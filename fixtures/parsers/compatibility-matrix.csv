@@ -1,0 +1,3 @@
+host,host_version,scenario,fixture,status,notes
+claude,unverified,unknown-fields,claude/unknown-fields.manifest.json,pending,Phase 1 parser must ignore unknown fields
+claude,unverified,truncated,claude/truncated.manifest.json,pending,Phase 1 parser must leave checkpoint consistent

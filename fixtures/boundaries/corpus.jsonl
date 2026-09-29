@@ -1,0 +1,4 @@
+{"id":"child-regression-test","sanitized_input":"fix that and add a regression test","expected":"CHILD","confidence":0.94,"parent_evidence":true,"moved_later":false,"tags":["required","regression","parent-open"]}
+{"id":"continue-follow-up","sanitized_input":"also update the nearby assertion","expected":"CONTINUE","confidence":0.9,"parent_evidence":true,"moved_later":false,"tags":["same-task"]}
+{"id":"explicit-switch","sanitized_input":"switch topics and improve the release notes","expected":"SWITCH","confidence":0.92,"parent_evidence":false,"moved_later":false,"tags":["explicit-switch"]}
+{"id":"ambiguous-next","sanitized_input":"take a look at the other thing","expected":"UNCERTAIN","confidence":0.45,"parent_evidence":false,"moved_later":true,"tags":["ambiguous"]}
