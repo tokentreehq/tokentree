@@ -26,7 +26,7 @@ Once installed, Claude Code automatically runs TokenTree's lightweight lifecycle
 
 ## 2. Standalone CLI Installation
 
-You can install the official `@tokentreehq/cli` binary wrapper via npm or download prebuilt signed binaries from GitHub Releases:
+You can install the official `@tokentreehq/cli` binary wrapper via npm or download prebuilt SHA-256 checksummed binaries from GitHub Releases:
 
 ### Via npm
 ```bash

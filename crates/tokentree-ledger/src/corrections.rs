@@ -63,7 +63,9 @@ pub fn ensure_session_attribution(connection: &mut Connection, session_id: &str)
 
     let mut stmt = connection.prepare(
         "SELECT id, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, reasoning_tokens
-         FROM usage_events WHERE session_id = ?1",
+         FROM usage_events
+         WHERE session_id = ?1
+           AND source_kind NOT IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter')",
     )?;
 
     let events = stmt
@@ -128,6 +130,8 @@ pub fn ensure_session_attribution(connection: &mut Connection, session_id: &str)
             params![group_id, project_id, work_item_id],
         )?;
 
+        validate_group_invariant(&transaction, &group_id)?;
+
         created += 1;
     }
 
@@ -191,6 +195,8 @@ pub fn attach_session(
             ) VALUES(?,?,?,'primary',10000,'manual_attach',1,1)",
             params![new_group_id, target_project_id, work_item_id],
         )?;
+
+        validate_group_invariant(&transaction, &new_group_id)?;
 
         changed += 1;
     }
@@ -340,6 +346,295 @@ pub fn reclassify_work_item(
     Ok(())
 }
 
+pub fn validate_group_invariant(connection: &Connection, group_id: &str) -> Result<()> {
+    let is_active: bool = connection
+        .query_row(
+            "SELECT active FROM attribution_groups WHERE id = ?1",
+            [group_id],
+            |row| row.get::<_, i64>(0).map(|v| v == 1),
+        )
+        .with_context(|| format!("Attribution group {group_id} not found"))?;
+
+    if !is_active {
+        return Ok(());
+    }
+
+    let total_bp: i64 = connection.query_row(
+        "SELECT coalesce(sum(weight_basis_points), 0) FROM attributions WHERE group_id = ?1",
+        [group_id],
+        |row| row.get(0),
+    )?;
+
+    if total_bp != 10_000 {
+        bail!(
+            "Attribution group invariant violated for {group_id}: active weights total {total_bp} bp (must equal exactly 10,000 bp)"
+        );
+    }
+
+    Ok(())
+}
+
+pub fn merge_work_items(
+    connection: &mut Connection,
+    source_id: &str,
+    target_id: &str,
+) -> Result<u64> {
+    if source_id == target_id {
+        bail!("Cannot merge work item into itself");
+    }
+
+    struct ItemInfo {
+        project_id: String,
+        status: String,
+    }
+
+    let source: ItemInfo = connection
+        .query_row(
+            "SELECT project_id, status FROM work_items WHERE id = ?1",
+            [source_id],
+            |row| {
+                Ok(ItemInfo {
+                    project_id: row.get(0)?,
+                    status: row.get(1)?,
+                })
+            },
+        )
+        .with_context(|| format!("Source work item {source_id} not found"))?;
+
+    let target: ItemInfo = connection
+        .query_row(
+            "SELECT project_id, status FROM work_items WHERE id = ?1",
+            [target_id],
+            |row| {
+                Ok(ItemInfo {
+                    project_id: row.get(0)?,
+                    status: row.get(1)?,
+                })
+            },
+        )
+        .with_context(|| format!("Target work item {target_id} not found"))?;
+
+    if source.project_id != target.project_id {
+        bail!("Cross-project merge rejected: source and target must belong to the same project");
+    }
+
+    if source.status == "merged" {
+        bail!("Source work item {source_id} is already merged");
+    }
+
+    struct ActiveAttr {
+        group_id: String,
+        usage_span_id: String,
+        role: String,
+        weight_basis_points: i64,
+        confidence: Option<f64>,
+    }
+
+    let mut stmt = connection.prepare(
+        "SELECT ag.id, ag.usage_span_id, a.role, a.weight_basis_points, a.confidence
+         FROM attribution_groups ag
+         JOIN attributions a ON a.group_id = ag.id
+         WHERE a.work_item_id = ?1 AND ag.active = 1",
+    )?;
+
+    let active_attrs = stmt
+        .query_map([source_id], |row| {
+            Ok(ActiveAttr {
+                group_id: row.get(0)?,
+                usage_span_id: row.get(1)?,
+                role: row.get(2)?,
+                weight_basis_points: row.get(3)?,
+                confidence: row.get(4)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    let now = Utc::now().to_rfc3339();
+    let tx = connection.transaction()?;
+
+    // 1. Reparent any child work items to target
+    tx.execute(
+        "UPDATE work_items SET parent_id = ?1 WHERE parent_id = ?2",
+        params![target_id, source_id],
+    )?;
+
+    // 2. Reparent any notes to target
+    tx.execute(
+        "UPDATE notes SET work_item_id = ?1 WHERE work_item_id = ?2",
+        params![target_id, source_id],
+    )?;
+
+    // 3. Re-attribute usage spans: deactivate old group, create replacement group pointing to target_id
+    let mut reattributed_spans = 0;
+    for attr in active_attrs {
+        tx.execute(
+            "UPDATE attribution_groups SET active = 0 WHERE id = ?1",
+            [&attr.group_id],
+        )?;
+
+        let new_group_id = stable_id("attr", &format!("{}:{target_id}:{now}", attr.usage_span_id));
+        tx.execute(
+            "INSERT INTO attribution_groups(
+                id, usage_span_id, policy, supersedes_group_id, active, created_at
+            ) VALUES(?,?,'causal-request',?,1,?)",
+            params![new_group_id, attr.usage_span_id, attr.group_id, now],
+        )?;
+
+        tx.execute(
+            "INSERT INTO attributions(
+                group_id, project_id, work_item_id, role, weight_basis_points, method, confidence, verified_by_user
+            ) VALUES(?,?,?,?,?,'manual_merge',?,1)",
+            params![
+                new_group_id,
+                target.project_id,
+                target_id,
+                attr.role,
+                attr.weight_basis_points,
+                attr.confidence.unwrap_or(1.0)
+            ],
+        )?;
+
+        validate_group_invariant(&tx, &new_group_id)?;
+        reattributed_spans += 1;
+    }
+
+    // 4. Mark source item as merged
+    tx.execute(
+        "UPDATE work_items SET status = 'merged' WHERE id = ?1",
+        [source_id],
+    )?;
+
+    tx.commit()?;
+    Ok(reattributed_spans)
+}
+
+pub fn split_work_item(
+    connection: &mut Connection,
+    source_id: &str,
+    new_title: &str,
+    span_ids: &[String],
+) -> Result<String> {
+    let title = new_title.trim();
+    if title.is_empty() {
+        bail!("Split work item title cannot be empty");
+    }
+    if span_ids.is_empty() {
+        bail!("Must select at least one usage span to split");
+    }
+
+    struct SourceInfo {
+        project_id: String,
+        parent_id: Option<String>,
+    }
+
+    let source: SourceInfo = connection
+        .query_row(
+            "SELECT project_id, parent_id FROM work_items WHERE id = ?1",
+            [source_id],
+            |row| {
+                Ok(SourceInfo {
+                    project_id: row.get(0)?,
+                    parent_id: row.get(1)?,
+                })
+            },
+        )
+        .with_context(|| format!("Source work item {source_id} not found"))?;
+
+    struct SpanAttr {
+        span_id: String,
+        group_id: String,
+        role: String,
+        weight_basis_points: i64,
+        confidence: Option<f64>,
+    }
+
+    let mut span_attrs = Vec::new();
+    for span_id in span_ids {
+        let attr: Option<SpanAttr> = connection
+            .query_row(
+                "SELECT ag.usage_span_id, ag.id, a.role, a.weight_basis_points, a.confidence
+                 FROM attribution_groups ag
+                 JOIN attributions a ON a.group_id = ag.id
+                 WHERE ag.usage_span_id = ?1 AND a.work_item_id = ?2 AND ag.active = 1",
+                params![span_id, source_id],
+                |row| {
+                    Ok(SpanAttr {
+                        span_id: row.get(0)?,
+                        group_id: row.get(1)?,
+                        role: row.get(2)?,
+                        weight_basis_points: row.get(3)?,
+                        confidence: row.get(4)?,
+                    })
+                },
+            )
+            .ok();
+
+        let Some(attr) = attr else {
+            bail!(
+                "Invalid span selection: span {span_id} is not currently actively attributed to work item {source_id}"
+            );
+        };
+        span_attrs.push(attr);
+    }
+
+    let now = Utc::now().to_rfc3339();
+    let new_work_item_id = stable_id("wi", &format!("{}:{}:{}", source.project_id, title, now));
+
+    let tx = connection.transaction()?;
+
+    // 1. Create new work item
+    tx.execute(
+        "INSERT INTO work_items(id, project_id, parent_id, type, title, status, created_at)
+         VALUES(?,?,?,'task',?,'open',?)",
+        params![
+            new_work_item_id,
+            source.project_id,
+            source.parent_id,
+            title,
+            now
+        ],
+    )?;
+
+    // 2. Re-attribute selected spans to new work item with replacement groups
+    for attr in span_attrs {
+        tx.execute(
+            "UPDATE attribution_groups SET active = 0 WHERE id = ?1",
+            [&attr.group_id],
+        )?;
+
+        let new_group_id = stable_id(
+            "attr",
+            &format!("{}:{new_work_item_id}:{now}", attr.span_id),
+        );
+        tx.execute(
+            "INSERT INTO attribution_groups(
+                id, usage_span_id, policy, supersedes_group_id, active, created_at
+            ) VALUES(?,?,'causal-request',?,1,?)",
+            params![new_group_id, attr.span_id, attr.group_id, now],
+        )?;
+
+        tx.execute(
+            "INSERT INTO attributions(
+                group_id, project_id, work_item_id, role, weight_basis_points, method, confidence, verified_by_user
+            ) VALUES(?,?,?,?,?,'manual_split',?,1)",
+            params![
+                new_group_id,
+                source.project_id,
+                new_work_item_id,
+                attr.role,
+                attr.weight_basis_points,
+                attr.confidence.unwrap_or(1.0)
+            ],
+        )?;
+
+        validate_group_invariant(&tx, &new_group_id)?;
+    }
+
+    tx.commit()?;
+    Ok(new_work_item_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,5 +697,676 @@ mod tests {
             )
             .unwrap();
         assert_eq!(total_weight, 10_000);
+    }
+
+    #[test]
+    fn test_merge_work_items_preserves_usage_and_enforces_10000_bp() {
+        let mut ledger = Ledger::open_memory().unwrap();
+        let run = start_manual(
+            ledger.connection_mut(),
+            ManualStartInput {
+                project_key: "space-game",
+                project_title: Some("Space Game"),
+                task_title: "Fix collision bug",
+                parent_title: None,
+                cwd: "/tmp/game",
+            },
+        )
+        .unwrap();
+
+        stop_manual(ledger.connection_mut(), Default::default()).unwrap();
+
+        // Create target work item in the same project
+        let target_id = stable_id("wi", "space-game:target-task");
+        ledger
+            .connection_mut()
+            .execute(
+                "INSERT INTO work_items (id, project_id, type, title, status, created_at)
+                 VALUES (?1, ?2, 'task', 'Target Task', 'open', '2026-09-29T10:00:00Z')",
+                params![target_id, run.project_id],
+            )
+            .unwrap();
+
+        add_note(
+            ledger.connection_mut(),
+            "Important bug note",
+            Some(&run.work_item_id),
+        )
+        .unwrap();
+
+        // Perform merge
+        let reattributed =
+            merge_work_items(ledger.connection_mut(), &run.work_item_id, &target_id).unwrap();
+        assert_eq!(reattributed, 1);
+
+        // Verify source status is merged
+        let source_status: String = ledger
+            .connection()
+            .query_row(
+                "SELECT status FROM work_items WHERE id = ?1",
+                [&run.work_item_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source_status, "merged");
+
+        // Verify note reparented
+        let note_wi: String = ledger
+            .connection()
+            .query_row(
+                "SELECT work_item_id FROM notes WHERE text = 'Important bug note'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(note_wi, target_id);
+
+        // Verify active attribution points to target with exactly 10,000 bp
+        let (active_wi, active_bp): (String, i64) = ledger
+            .connection()
+            .query_row(
+                "SELECT a.work_item_id, a.weight_basis_points
+                 FROM attribution_groups ag
+                 JOIN attributions a ON a.group_id = ag.id
+                 WHERE ag.active = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(active_wi, target_id);
+        assert_eq!(active_bp, 10_000);
+
+        // Verify superseded group exists and is inactive
+        let inactive_count: i64 = ledger
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM attribution_groups WHERE active = 0 AND supersedes_group_id IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(inactive_count, 0); // supersedes_group_id is on the NEW group, not old group!
+        let superseded_group_count: i64 = ledger
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM attribution_groups WHERE active = 1 AND supersedes_group_id IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(superseded_group_count, 1);
+    }
+
+    #[test]
+    fn test_merge_cross_project_and_self_fail_safely() {
+        let mut ledger = Ledger::open_memory().unwrap();
+
+        // Project A
+        let run_a = start_manual(
+            ledger.connection_mut(),
+            ManualStartInput {
+                project_key: "proj-a",
+                project_title: Some("Project A"),
+                task_title: "Task A",
+                parent_title: None,
+                cwd: "/tmp/a",
+            },
+        )
+        .unwrap();
+
+        // Project B
+        let run_b = start_manual(
+            ledger.connection_mut(),
+            ManualStartInput {
+                project_key: "proj-b",
+                project_title: Some("Project B"),
+                task_title: "Task B",
+                parent_title: None,
+                cwd: "/tmp/b",
+            },
+        )
+        .unwrap();
+
+        // Cross-project merge fails
+        let err = merge_work_items(
+            ledger.connection_mut(),
+            &run_a.work_item_id,
+            &run_b.work_item_id,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Cross-project merge rejected"));
+
+        // Merge into self fails
+        let self_err = merge_work_items(
+            ledger.connection_mut(),
+            &run_a.work_item_id,
+            &run_a.work_item_id,
+        )
+        .unwrap_err();
+        assert!(self_err.to_string().contains("into itself"));
+    }
+
+    #[test]
+    fn test_split_work_item_moves_selected_spans_and_enforces_invariant() {
+        let mut ledger = Ledger::open_memory().unwrap();
+        let run = start_manual(
+            ledger.connection_mut(),
+            ManualStartInput {
+                project_key: "split-proj",
+                project_title: Some("Split Project"),
+                task_title: "Initial Big Task",
+                parent_title: None,
+                cwd: "/tmp/split",
+            },
+        )
+        .unwrap();
+
+        // Add a second span to the session
+        let span_2_id = stable_id("span", "second-event-span");
+        ledger
+            .connection_mut()
+            .execute(
+                "INSERT INTO usage_spans(id, session_id, measurement_status, completeness)
+                 VALUES(?1, ?2, 'measured', 100)",
+                params![span_2_id, run.session_id],
+            )
+            .unwrap();
+
+        let ag_2_id = stable_id("attr", "span-2-initial");
+        ledger
+            .connection_mut()
+            .execute(
+                "INSERT INTO attribution_groups(id, usage_span_id, policy, active, created_at)
+                 VALUES(?1, ?2, 'causal-request', 1, '2026-09-29T10:00:00Z')",
+                params![ag_2_id, span_2_id],
+            )
+            .unwrap();
+
+        ledger
+            .connection_mut()
+            .execute(
+                "INSERT INTO attributions(group_id, project_id, work_item_id, role, weight_basis_points, method, confidence, verified_by_user)
+                 VALUES(?1, ?2, ?3, 'primary', 10000, 'session_default', 1.0, 1)",
+                params![ag_2_id, run.project_id, run.work_item_id],
+            )
+            .unwrap();
+
+        // Split span_2 into a new work item
+        let new_wi = split_work_item(
+            ledger.connection_mut(),
+            &run.work_item_id,
+            "Extracted Second Task",
+            std::slice::from_ref(&span_2_id),
+        )
+        .unwrap();
+
+        assert_ne!(new_wi, run.work_item_id);
+
+        // Verify span_2 is now attributed to new_wi with 10,000 bp
+        let (wi_for_span_2, bp_for_span_2): (String, i64) = ledger
+            .connection()
+            .query_row(
+                "SELECT a.work_item_id, a.weight_basis_points
+                 FROM attribution_groups ag
+                 JOIN attributions a ON a.group_id = ag.id
+                 WHERE ag.usage_span_id = ?1 AND ag.active = 1",
+                [&span_2_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(wi_for_span_2, new_wi);
+        assert_eq!(bp_for_span_2, 10_000);
+
+        // Invalid span selection fails
+        let invalid_err = split_work_item(
+            ledger.connection_mut(),
+            &run.work_item_id,
+            "Failing Task",
+            &["nonexistent_span".to_string()],
+        )
+        .unwrap_err();
+        assert!(invalid_err.to_string().contains("Invalid span selection"));
+    }
+
+    #[test]
+    fn test_attribution_group_invariant_rejections() {
+        let mut ledger = Ledger::open_memory().unwrap();
+
+        // Insert incomplete group with 9,999 bp
+        ledger
+            .connection_mut()
+            .execute(
+                "INSERT INTO projects (id, key, display_name, identity_hash, detection_method, created_at, updated_at)
+                 VALUES ('p1', 'p1', 'P1', 'h1', 'git', '2026-09-29T10:00:00Z', '2026-09-29T10:00:00Z')",
+                [],
+            )
+            .unwrap();
+        ledger
+            .connection_mut()
+            .execute(
+                "INSERT INTO work_items (id, project_id, type, title, status, created_at)
+                 VALUES ('w1', 'p1', 'task', 'W1', 'open', '2026-09-29T10:00:00Z')",
+                [],
+            )
+            .unwrap();
+        ledger
+            .connection_mut()
+            .execute(
+                "INSERT INTO sessions (id, adapter, provider_session_id, project_id, started_at)
+                 VALUES ('s1', 'claude', 's1', 'p1', '2026-09-29T10:00:00Z')",
+                [],
+            )
+            .unwrap();
+        ledger
+            .connection_mut()
+            .execute(
+                "INSERT INTO usage_spans (id, session_id, measurement_status) VALUES ('sp1', 's1', 'measured')",
+                [],
+            )
+            .unwrap();
+
+        // 9,999 bp group
+        ledger
+            .connection_mut()
+            .execute(
+                "INSERT INTO attribution_groups (id, usage_span_id, policy, active, created_at)
+                 VALUES ('ag_9999', 'sp1', 'causal-request', 1, '2026-09-29T10:00:00Z')",
+                [],
+            )
+            .unwrap();
+        ledger
+            .connection_mut()
+            .execute(
+                "INSERT INTO attributions (group_id, project_id, work_item_id, role, weight_basis_points, method)
+                 VALUES ('ag_9999', 'p1', 'w1', 'primary', 9999, 'manual')",
+                [],
+            )
+            .unwrap();
+
+        let err_9999 = validate_group_invariant(ledger.connection(), "ag_9999").unwrap_err();
+        assert!(err_9999.to_string().contains("9999 bp"));
+
+        // 10,001 bp group (via two roles totaling 10,001)
+        ledger
+            .connection_mut()
+            .execute(
+                "INSERT INTO usage_spans (id, session_id, measurement_status) VALUES ('sp2', 's1', 'measured')",
+                [],
+            )
+            .unwrap();
+        ledger
+            .connection_mut()
+            .execute(
+                "INSERT INTO attribution_groups (id, usage_span_id, policy, active, created_at)
+                 VALUES ('ag_10001', 'sp2', 'causal-request', 1, '2026-09-29T10:00:00Z')",
+                [],
+            )
+            .unwrap();
+        ledger
+            .connection_mut()
+            .execute(
+                "INSERT INTO attributions (group_id, project_id, work_item_id, role, weight_basis_points, method)
+                 VALUES ('ag_10001', 'p1', 'w1', 'primary', 10000, 'manual')",
+                [],
+            )
+            .unwrap();
+        ledger
+            .connection_mut()
+            .execute(
+                "INSERT INTO attributions (group_id, project_id, work_item_id, role, weight_basis_points, method)
+                 VALUES ('ag_10001', 'p1', 'w1', 'secondary', 1, 'manual')",
+                [],
+            )
+            .unwrap();
+
+        let err_10001 = validate_group_invariant(ledger.connection(), "ag_10001").unwrap_err();
+        assert!(err_10001.to_string().contains("10001 bp"));
+    }
+
+    #[test]
+    fn test_negative_and_duplicate_attribution_group_rejections() {
+        let mut ledger = Ledger::open_memory().unwrap();
+
+        ledger
+            .connection_mut()
+            .execute(
+                "INSERT INTO projects (id, key, display_name, identity_hash, detection_method, created_at, updated_at)
+                 VALUES ('p_neg', 'p_neg', 'P Neg', 'h_neg', 'git', '2026-09-29T10:00:00Z', '2026-09-29T10:00:00Z')",
+                [],
+            )
+            .unwrap();
+        ledger
+            .connection_mut()
+            .execute(
+                "INSERT INTO work_items (id, project_id, type, title, status, created_at)
+                 VALUES ('w_neg', 'p_neg', 'task', 'W Neg', 'open', '2026-09-29T10:00:00Z')",
+                [],
+            )
+            .unwrap();
+        ledger
+            .connection_mut()
+            .execute(
+                "INSERT INTO sessions (id, adapter, provider_session_id, project_id, started_at)
+                 VALUES ('s_neg', 'claude', 's_neg', 'p_neg', '2026-09-29T10:00:00Z')",
+                [],
+            )
+            .unwrap();
+        ledger
+            .connection_mut()
+            .execute(
+                "INSERT INTO usage_spans (id, session_id, measurement_status) VALUES ('sp_neg', 's_neg', 'measured')",
+                [],
+            )
+            .unwrap();
+        ledger
+            .connection_mut()
+            .execute(
+                "INSERT INTO attribution_groups (id, usage_span_id, policy, active, created_at)
+                 VALUES ('ag_neg', 'sp_neg', 'causal-request', 1, '2026-09-29T10:00:00Z')",
+                [],
+            )
+            .unwrap();
+
+        // 1. Negative weight is rejected by database CHECK constraint
+        let neg_err = ledger
+            .connection_mut()
+            .execute(
+                "INSERT INTO attributions (group_id, project_id, work_item_id, role, weight_basis_points, method)
+                 VALUES ('ag_neg', 'p_neg', 'w_neg', 'primary', -500, 'manual')",
+                [],
+            );
+        assert!(neg_err.is_err(), "Negative basis points must be rejected");
+
+        // 2. Inserting a second active attribution group for the same usage_span_id violates unique index
+        ledger
+            .connection_mut()
+            .execute(
+                "INSERT INTO attributions (group_id, project_id, work_item_id, role, weight_basis_points, method)
+                 VALUES ('ag_neg', 'p_neg', 'w_neg', 'primary', 10000, 'manual')",
+                [],
+            )
+            .unwrap();
+
+        let dup_active_err = ledger.connection_mut().execute(
+            "INSERT INTO attribution_groups (id, usage_span_id, policy, active, created_at)
+                 VALUES ('ag_neg_dup', 'sp_neg', 'causal-request', 1, '2026-09-29T10:00:00Z')",
+            [],
+        );
+        assert!(
+            dup_active_err.is_err(),
+            "Duplicate active group for same span must violate unique index"
+        );
+    }
+
+    #[test]
+    fn test_superseding_group_lineage_and_deactivation() {
+        let mut ledger = Ledger::open_memory().unwrap();
+        let run = start_manual(
+            ledger.connection_mut(),
+            ManualStartInput {
+                project_key: "lineage-proj",
+                project_title: Some("Lineage Project"),
+                task_title: "Lineage Task 1",
+                parent_title: None,
+                cwd: "/tmp/lineage",
+            },
+        )
+        .unwrap();
+
+        let target_run = start_manual(
+            ledger.connection_mut(),
+            ManualStartInput {
+                project_key: "lineage-proj",
+                project_title: Some("Lineage Project"),
+                task_title: "Lineage Task 2",
+                parent_title: None,
+                cwd: "/tmp/lineage",
+            },
+        )
+        .unwrap();
+
+        let span_1_id = stable_id("span", "lineage-span-1");
+        ledger
+            .connection_mut()
+            .execute(
+                "INSERT INTO usage_spans(id, session_id, measurement_status, completeness)
+                 VALUES(?1, ?2, 'measured', 100)",
+                params![span_1_id, run.session_id],
+            )
+            .unwrap();
+
+        let old_group_id = stable_id("attr", "lineage-span-1-initial");
+        ledger
+            .connection_mut()
+            .execute(
+                "INSERT INTO attribution_groups(id, usage_span_id, policy, active, created_at)
+                 VALUES(?1, ?2, 'causal-request', 1, '2026-09-29T10:00:00Z')",
+                params![old_group_id, span_1_id],
+            )
+            .unwrap();
+
+        ledger
+            .connection_mut()
+            .execute(
+                "INSERT INTO attributions(group_id, project_id, work_item_id, role, weight_basis_points, method, confidence, verified_by_user)
+                 VALUES(?1, ?2, ?3, 'primary', 10000, 'session_default', 1.0, 1)",
+                params![old_group_id, run.project_id, run.work_item_id],
+            )
+            .unwrap();
+
+        // Merge Task 1 into Task 2
+        let count = merge_work_items(
+            ledger.connection_mut(),
+            &run.work_item_id,
+            &target_run.work_item_id,
+        )
+        .unwrap();
+        assert!(count >= 1);
+
+        // Verify old group is deactivated
+        let old_active: i64 = ledger
+            .connection()
+            .query_row(
+                "SELECT active FROM attribution_groups WHERE id = ?1",
+                [&old_group_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            old_active, 0,
+            "Superseded group must be deactivated (active = 0)"
+        );
+
+        // Verify new group supersedes old group and is active
+        let (new_group_id, supersedes_id, new_active): (String, Option<String>, i64) = ledger
+            .connection()
+            .query_row(
+                "SELECT id, supersedes_group_id, active FROM attribution_groups WHERE supersedes_group_id = ?1",
+                [&old_group_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(supersedes_id, Some(old_group_id));
+        assert_eq!(new_active, 1);
+
+        // Verify invariant on replacement group
+        validate_group_invariant(ledger.connection(), &new_group_id).unwrap();
+    }
+
+    #[test]
+    fn test_transactional_rollback_preserves_state() {
+        let mut ledger = Ledger::open_memory().unwrap();
+        let run = start_manual(
+            ledger.connection_mut(),
+            ManualStartInput {
+                project_key: "rollback-proj",
+                project_title: Some("Rollback Project"),
+                task_title: "Rollback Task",
+                parent_title: None,
+                cwd: "/tmp/rollback",
+            },
+        )
+        .unwrap();
+
+        // Invalid span list in split should fail and leave work items unmodified
+        let initial_count: i64 = ledger
+            .connection()
+            .query_row("SELECT count(*) FROM work_items", [], |row| row.get(0))
+            .unwrap();
+
+        let split_res = split_work_item(
+            ledger.connection_mut(),
+            &run.work_item_id,
+            "Failed Split",
+            &[
+                "nonexistent_span_1".to_string(),
+                "nonexistent_span_2".to_string(),
+            ],
+        );
+        assert!(split_res.is_err());
+
+        let post_count: i64 = ledger
+            .connection()
+            .query_row("SELECT count(*) FROM work_items", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            initial_count, post_count,
+            "Failed split must rollback work_items insertion"
+        );
+
+        // Status of original work item is unchanged
+        let status: String = ledger
+            .connection()
+            .query_row(
+                "SELECT status FROM work_items WHERE id = ?1",
+                [&run.work_item_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "open");
+    }
+
+    #[test]
+    fn test_concurrent_corrections_merge_and_split() {
+        use std::sync::Arc;
+        use std::thread;
+        use tempfile::tempdir;
+
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("concurrent_corrections.db");
+
+        let (run_a_id, run_b_id, span_a_id) = {
+            let mut ledger = Ledger::open(&db_path).unwrap();
+            let run_a = start_manual(
+                ledger.connection_mut(),
+                ManualStartInput {
+                    project_key: "conc-proj",
+                    project_title: Some("Concurrent Project"),
+                    task_title: "Task A",
+                    parent_title: None,
+                    cwd: "/tmp/conc",
+                },
+            )
+            .unwrap();
+
+            let run_b = start_manual(
+                ledger.connection_mut(),
+                ManualStartInput {
+                    project_key: "conc-proj",
+                    project_title: Some("Concurrent Project"),
+                    task_title: "Task B",
+                    parent_title: None,
+                    cwd: "/tmp/conc",
+                },
+            )
+            .unwrap();
+
+            let span_a = stable_id("span", "conc-span-a");
+            ledger
+                .connection_mut()
+                .execute(
+                    "INSERT INTO usage_spans(id, session_id, measurement_status, completeness)
+                     VALUES(?1, ?2, 'measured', 100)",
+                    params![span_a, run_a.session_id],
+                )
+                .unwrap();
+
+            let ag_a = stable_id("attr", "conc-span-a-ag");
+            ledger
+                .connection_mut()
+                .execute(
+                    "INSERT INTO attribution_groups(id, usage_span_id, policy, active, created_at)
+                     VALUES(?1, ?2, 'causal-request', 1, '2026-09-29T10:00:00Z')",
+                    params![ag_a, span_a],
+                )
+                .unwrap();
+
+            ledger
+                .connection_mut()
+                .execute(
+                    "INSERT INTO attributions(group_id, project_id, work_item_id, role, weight_basis_points, method, confidence, verified_by_user)
+                     VALUES(?1, ?2, ?3, 'primary', 10000, 'session_default', 1.0, 1)",
+                    params![ag_a, run_a.project_id, run_a.work_item_id],
+                )
+                .unwrap();
+
+            (run_a.work_item_id, run_b.work_item_id, span_a)
+        };
+
+        let path_arc = Arc::new(db_path.clone());
+        let p1 = Arc::clone(&path_arc);
+        let run_a_clone = run_a_id.clone();
+        let span_a_clone = span_a_id.clone();
+
+        let handle_split = thread::spawn(move || -> anyhow::Result<()> {
+            let mut ledger = Ledger::open(&*p1)?;
+            let new_item = split_work_item(
+                ledger.connection_mut(),
+                &run_a_clone,
+                "Concurrent Split Task",
+                &[span_a_clone],
+            )?;
+            assert!(!new_item.is_empty());
+            Ok(())
+        });
+
+        let p2 = Arc::clone(&path_arc);
+        let run_b_clone = run_b_id.clone();
+        let handle_rename = thread::spawn(move || -> anyhow::Result<()> {
+            let mut ledger = Ledger::open(&*p2)?;
+            rename_work_item(
+                ledger.connection_mut(),
+                &run_b_clone,
+                "Renamed Concurrent Task B",
+            )?;
+            add_note(
+                ledger.connection_mut(),
+                "Concurrent note during split",
+                Some(&run_b_clone),
+            )?;
+            Ok(())
+        });
+
+        handle_split.join().unwrap().unwrap();
+        handle_rename.join().unwrap().unwrap();
+
+        // Verify ledger integrity and invariant across all active groups
+        let ledger = Ledger::open(&db_path).unwrap();
+        assert_eq!(ledger.integrity_check().unwrap(), "ok");
+
+        let active_groups: Vec<String> = {
+            let mut stmt = ledger
+                .connection()
+                .prepare("SELECT id FROM attribution_groups WHERE active = 1")
+                .unwrap();
+            stmt.query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+
+        for g in active_groups {
+            validate_group_invariant(ledger.connection(), &g).unwrap();
+        }
     }
 }

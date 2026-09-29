@@ -11,7 +11,7 @@
     "test": "vitest run",
     "typecheck": "tsc -b",
     "lint": "eslint .",
-    "fixture:boundaries": "tsx packages/classifier/src/evaluate.ts fixtures/boundaries/corpus.jsonl fixtures/boundaries/predictions.example.jsonl",
+    "fixture:boundaries": "tsx packages/classifier/src/evaluate.ts fixtures/boundaries/eval.jsonl",
     "check": "pnpm typecheck && pnpm test && pnpm fixture:boundaries && pnpm rust:check",
     "rust:check": "cargo fmt --all -- --check && cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings"
   },

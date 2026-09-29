@@ -1,0 +1,12 @@
+{"id":"child-train-regression","sanitized_input":"fix that and add a regression test","expected":"CHILD","confidence":0.94,"parent_evidence":true,"moved_later":false,"tags":["regression","parent-open"]}
+{"id":"child-train-benchmark","sanitized_input":"write a microbenchmark for this query parser","expected":"CHILD","confidence":0.91,"parent_evidence":true,"moved_later":false,"tags":["subtask","performance"]}
+{"id":"child-train-helper","sanitized_input":"extract this token counter into a separate helper module","expected":"CHILD","confidence":0.88,"parent_evidence":true,"moved_later":false,"tags":["refactor","subtask"]}
+{"id":"continue-train-followup","sanitized_input":"also update the nearby assertion","expected":"CONTINUE","confidence":0.9,"parent_evidence":true,"moved_later":false,"tags":["same-task"]}
+{"id":"continue-train-lint","sanitized_input":"make sure to run linter on that file too","expected":"CONTINUE","confidence":0.89,"parent_evidence":true,"moved_later":false,"tags":["same-task","lint"]}
+{"id":"continue-train-typo","sanitized_input":"fix the typo in the docstring above","expected":"CONTINUE","confidence":0.93,"parent_evidence":true,"moved_later":false,"tags":["same-task","docs"]}
+{"id":"switch-train-topic","sanitized_input":"switch topics and improve the release notes","expected":"SWITCH","confidence":0.92,"parent_evidence":false,"moved_later":false,"tags":["explicit-switch"]}
+{"id":"switch-train-auth","sanitized_input":"now let's start working on the auth service","expected":"SWITCH","confidence":0.94,"parent_evidence":false,"moved_later":false,"tags":["new-feature","switch"]}
+{"id":"switch-train-css","sanitized_input":"switch to fixing the bug in dashboard css layout","expected":"SWITCH","confidence":0.9,"parent_evidence":false,"moved_later":false,"tags":["switch","ui-bug"]}
+{"id":"uncertain-train-opinion","sanitized_input":"what do you think about this?","expected":"UNCERTAIN","confidence":0.4,"parent_evidence":false,"moved_later":false,"tags":["ambiguous","discussion"]}
+{"id":"uncertain-train-logs","sanitized_input":"check the logs","expected":"UNCERTAIN","confidence":0.48,"parent_evidence":false,"moved_later":true,"tags":["ambiguous","vague"]}
+{"id":"uncertain-train-maybe","sanitized_input":"maybe try the second approach instead","expected":"UNCERTAIN","confidence":0.52,"parent_evidence":false,"moved_later":false,"tags":["ambiguous","tentative"]}

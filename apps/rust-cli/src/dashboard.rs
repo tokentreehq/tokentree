@@ -14,8 +14,8 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokentree_ledger::{
-    Ledger, add_note, attach_session, detach_session, load_project_trees, move_work_item,
-    rename_work_item,
+    Ledger, add_note, attach_session, detach_session, load_project_trees, merge_work_items,
+    move_work_item, rename_work_item, split_work_item,
 };
 
 #[derive(Clone)]
@@ -355,6 +355,100 @@ async fn handle_detach(
     }
 }
 
+#[derive(Deserialize)]
+pub struct MergePayload {
+    pub source: String,
+    pub target: String,
+}
+
+async fn handle_merge(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    axum::Json(payload): axum::Json<MergePayload>,
+) -> Response {
+    if !verify_token(&state, &headers, &query) {
+        return apply_security_headers((StatusCode::UNAUTHORIZED, "Unauthorized").into_response());
+    }
+
+    let db_path = state.home.join("ledger.db");
+    let mut ledger = match Ledger::open(&db_path) {
+        Ok(l) => l,
+        Err(e) => {
+            return apply_security_headers(
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            );
+        }
+    };
+
+    match merge_work_items(ledger.connection_mut(), &payload.source, &payload.target) {
+        Ok(spans) => apply_security_headers(
+            (
+                StatusCode::OK,
+                json!({"ok": true, "spans_reattributed": spans}).to_string(),
+            )
+                .into_response(),
+        ),
+        Err(e) => apply_security_headers(
+            (
+                StatusCode::BAD_REQUEST,
+                json!({"error": e.to_string()}).to_string(),
+            )
+                .into_response(),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct SplitPayload {
+    pub source: String,
+    pub title: String,
+    pub spans: Vec<String>,
+}
+
+async fn handle_split(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    axum::Json(payload): axum::Json<SplitPayload>,
+) -> Response {
+    if !verify_token(&state, &headers, &query) {
+        return apply_security_headers((StatusCode::UNAUTHORIZED, "Unauthorized").into_response());
+    }
+
+    let db_path = state.home.join("ledger.db");
+    let mut ledger = match Ledger::open(&db_path) {
+        Ok(l) => l,
+        Err(e) => {
+            return apply_security_headers(
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            );
+        }
+    };
+
+    match split_work_item(
+        ledger.connection_mut(),
+        &payload.source,
+        &payload.title,
+        &payload.spans,
+    ) {
+        Ok(new_id) => apply_security_headers(
+            (
+                StatusCode::OK,
+                json!({"ok": true, "new_work_item_id": new_id}).to_string(),
+            )
+                .into_response(),
+        ),
+        Err(e) => apply_security_headers(
+            (
+                StatusCode::BAD_REQUEST,
+                json!({"error": e.to_string()}).to_string(),
+            )
+                .into_response(),
+        ),
+    }
+}
+
 async fn handle_api_status(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -433,6 +527,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/corrections/note", post(handle_note))
         .route("/api/corrections/attach", post(handle_attach))
         .route("/api/corrections/detach", post(handle_detach))
+        .route("/api/corrections/merge", post(handle_merge))
+        .route("/api/corrections/split", post(handle_split))
         .with_state(state)
 }
 
@@ -930,6 +1026,44 @@ fn render_dashboard_spa(token: &str) -> String {
         <button class="btn-primary" onclick="submitAttach()">Attach Session</button>
         <div id="attachFeedback" class="feedback-msg"></div>
       </div>
+
+      <!-- Merge Work Items -->
+      <div class="form-card">
+        <h2 class="form-title">Merge Work Items</h2>
+        <div class="form-grid">
+          <div class="form-group">
+            <label class="form-label">Source Task ID (will be merged)</label>
+            <input type="text" id="mergeSource" class="form-input" placeholder="e.g. wi_source">
+          </div>
+          <div class="form-group">
+            <label class="form-label">Target Task ID (receives usage &amp; children)</label>
+            <input type="text" id="mergeTarget" class="form-input" placeholder="e.g. wi_target">
+          </div>
+        </div>
+        <button class="btn-primary" onclick="submitMerge()">Merge Work Items</button>
+        <div id="mergeFeedback" class="feedback-msg"></div>
+      </div>
+
+      <!-- Split Work Item -->
+      <div class="form-card">
+        <h2 class="form-title">Split Work Item at Selected Spans</h2>
+        <div class="form-grid">
+          <div class="form-group">
+            <label class="form-label">Source Task ID</label>
+            <input type="text" id="splitSource" class="form-input" placeholder="e.g. wi_source">
+          </div>
+          <div class="form-group">
+            <label class="form-label">New Work Item Title</label>
+            <input type="text" id="splitTitle" class="form-input" placeholder="e.g. Extracted Subtask">
+          </div>
+          <div class="form-group" style="grid-column: 1 / -1;">
+            <label class="form-label">Span IDs to Move (comma-separated)</label>
+            <input type="text" id="splitSpans" class="form-input" placeholder="e.g. span_1, span_2">
+          </div>
+        </div>
+        <button class="btn-primary" onclick="submitSplit()">Split Work Item</button>
+        <div id="splitFeedback" class="feedback-msg"></div>
+      </div>
     </div>
 
     <!-- Status & Diagnostics View -->
@@ -1206,6 +1340,52 @@ fn render_dashboard_spa(token: &str) -> String {
       }}
     }}
 
+    async function submitMerge() {{
+      const source = document.getElementById('mergeSource').value.trim();
+      const target = document.getElementById('mergeTarget').value.trim();
+      const fb = document.getElementById('mergeFeedback');
+      if (!source || !target) {{ fb.className = 'feedback-msg feedback-err'; fb.innerText = 'Source and Target task IDs required'; return; }}
+      try {{
+        const res = await apiFetch('/api/corrections/merge', {{
+          method: 'POST',
+          body: JSON.stringify({{ source, target }})
+        }});
+        const data = await res.json();
+        if (res.ok) {{
+          fb.className = 'feedback-msg feedback-ok'; fb.innerText = 'Merged successfully! ' + data.spans_reattributed + ' spans reattributed.';
+          loadProjects();
+        }} else {{
+          fb.className = 'feedback-msg feedback-err'; fb.innerText = data.error || 'Merge failed';
+        }}
+      }} catch (e) {{
+        fb.className = 'feedback-msg feedback-err'; fb.innerText = e.message;
+      }}
+    }}
+
+    async function submitSplit() {{
+      const source = document.getElementById('splitSource').value.trim();
+      const title = document.getElementById('splitTitle').value.trim();
+      const spansInput = document.getElementById('splitSpans').value.trim();
+      const fb = document.getElementById('splitFeedback');
+      if (!source || !title || !spansInput) {{ fb.className = 'feedback-msg feedback-err'; fb.innerText = 'Source, Title, and at least one Span ID required'; return; }}
+      const spans = spansInput.split(',').map(s => s.trim()).filter(Boolean);
+      try {{
+        const res = await apiFetch('/api/corrections/split', {{
+          method: 'POST',
+          body: JSON.stringify({{ source, title, spans }})
+        }});
+        const data = await res.json();
+        if (res.ok) {{
+          fb.className = 'feedback-msg feedback-ok'; fb.innerText = 'Split successfully! New item ID: ' + data.new_work_item_id;
+          loadProjects();
+        }} else {{
+          fb.className = 'feedback-msg feedback-err'; fb.innerText = data.error || 'Split failed';
+        }}
+      }} catch (e) {{
+        fb.className = 'feedback-msg feedback-err'; fb.innerText = e.message;
+      }}
+    }}
+
     document.getElementById('searchInput').addEventListener('input', function(e) {{
       const term = e.target.value.toLowerCase().trim();
       document.querySelectorAll('.project-card').forEach(card => {{
@@ -1406,5 +1586,89 @@ mod tests {
         assert!(!escaped.contains("<img"));
         assert!(escaped.contains("&lt;script&gt;"));
         assert!(escaped.contains("&quot;"));
+    }
+
+    #[tokio::test]
+    async fn merge_and_split_endpoints_work_correctly() {
+        let (app, token, temp) = test_app();
+        let db_path = temp.path().join("ledger.db");
+        let mut ledger = Ledger::open(&db_path).unwrap();
+
+        // Seed project and two tasks
+        let run = tokentree_ledger::start_manual(
+            ledger.connection_mut(),
+            tokentree_ledger::ManualStartInput {
+                project_key: "endpoint-proj",
+                project_title: Some("Endpoint Project"),
+                task_title: "Source Task",
+                parent_title: None,
+                cwd: "/tmp",
+            },
+        )
+        .unwrap();
+
+        let target_wi = "wi_target_endpoint";
+        ledger
+            .connection_mut()
+            .execute(
+                "INSERT INTO work_items (id, project_id, type, title, status, created_at)
+                 VALUES (?1, ?2, 'task', 'Target Task', 'open', '2026-09-29T10:00:00Z')",
+                [target_wi, &run.project_id],
+            )
+            .unwrap();
+
+        drop(ledger);
+
+        // Test merge endpoint
+        let merge_req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/corrections/merge?token={token}"))
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                json!({
+                    "source": run.work_item_id,
+                    "target": target_wi,
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let merge_res = app.clone().oneshot(merge_req).await.unwrap();
+        assert_eq!(merge_res.status(), StatusCode::OK);
+
+        // Test invalid merge endpoint (cross-project / non-existent)
+        let bad_merge_req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/corrections/merge?token={token}"))
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                json!({
+                    "source": "nonexistent_source",
+                    "target": target_wi,
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let bad_merge_res = app.clone().oneshot(bad_merge_req).await.unwrap();
+        assert_eq!(bad_merge_res.status(), StatusCode::BAD_REQUEST);
+
+        // Test invalid split endpoint (empty spans)
+        let bad_split_req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/corrections/split?token={token}"))
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                json!({
+                    "source": target_wi,
+                    "title": "New Extracted Item",
+                    "spans": []
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let bad_split_res = app.oneshot(bad_split_req).await.unwrap();
+        assert_eq!(bad_split_res.status(), StatusCode::BAD_REQUEST);
     }
 }

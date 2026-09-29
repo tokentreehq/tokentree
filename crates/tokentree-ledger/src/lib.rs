@@ -8,8 +8,9 @@ pub mod spool;
 pub mod tree;
 
 pub use corrections::{
-    add_note, attach_session, detach_session, ensure_session_attribution, move_work_item,
-    reclassify_work_item, rename_work_item,
+    add_note, attach_session, detach_session, ensure_session_attribution, merge_work_items,
+    move_work_item, reclassify_work_item, rename_work_item, split_work_item,
+    validate_group_invariant,
 };
 pub use export::{export_csv, export_html, export_json, html_escape};
 pub use manual::{
@@ -105,7 +106,8 @@ impl Ledger {
              coalesce(sum(CASE WHEN input_tokens IS NOT NULL OR cached_input_tokens IS NOT NULL OR cache_write_tokens IS NOT NULL OR output_tokens IS NOT NULL OR reasoning_tokens IS NOT NULL THEN 1 ELSE 0 END),0),
              coalesce(sum(CASE WHEN input_tokens IS NULL AND cached_input_tokens IS NULL AND cache_write_tokens IS NULL AND output_tokens IS NULL AND reasoning_tokens IS NULL THEN 1 ELSE 0 END),0),
              coalesce(sum(input_tokens),0),coalesce(sum(cached_input_tokens),0),coalesce(sum(cache_write_tokens),0),coalesce(sum(output_tokens),0),coalesce(sum(reasoning_tokens),0)
-             FROM usage_events",
+             FROM usage_events
+             WHERE source_kind NOT IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter')",
             [],
             |row| Ok(AggregateUsage {
                 requests: row.get::<_, i64>(0)? as u64,
@@ -142,6 +144,7 @@ pub struct ReconcileResult {
     pub duplicate_request_ids: u64,
     pub unresolved_anomalies: u64,
     pub subagent_reconciliation: String,
+    pub duplicate_subagent_counters: u64,
 }
 
 pub fn reconcile(connection: &Connection) -> Result<ReconcileResult> {
@@ -152,18 +155,131 @@ pub fn reconcile(connection: &Connection) -> Result<ReconcileResult> {
         [],
         |row| row.get(0),
     )?;
+
+    // Detect duplicate final-request / lifecycle counters vs request-level events:
+    // Any turn or request where there is both a request-level event and a final-request counter event,
+    // or multiple final-request counters for the same turn.
+    let duplicate_subagent_counters: i64 = connection.query_row(
+        "SELECT count(*) FROM (
+            SELECT session_id, turn_id FROM usage_events
+            WHERE source_kind IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter')
+            GROUP BY session_id, turn_id
+            HAVING count(*) > 1
+            UNION
+            SELECT e1.session_id, e1.turn_id
+            FROM usage_events e1
+            JOIN usage_events e2 ON e1.session_id = e2.session_id
+                AND ((e1.turn_id IS NOT NULL AND e1.turn_id = e2.turn_id) OR (e1.request_id IS NOT NULL AND e1.request_id = e2.request_id))
+            WHERE e1.source_kind IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter')
+              AND e2.source_kind NOT IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter')
+        )",
+        [],
+        |row| row.get(0),
+    ).unwrap_or(0);
+
     let unresolved_anomalies: i64 = connection.query_row(
         "SELECT count(*) FROM measurement_anomalies WHERE resolved_at IS NULL",
         [],
         |row| row.get(0),
     )?;
 
+    // Check adapter capability for subagent tokens
+    let cap_row: Option<(String, Option<String>)> = connection
+        .query_row(
+            "SELECT state, detail FROM adapter_capabilities
+             WHERE capability = 'subagent_tokens_already_in_parent'
+             ORDER BY checked_at DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok();
+
+    let subagent_reconciliation = match cap_row {
+        Some((state, detail)) if state == "available" => {
+            let is_in_parent = detail
+                .as_deref()
+                .map(|d| {
+                    let s = d.trim().to_ascii_lowercase();
+                    s == "true"
+                        || s.contains("\"already_in_parent\":true")
+                        || s.contains("\"already_in_parent\": true")
+                })
+                .unwrap_or(false);
+            if is_in_parent {
+                "verified: child tokens included in parent (no double-counting)".to_string()
+            } else {
+                "verified: child tokens independent (rolled up to parent)".to_string()
+            }
+        }
+        Some((state, _)) => format!("degraded: subagent capability state is {state}"),
+        None => "degraded: capability unknown or missing".to_string(),
+    };
+
     Ok(ReconcileResult {
         sessions: sessions.max(0) as u64,
         duplicate_request_ids: duplicate_requests.max(0) as u64,
         unresolved_anomalies: unresolved_anomalies.max(0) as u64,
-        subagent_reconciliation: "unavailable until adapter capability is verified".to_owned(),
+        subagent_reconciliation,
+        duplicate_subagent_counters: duplicate_subagent_counters.max(0) as u64,
     })
+}
+
+pub fn register_project_root(
+    connection: &mut Connection,
+    project_id: &str,
+    canonical_path: &str,
+    root_type: &str,
+) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let fingerprint = stable_id("root", canonical_path);
+    connection.execute(
+        "INSERT INTO project_roots (project_id, canonical_path, root_type, fingerprint, active, first_seen_at, last_seen_at)
+         VALUES (?1, ?2, ?3, ?4, 1, ?5, ?5)
+         ON CONFLICT (project_id, canonical_path) DO UPDATE SET active = 1, last_seen_at = ?5",
+        params![project_id, canonical_path, root_type, fingerprint, now],
+    )?;
+    Ok(())
+}
+
+pub fn deactivate_project_root(connection: &mut Connection, canonical_path: &str) -> Result<()> {
+    let changed = connection.execute(
+        "UPDATE project_roots SET active = 0 WHERE canonical_path = ?1",
+        params![canonical_path],
+    )?;
+    if changed == 0 {
+        bail!("Project root {canonical_path} not found");
+    }
+    Ok(())
+}
+
+pub fn move_project_root(
+    connection: &mut Connection,
+    old_path: &str,
+    new_path: &str,
+) -> Result<()> {
+    let project_id: String = connection
+        .query_row(
+            "SELECT project_id FROM project_roots WHERE canonical_path = ?1",
+            [old_path],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("Project root {old_path} not found"))?;
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let tx = connection.transaction()?;
+    tx.execute(
+        "UPDATE project_roots SET active = 0 WHERE canonical_path = ?1",
+        params![old_path],
+    )?;
+    let new_fingerprint = stable_id("root", new_path);
+    tx.execute(
+        "INSERT INTO project_roots (project_id, canonical_path, root_type, fingerprint, active, first_seen_at, last_seen_at)
+         VALUES (?1, ?2, 'moved', ?3, 1, ?4, ?4)
+         ON CONFLICT (project_id, canonical_path) DO UPDATE SET active = 1, last_seen_at = ?4",
+        params![project_id, new_path, new_fingerprint, now],
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 pub fn ingest_observations(

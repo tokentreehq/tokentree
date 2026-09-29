@@ -13,7 +13,7 @@
 - [x] Rust conservative boundary classifier and secret-redacting label generator
 - [x] Rust hook spool worker with crash-safe SQLite checkpointing
 - [x] Port recursive tree/query/corrections to Rust
-- [x] Signed cross-platform binaries and scoped npm launcher
+- [x] Cross-platform release pipeline with SHA-256 checksum generation and scoped npm launcher
 
 ## Phase 0 — Fixtures, schema, and naming
 - [x] Locked names and distribution decisions
@@ -46,19 +46,21 @@
 - [x] Checkpointed background hook spool consumer
 - [x] Transient-prompt classifier worker
 - [x] Recursive `/tokentree` project/work-item tree and structured query
-- [x] Attach/detach/note corrections
+- [x] Attach/detach/note/merge/split corrections with transactional 10,000 bp invariants
 - [x] One-time clarification flow
 - [x] Bundled release CLI and real Claude compatibility proof
+- [x] Multi-root project tree aggregation, root deactivation, and directory move
+- [x] Subagent capability-based reconciliation and duplicate counter detection
 
 ## Phase 3 — Dashboard, static export, and corrections
 - [x] Local web dashboard (loopback + random session token)
 - [x] Interactive tree drilldown and project inspection
-- [x] In-dashboard corrections (rename, move, add note, attach, detach)
+- [x] In-dashboard corrections (rename, merge, split, move, add note, attach, detach)
 - [x] Self-contained static HTML export (`tokentree report --html`)
 - [x] Structured JSON and CSV exports (`tokentree export`)
 
 ## Phase 4 — Hardening and distribution
-- [x] Signed cross-platform release pipeline and scoped npm launcher
-- [x] End-to-end beta validation (Acceptance criteria 1–36 audited in `docs/public-beta-evidence.md`: 35 PASS, 1 DEFERRED)
+- [x] Cross-platform release pipeline with SHA-256 checksums and scoped npm launcher (code signing keys pending external organization release)
+- [x] End-to-end beta validation (Acceptance criteria 1–36 audited in `docs/public-beta-evidence.md`: 31 PASS, 4 PARTIAL, 1 DEFERRED)
 
 

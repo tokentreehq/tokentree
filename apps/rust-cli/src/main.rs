@@ -14,9 +14,9 @@ use tokentree_claude::{discover_sessions, parse_session};
 use tokentree_core::{PriceSnapshot, token_completeness};
 use tokentree_ledger::{
     Ledger, ManualCounts, ManualStartInput, add_note, apply_prototype, attach_session,
-    detach_session, export_csv, export_html, export_json, load_project_trees, move_work_item,
-    preview_prototype, query_ledger, rename_work_item, render_project_trees, start_manual,
-    stop_manual,
+    detach_session, export_csv, export_html, export_json, load_project_trees, merge_work_items,
+    move_work_item, preview_prototype, query_ledger, rename_work_item, render_project_trees,
+    split_work_item, start_manual, stop_manual,
 };
 
 const DISCLAIMER: &str = "Amounts are list-price estimates from public per-token rates unless labeled otherwise. They are not your provider invoice, prepaid credit balance, or subscription allowance.";
@@ -123,6 +123,20 @@ enum Command {
         task: String,
         #[arg(long)]
         parent: Option<String>,
+    },
+    Merge {
+        #[arg(long)]
+        source: String,
+        #[arg(long)]
+        target: String,
+    },
+    Split {
+        #[arg(long)]
+        source: String,
+        #[arg(long)]
+        title: String,
+        #[arg(long, value_delimiter = ',')]
+        spans: Vec<String>,
     },
     Classify,
     Reconcile,
@@ -235,6 +249,12 @@ fn run() -> Result<()> {
         Command::Note { text, task } => note(&home, &text, task.as_deref()),
         Command::Rename { task, title } => rename(&home, &task, &title),
         Command::Move { task, parent } => move_item(&home, &task, parent.as_deref()),
+        Command::Merge { source, target } => merge(&home, &source, &target),
+        Command::Split {
+            source,
+            title,
+            spans,
+        } => split(&home, &source, &title, &spans),
         Command::Classify => classify(&home),
         Command::Reconcile => reconcile_cmd(&home),
         Command::MigratePrototype {
@@ -521,6 +541,28 @@ fn move_item(home: &Path, task: &str, parent: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+fn merge(home: &Path, source: &str, target: &str) -> Result<()> {
+    let mut ledger = ledger(home)?;
+    let reattributed = merge_work_items(ledger.connection_mut(), source, target)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(
+            &json!({ "merged": true, "spans_reattributed": reattributed })
+        )?
+    );
+    Ok(())
+}
+
+fn split(home: &Path, source: &str, title: &str, spans: &[String]) -> Result<()> {
+    let mut ledger = ledger(home)?;
+    let new_id = split_work_item(ledger.connection_mut(), source, title, spans)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({ "split": true, "new_work_item_id": new_id }))?
+    );
+    Ok(())
+}
+
 fn classify(home: &Path) -> Result<()> {
     let mut ledger = ledger(home)?;
     let spool = home.join("spool/claude-hooks.jsonl");
@@ -539,6 +581,10 @@ fn reconcile_cmd(home: &Path) -> Result<()> {
     );
     println!("unresolved anomalies: {}", res.unresolved_anomalies);
     println!("subagent reconciliation: {}", res.subagent_reconciliation);
+    println!(
+        "duplicate subagent counters: {}",
+        res.duplicate_subagent_counters
+    );
     Ok(())
 }
 

@@ -12,8 +12,8 @@ export function redactedLabel(text:string):string{
 }
 export function classifyBoundary(input:BoundaryInput):BoundaryResult{
  const lower=input.text.toLowerCase(),signals:string[]=[];
- if(input.issueIdChanged||/\b(?:switch topics?|new task|unrelated|separately)\b/.test(lower)){signals.push(input.issueIdChanged?'issue_id_changed':'explicit_switch');return{outcome:'SWITCH',score:.92,signals,derivedLabel:redactedLabel(input.text)};}
- if(input.hasOpenParent&&(/\b(?:regression test|add (?:a )?test|document (?:the|this) fix)\b/.test(lower)||input.explicitParentRequest)){signals.push('open_parent','bounded_follow_up');return{outcome:'CHILD',score:.9,signals,derivedLabel:redactedLabel(input.text)};}
- if(/\b(?:also|continue|same|that|it|nearby|follow.?up)\b/.test(lower)){signals.push('continuity_language');return{outcome:'CONTINUE',score:.82,signals,derivedLabel:redactedLabel(input.text)};}
+ if(input.issueIdChanged||/\b(?:switch(?: (?:topics?|to))?|new task|unrelated|separately|start working on|pause this)\b/.test(lower)){signals.push(input.issueIdChanged?'issue_id_changed':'explicit_switch');return{outcome:'SWITCH',score:.92,signals,derivedLabel:redactedLabel(input.text)};}
+ if(input.hasOpenParent&&(/\b(?:regression test|add (?:a )?test|document (?:the|this) fix|benchmark|microbenchmark|extract|investigate|profile)\b/.test(lower)||input.explicitParentRequest)){signals.push('open_parent','bounded_follow_up');return{outcome:'CHILD',score:.9,signals,derivedLabel:redactedLabel(input.text)};}
+ if(/\b(?:also|continue|same|that|it|nearby|follow.?up|too|above|keep going|finish)\b/.test(lower)){signals.push('continuity_language');return{outcome:'CONTINUE',score:.82,signals,derivedLabel:redactedLabel(input.text)};}
  signals.push('insufficient_boundary_evidence');return{outcome:'UNCERTAIN',score:.45,signals,derivedLabel:redactedLabel(input.text)};
 }

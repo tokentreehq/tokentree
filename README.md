@@ -16,8 +16,8 @@ TokenTree is an open-source, local-first developer tool that measures AI coding-
 - **Recursive Terminal Trees**: `tokentree report --text` renders hierarchical project/work-item rollups in under 50ms without opening ports.
 - **Interactive Local Dashboard**: `tokentree dashboard` opens a loopback-only SPA with ephemeral random session tokens, strict CSP, and zero external CDNs.
 - **Static HTML & Multi-Format Export**: `tokentree report --html` generates self-contained, XSS-safe static reports; `tokentree export` provides JSON and CSV.
-- **Versioned Corrections**: Rename, move, add note, attach, and detach operations maintaining 10,000 basis points weight invariants.
-- **Cross-Platform**: Binaries for macOS (Apple Silicon / Intel), Linux (x86_64, aarch64), and Windows (x64) with signed release workflows.
+- **Versioned Corrections**: Rename, merge, split, move, add note, attach, and detach operations maintaining 10,000 basis points weight invariants transactionally in the authoritative Rust write path.
+- **Cross-Platform**: Binaries for macOS (Apple Silicon / Intel), Linux (x86_64, aarch64), and Windows (x64) with SHA-256 checksummed release workflows.
 
 ## Documentation
 

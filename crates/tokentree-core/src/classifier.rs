@@ -115,11 +115,12 @@ pub fn classify_boundary(input: &BoundaryInput<'_>) -> BoundaryResult {
     let lower = input.text.to_ascii_lowercase();
     let mut signals = Vec::new();
 
-    let has_switch_phrase = lower.contains("switch topic")
-        || lower.contains("switch topics")
+    let has_switch_phrase = lower.contains("switch")
         || lower.contains("new task")
         || lower.contains("unrelated")
-        || lower.contains("separately");
+        || lower.contains("separately")
+        || lower.contains("start working on")
+        || lower.contains("pause this");
 
     if input.issue_id_changed || has_switch_phrase {
         signals.push(
@@ -142,7 +143,12 @@ pub fn classify_boundary(input: &BoundaryInput<'_>) -> BoundaryResult {
         || lower.contains("add test")
         || lower.contains("add a test")
         || lower.contains("document the fix")
-        || lower.contains("document this fix");
+        || lower.contains("document this fix")
+        || lower.contains("benchmark")
+        || lower.contains("microbenchmark")
+        || lower.contains("extract")
+        || lower.contains("investigate")
+        || lower.contains("profile");
 
     if input.has_open_parent && (has_child_phrase || input.explicit_parent_request) {
         signals.push("open_parent".to_owned());
@@ -163,7 +169,11 @@ pub fn classify_boundary(input: &BoundaryInput<'_>) -> BoundaryResult {
         || lower.contains("nearby")
         || lower.contains("follow up")
         || lower.contains("follow-up")
-        || lower.contains("followup");
+        || lower.contains("followup")
+        || lower.contains(" too")
+        || lower.contains("above")
+        || lower.contains("keep going")
+        || lower.contains("finish");
 
     if has_continue_phrase {
         signals.push("continuity_language".to_owned());
@@ -228,5 +238,65 @@ mod tests {
             explicit_parent_request: false,
         });
         assert_eq!(res.outcome, BoundaryOutcome::CONTINUE);
+    }
+
+    #[test]
+    fn test_dynamic_boundary_evaluation_on_eval_fixture() {
+        #[derive(serde::Deserialize)]
+        struct EvalRow {
+            id: String,
+            sanitized_input: String,
+            expected: String,
+            parent_evidence: Option<bool>,
+            issue_id_changed: Option<bool>,
+        }
+
+        let eval_jsonl = include_str!("../../../fixtures/boundaries/eval.jsonl");
+        let mut total = 0;
+        let mut correct = 0;
+
+        for line in eval_jsonl.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let row: EvalRow = serde_json::from_str(line).expect("valid eval JSON");
+            total += 1;
+
+            let res = classify_boundary(&BoundaryInput {
+                text: &row.sanitized_input,
+                has_open_parent: row.parent_evidence.unwrap_or(false),
+                issue_id_changed: row.issue_id_changed.unwrap_or(false),
+                explicit_parent_request: false,
+            });
+
+            if res.outcome.as_str() == row.expected {
+                correct += 1;
+            } else {
+                eprintln!(
+                    "Mismatch on {}: expected {}, got {}",
+                    row.id,
+                    row.expected,
+                    res.outcome.as_str()
+                );
+            }
+        }
+
+        assert!(total >= 10, "Expected at least 10 evaluation samples");
+        let accuracy = correct as f64 / total as f64;
+        let error_rate = (total - correct) as f64 / total as f64;
+        let acc_pct = accuracy * 100.0;
+        let err_pct = error_rate * 100.0;
+        println!(
+            "Rust Dynamic Boundary Evaluation: Accuracy={acc_pct:.1}%, ErrorRate={err_pct:.1}%"
+        );
+        assert!(
+            accuracy >= 0.90,
+            "Accuracy {acc_pct:.1}% below 90% threshold"
+        );
+        assert!(
+            error_rate <= 0.10,
+            "Error rate {err_pct:.1}% exceeds 10% threshold"
+        );
     }
 }
