@@ -21,3 +21,6 @@ tokentree-core = { path = "../../crates/tokentree-core" }
 tokentree-ledger = { path = "../../crates/tokentree-ledger" }
 tokentree-otel = { path = "../../crates/tokentree-otel" }
 tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -2,14 +2,14 @@
 use crate::stable_id;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::Path;
 use tokentree_core::{ResolveProjectInput, resolve_project};
 
-#[derive(Debug, Default, Eq, PartialEq)]
+#[derive(Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HookWorkerSummary {
     pub processed: u64,
     pub skipped: u64,

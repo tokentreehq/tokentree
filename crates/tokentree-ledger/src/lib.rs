@@ -1,9 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
+pub mod corrections;
+pub mod manual;
 pub mod pricing;
+pub mod prototype;
 pub mod spool;
+pub mod tree;
 
-pub use pricing::PricingSummary;
+pub use corrections::{
+    add_note, attach_session, detach_session, ensure_session_attribution, move_work_item,
+    reclassify_work_item, rename_work_item,
+};
+pub use manual::{
+    ManualCounts, ManualStartInput, ManualStartResult, ManualStopResult, start_manual, stop_manual,
+};
+pub use pricing::{PricingSummary, apply_price_snapshot};
+pub use prototype::{PrototypePreview, apply_prototype, preview_prototype};
 pub use spool::HookWorkerSummary;
+pub use tree::{
+    ProjectTree, UsageTotals, WorkTreeNode, format_totals, load_project_trees, query_ledger,
+    render_project_trees,
+};
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, params};
@@ -67,6 +83,10 @@ impl Ledger {
         &self.connection
     }
 
+    pub fn connection_mut(&mut self) -> &mut Connection {
+        &mut self.connection
+    }
+
     pub fn integrity_check(&self) -> Result<String> {
         Ok(self
             .connection
@@ -74,63 +94,7 @@ impl Ledger {
     }
 
     pub fn ingest(&mut self, observations: Vec<UsageObservation>) -> Result<IngestSummary> {
-        let deduped = deduplicate(observations);
-        let transaction = self.connection.transaction()?;
-        let mut summary = IngestSummary {
-            conflicts: deduped.conflicts as u64,
-            ..IngestSummary::default()
-        };
-
-        for observation in &deduped.canonical {
-            let session_id = stable_id(
-                "ses",
-                &format!(
-                    "{}:{}",
-                    observation.adapter, observation.provider_session_id
-                ),
-            );
-            transaction.execute(
-                "INSERT OR IGNORE INTO sessions(id,adapter,provider_session_id,source_path,started_at) VALUES(?,?,?,?,?)",
-                params![session_id, observation.adapter, observation.provider_session_id, observation.source_path, observation.source_timestamp.as_deref().unwrap_or(&observation.observed_at)],
-            )?;
-            let input_tokens = sql_integer(observation.usage.input_tokens)?;
-            let cached_input_tokens = sql_integer(observation.usage.cached_input_tokens)?;
-            let cache_write_tokens = sql_integer(observation.usage.cache_write_tokens)?;
-            let output_tokens = sql_integer(observation.usage.output_tokens)?;
-            let reasoning_tokens = sql_integer(observation.usage.reasoning_tokens)?;
-            let provider_cost = sql_integer(observation.provider_reported_cost_micros)?;
-            let source_offset = i64::try_from(observation.source_offset)
-                .context("source offset exceeds SQLite integer range")?;
-            let changed = transaction.execute(
-                "INSERT OR IGNORE INTO usage_events(
-                  id,adapter,source_kind,source_event_id,session_id,turn_id,request_id,source_timestamp,
-                  observed_at,ingested_at,model,service_tier,region,input_tokens,cached_input_tokens,
-                  cache_write_tokens,output_tokens,reasoning_tokens,provider_reported_cost_micros,
-                  source_path,source_offset,event_hash,adapter_version,parser_version
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                params![
-                    stable_id("evt", &observation.canonical_identity()), observation.adapter,
-                    observation.source.as_str(), observation.source_event_id, session_id,
-                    observation.turn_id, observation.request_id, observation.source_timestamp,
-                    observation.observed_at, observation.observed_at, observation.model,
-                    observation.service_tier, observation.region, input_tokens,
-                    cached_input_tokens, cache_write_tokens, output_tokens, reasoning_tokens,
-                    provider_cost, observation.source_path, source_offset,
-                    observation.event_hash(), observation.adapter_version,
-                    observation.parser_version,
-                ],
-            )?;
-            if changed == 1 {
-                summary.inserted += 1;
-                if !observation.usage.is_measured() {
-                    summary.unavailable += 1;
-                }
-            } else {
-                summary.duplicates += 1;
-            }
-        }
-        transaction.commit()?;
-        Ok(summary)
+        ingest_observations(&mut self.connection, observations)
     }
 
     pub fn aggregate_usage(&self) -> Result<AggregateUsage> {
@@ -164,6 +128,118 @@ impl Ledger {
     pub fn process_claude_hook_spool(&mut self, spool_path: &Path) -> Result<HookWorkerSummary> {
         spool::process_claude_hook_spool(&mut self.connection, spool_path)
     }
+
+    pub fn reconcile(&self) -> Result<ReconcileResult> {
+        reconcile(&self.connection)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReconcileResult {
+    pub sessions: u64,
+    pub duplicate_request_ids: u64,
+    pub unresolved_anomalies: u64,
+    pub subagent_reconciliation: String,
+}
+
+pub fn reconcile(connection: &Connection) -> Result<ReconcileResult> {
+    let sessions: i64 =
+        connection.query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))?;
+    let duplicate_requests: i64 = connection.query_row(
+        "SELECT count(*) FROM (SELECT request_id FROM usage_events WHERE request_id IS NOT NULL GROUP BY request_id HAVING count(*) > 1)",
+        [],
+        |row| row.get(0),
+    )?;
+    let unresolved_anomalies: i64 = connection.query_row(
+        "SELECT count(*) FROM measurement_anomalies WHERE resolved_at IS NULL",
+        [],
+        |row| row.get(0),
+    )?;
+
+    Ok(ReconcileResult {
+        sessions: sessions.max(0) as u64,
+        duplicate_request_ids: duplicate_requests.max(0) as u64,
+        unresolved_anomalies: unresolved_anomalies.max(0) as u64,
+        subagent_reconciliation: "unavailable until adapter capability is verified".to_owned(),
+    })
+}
+
+pub fn ingest_observations(
+    connection: &mut Connection,
+    observations: Vec<UsageObservation>,
+) -> Result<IngestSummary> {
+    let deduped = deduplicate(observations);
+    let transaction = connection.transaction()?;
+    let mut summary = IngestSummary {
+        conflicts: deduped.conflicts as u64,
+        ..IngestSummary::default()
+    };
+
+    for observation in &deduped.canonical {
+        let session_id = stable_id(
+            "ses",
+            &format!(
+                "{}:{}",
+                observation.adapter, observation.provider_session_id
+            ),
+        );
+        transaction.execute(
+            "INSERT OR IGNORE INTO sessions(id,adapter,provider_session_id,source_path,started_at) VALUES(?,?,?,?,?)",
+            params![session_id, observation.adapter, observation.provider_session_id, observation.source_path, observation.source_timestamp.as_deref().unwrap_or(&observation.observed_at)],
+        )?;
+        let input_tokens = sql_integer(observation.usage.input_tokens)?;
+        let cached_input_tokens = sql_integer(observation.usage.cached_input_tokens)?;
+        let cache_write_tokens = sql_integer(observation.usage.cache_write_tokens)?;
+        let output_tokens = sql_integer(observation.usage.output_tokens)?;
+        let reasoning_tokens = sql_integer(observation.usage.reasoning_tokens)?;
+        let provider_cost = sql_integer(observation.provider_reported_cost_micros)?;
+        let source_offset = i64::try_from(observation.source_offset)
+            .context("source offset exceeds SQLite integer range")?;
+        let changed = transaction.execute(
+            "INSERT OR IGNORE INTO usage_events(
+              id,adapter,source_kind,source_event_id,session_id,turn_id,request_id,source_timestamp,
+              observed_at,ingested_at,model,service_tier,region,input_tokens,cached_input_tokens,
+              cache_write_tokens,output_tokens,reasoning_tokens,provider_reported_cost_micros,
+              source_path,source_offset,event_hash,adapter_version,parser_version
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            params![
+                stable_id("evt", &observation.canonical_identity()),
+                observation.adapter,
+                observation.source.as_str(),
+                observation.source_event_id,
+                session_id,
+                observation.turn_id,
+                observation.request_id,
+                observation.source_timestamp,
+                observation.observed_at,
+                observation.observed_at,
+                observation.model,
+                observation.service_tier,
+                observation.region,
+                input_tokens,
+                cached_input_tokens,
+                cache_write_tokens,
+                output_tokens,
+                reasoning_tokens,
+                provider_cost,
+                observation.source_path,
+                source_offset,
+                observation.event_hash(),
+                observation.adapter_version,
+                observation.parser_version,
+            ],
+        )?;
+        if changed == 1 {
+            summary.inserted += 1;
+            if !observation.usage.is_measured() {
+                summary.unavailable += 1;
+            }
+        } else {
+            summary.duplicates += 1;
+        }
+    }
+    transaction.commit()?;
+    Ok(summary)
 }
 
 fn sql_integer(value: Option<u64>) -> Result<Option<i64>> {

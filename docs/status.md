@@ -12,7 +12,7 @@
 - [x] Rust project resolution (override, safe config, git, manifest, cwd)
 - [x] Rust conservative boundary classifier and secret-redacting label generator
 - [x] Rust hook spool worker with crash-safe SQLite checkpointing
-- [ ] Port recursive tree/query/corrections to Rust
+- [x] Port recursive tree/query/corrections to Rust
 - [ ] Signed cross-platform binaries and scoped npm launcher
 
 ## Phase 0 — Fixtures, schema, and naming

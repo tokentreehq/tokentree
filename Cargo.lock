@@ -967,6 +967,7 @@ dependencies = [
  "dirs",
  "serde_json",
  "sha2",
+ "tempfile",
  "tokentree-claude",
  "tokentree-core",
  "tokentree-ledger",
