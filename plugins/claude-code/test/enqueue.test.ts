@@ -1,0 +1,8 @@
+// SPDX-License-Identifier: Apache-2.0
+import{readFileSync,statSync}from'node:fs';import{mkdtempSync}from'node:fs';import{tmpdir}from'node:os';import{join}from'node:path';import{describe,expect,it}from'vitest';import{enqueue,sanitizeHook}from'../scripts/enqueue.mjs';
+describe('Claude enqueue hook',()=>{
+ it('never stores prompt text or tool payloads',()=>{const value=sanitizeHook({hook_event_name:'UserPromptSubmit',session_id:'s',prompt:'secret full prompt',tool_input:{content:'source code'}});const json=JSON.stringify(value);expect(json).not.toContain('secret full prompt');expect(json).not.toContain('source code');expect(value.payload.prompt_fingerprint).toMatch(/^[a-f0-9]{64}$/);});
+ it('keeps only file path for selected write tools',()=>{const value=sanitizeHook({hook_event_name:'PostToolUse',tool_name:'Write',tool_input:{file_path:'/tmp/a.ts',content:'private'}});expect(value.payload.file_path).toBe('/tmp/a.ts');expect(JSON.stringify(value)).not.toContain('private');});
+ it('appends a compact 0600 spool record',()=>{const home=mkdtempSync(join(tmpdir(),'tt-'));const path=enqueue({hook_event_name:'Stop',session_id:'s'},home);expect(readFileSync(path,'utf8')).toContain('"kind":"Stop"');if(process.platform!=='win32')expect(statSync(path).mode&0o777).toBe(0o600);});
+ it('keeps in-process p95 below 100ms',()=>{const samples=[];for(let i=0;i<1000;i++){const start=performance.now();sanitizeHook({hook_event_name:'UserPromptSubmit',prompt:'synthetic prompt'});samples.push(performance.now()-start);}samples.sort((a,b)=>a-b);expect(samples[Math.floor(samples.length*.95)]).toBeLessThan(100);});
+});

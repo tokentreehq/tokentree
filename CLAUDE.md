@@ -58,7 +58,7 @@ Default local-only; no telemetry or network. Do not persist prompts, completions
 - `--text` must never bind a port.
 
 ## Current phase
-Phase 0: schema, naming, fixtures, evaluation harness, and threat model. Next slice: Phase 1 streaming Claude discovery, normalization, and idempotent ingestion.
+Phase 2 in progress: enqueue-only Claude hooks, project resolution, boundary classification, and manual capture exist. Next slice: background spool consumption, recursive tree/query, and attach/detach/note. Phase 3 remains gated.
 
 ## Adding an adapter
 Discover sessions; stream and normalize requests; declare capabilities including `subagent_tokens_already_in_parent`; add sanitized fixtures and golden tests; pass the compatibility matrix; only then claim support.

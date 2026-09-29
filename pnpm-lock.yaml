@@ -30,13 +30,42 @@ importers:
         specifier: ^3.2.4
         version: 3.2.7(@types/node@24.19.0)(tsx@4.23.15)
 
+  apps/cli:
+    dependencies:
+      '@tokentreehq/adapter-claude':
+        specifier: workspace:*
+        version: link:../../packages/adapters/claude
+      '@tokentreehq/core':
+        specifier: workspace:*
+        version: link:../../packages/core
+      '@tokentreehq/database':
+        specifier: workspace:*
+        version: link:../../packages/database
+      '@tokentreehq/pricing':
+        specifier: workspace:*
+        version: link:../../packages/pricing
+
+  packages/adapters/claude:
+    dependencies:
+      '@tokentreehq/core':
+        specifier: workspace:*
+        version: link:../../core
+
   packages/classifier: {}
 
   packages/core: {}
 
-  packages/database: {}
+  packages/database:
+    dependencies:
+      '@tokentreehq/core':
+        specifier: workspace:*
+        version: link:../core
 
-  packages/pricing: {}
+  packages/pricing:
+    dependencies:
+      '@tokentreehq/core':
+        specifier: workspace:*
+        version: link:../core
 
 packages:
 

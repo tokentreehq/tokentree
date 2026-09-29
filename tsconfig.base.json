@@ -10,6 +10,13 @@
     "sourceMap": true,
     "composite": true,
     "skipLibCheck": true,
-    "verbatimModuleSyntax": true
+    "verbatimModuleSyntax": true,
+    "baseUrl": ".",
+    "paths": {
+      "@tokentreehq/core": ["packages/core/src/index.ts"],
+      "@tokentreehq/database": ["packages/database/src/index.ts"],
+      "@tokentreehq/pricing": ["packages/pricing/src/index.ts"],
+      "@tokentreehq/adapter-claude": ["packages/adapters/claude/src/index.ts"]
+    }
   }
 }

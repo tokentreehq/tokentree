@@ -36,3 +36,6 @@ export function assertAttributionWeights(db: DatabaseSync, groupId: string): voi
   const row = db.prepare('SELECT coalesce(sum(weight_basis_points), 0) AS total FROM attributions WHERE group_id = ?').get(groupId) as { total: number };
   if (row.total !== 10_000) throw new Error(`Attribution group ${groupId} totals ${row.total} basis points; expected 10000`);
 }
+
+export { LedgerWriter, ingestObservations, openLedger, stableId } from './ledger.js';
+export type { IngestAnomaly, IngestSummary } from './ledger.js';

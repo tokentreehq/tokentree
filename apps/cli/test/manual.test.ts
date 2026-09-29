@@ -1,0 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+import{DatabaseSync}from'node:sqlite';import{describe,expect,it}from'vitest';import{applyMigrations}from'@tokentreehq/database';import{startManual,stopManual}from'../src/index.js';
+describe('manual capture',()=>{
+ it('stores unavailable rather than zero and Stop does not complete work',()=>{const db=new DatabaseSync(':memory:');applyMigrations(db);const run=startManual(db,{projectKey:'game',taskTitle:'add sound',cwd:'/tmp/game'});expect(stopManual(db).measurementStatus).toBe('unavailable');expect(db.prepare('select input_tokens from usage_events').get()?.input_tokens).toBeNull();expect(db.prepare('select status from work_items where id=?').get(run.workItemId)?.status).toBe('open');expect(db.prepare('select sum(weight_basis_points) total from attributions').get()?.total).toBe(10000);db.close();});
+ it('stores explicit integer counts as measured',()=>{const db=new DatabaseSync(':memory:');applyMigrations(db);startManual(db,{projectKey:'game',taskTitle:'fix bug',cwd:'/tmp/game'});expect(stopManual(db,{input:10,output:2,cacheRead:20,model:'fixture'}).measurementStatus).toBe('measured');expect(db.prepare('select input_tokens,cached_input_tokens from usage_events').get()).toMatchObject({input_tokens:10,cached_input_tokens:20});db.close();});
+});

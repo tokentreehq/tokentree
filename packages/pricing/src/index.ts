@@ -43,3 +43,5 @@ function isPriceSnapshot(value: unknown): value is PriceSnapshot {
   const candidate = value as Record<string, unknown>;
   return candidate.version === 1 && typeof candidate.updated === 'string' && candidate.currency === 'USD' && Array.isArray(candidate.models) && typeof candidate.sha256 === 'string';
 }
+export { calculateApiEquivalentCost } from './cost.js';
+export type { CostResult, ExactRates } from './cost.js';

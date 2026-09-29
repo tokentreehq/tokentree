@@ -255,5 +255,16 @@ CREATE TABLE notes (
   CHECK (project_id IS NOT NULL OR work_item_id IS NOT NULL)
 ) STRICT;
 
+CREATE TABLE manual_runs (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+  started_at TEXT NOT NULL,
+  stopped_at TEXT,
+  state TEXT NOT NULL CHECK (state IN ('active', 'stopped'))
+) STRICT;
+CREATE INDEX active_manual_runs ON manual_runs(started_at) WHERE state = 'active';
+
 CREATE INDEX anomalies_unresolved ON measurement_anomalies(session_id, turn_id) WHERE resolved_at IS NULL;
 CREATE INDEX costs_type ON cost_calculations(cost_type, currency);
