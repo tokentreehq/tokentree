@@ -973,11 +973,25 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokentree-claude",
+ "tokentree-codex",
  "tokentree-core",
  "tokentree-ledger",
  "tokentree-otel",
  "tokio",
  "tower",
+]
+
+[[package]]
+name = "tokentree-codex"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tokentree-core",
+ "tokentree-ledger",
+ "walkdir",
 ]
 
 [[package]]

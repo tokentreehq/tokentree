@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { describe, expect, it } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -82,6 +82,32 @@ describe('launcher findNativeBinary', () => {
     try {
       const found = findNativeBinary({ envBin: join(tmp, 'nonexistent'), baseDir: tmp });
       expect(found).toBeUndefined();
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('locates native binary in archive layout vendor directory with SHA-256 verification', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'tokentree-vendor-test-'));
+    try {
+      const vendorDir = join(tmp, 'vendor', 'x86_64-pc-windows-msvc');
+      mkdirSync(vendorDir, { recursive: true });
+      const binPath = join(vendorDir, 'tokentree.exe');
+      const binPayload = Buffer.from('mock windows release candidate binary content');
+      writeFileSync(binPath, binPayload);
+
+      const found = findNativeBinary({
+        baseDir: tmp,
+        platform: 'win32',
+        arch: 'x64',
+      });
+      expect(found).toBe(binPath);
+
+      const expectedSha256 = computeSha256(binPayload);
+      expect(verifyBinaryChecksum(found!, expectedSha256)).toBe(true);
+
+      const tamperedSha256 = '1111111111111111111111111111111111111111111111111111111111111111';
+      expect(verifyBinaryChecksum(found!, tamperedSha256)).toBe(false);
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }

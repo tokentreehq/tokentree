@@ -115,6 +115,48 @@ impl Ledger {
         spool::process_claude_hook_spool(&mut self.connection, spool_path)
     }
 
+    pub fn record_anomaly(
+        &mut self,
+        session_id: Option<&str>,
+        turn_id: Option<&str>,
+        anomaly_type: &str,
+        source_values_json: &str,
+    ) -> Result<()> {
+        let resolved_session_id: Option<String> = if let Some(s) = session_id {
+            self.connection
+                .query_row(
+                    "SELECT id FROM sessions WHERE id = ?1 OR provider_session_id = ?1 LIMIT 1",
+                    [s],
+                    |row| row.get(0),
+                )
+                .ok()
+        } else {
+            None
+        };
+
+        let resolved_turn_id: Option<String> = if let Some(t) = turn_id {
+            self.connection
+                .query_row("SELECT id FROM turns WHERE id = ?1 LIMIT 1", [t], |row| {
+                    row.get(0)
+                })
+                .ok()
+        } else {
+            None
+        };
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let id = stable_id(
+            "anom",
+            &format!("{}:{}:{}", anomaly_type, now, source_values_json),
+        );
+        self.connection.execute(
+            "INSERT INTO measurement_anomalies (id, session_id, turn_id, type, source_values_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, resolved_session_id, resolved_turn_id, anomaly_type, source_values_json, now],
+        )?;
+        Ok(())
+    }
+
     pub fn reconcile(&self) -> Result<ReconcileResult> {
         reconcile(&self.connection)
     }
@@ -287,6 +329,32 @@ pub fn ingest_observations(
             "INSERT OR IGNORE INTO sessions(id,adapter,provider_session_id,source_path,started_at) VALUES(?,?,?,?,?)",
             params![session_id, observation.adapter, observation.provider_session_id, observation.source_path, observation.source_timestamp.as_deref().unwrap_or(&observation.observed_at)],
         )?;
+        let turn_db_id = if let Some(t_id) = &observation.turn_id {
+            let turn_id = stable_id("turn", &format!("{}:{}", session_id, t_id));
+            let seq: i64 = transaction
+                .query_row(
+                    "SELECT coalesce(max(sequence_number) + 1, 0) FROM turns WHERE session_id = ?1",
+                    [&session_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            transaction.execute(
+                "INSERT OR IGNORE INTO turns (id, session_id, sequence_number, started_at, prompt_storage_mode)
+                 VALUES (?1, ?2, ?3, ?4, 'fingerprint_only')",
+                params![
+                    turn_id,
+                    session_id,
+                    seq,
+                    observation
+                        .source_timestamp
+                        .as_deref()
+                        .unwrap_or(&observation.observed_at)
+                ],
+            )?;
+            Some(turn_id)
+        } else {
+            None
+        };
         let input_tokens = sql_integer(observation.usage.input_tokens)?;
         let cached_input_tokens = sql_integer(observation.usage.cached_input_tokens)?;
         let cache_write_tokens = sql_integer(observation.usage.cache_write_tokens)?;
@@ -308,7 +376,7 @@ pub fn ingest_observations(
                 observation.source.as_str(),
                 observation.source_event_id,
                 session_id,
-                observation.turn_id,
+                turn_db_id,
                 observation.request_id,
                 observation.agent_id,
                 observation.parent_agent_id,
@@ -398,6 +466,7 @@ pub struct AggregateUsage {
     pub requests: u64,
     pub measured: u64,
     pub unavailable: u64,
+    pub anomalous: u64,
     pub input: u64,
     pub cache_read: u64,
     pub cache_write: u64,
@@ -416,6 +485,15 @@ pub struct AggregateUsage {
 /// - `Unknown`: include all events but mark `completeness_degraded = true`.
 pub fn aggregate_usage_with_policy(connection: &Connection) -> Result<AggregateUsage> {
     let policy = resolve_subagent_policy(connection);
+
+    let anomalous: u64 = connection
+        .query_row(
+            "SELECT count(*) FROM measurement_anomalies WHERE resolved_at IS NULL",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        .max(0) as u64;
 
     let is_subagent = "(ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id))";
 
@@ -438,6 +516,7 @@ pub fn aggregate_usage_with_policy(connection: &Connection) -> Result<AggregateU
                         requests: row.get::<_, i64>(0)? as u64,
                         measured: row.get::<_, i64>(1)? as u64,
                         unavailable: row.get::<_, i64>(2)? as u64,
+                        anomalous,
                         input: row.get::<_, i64>(3)? as u64,
                         cache_read: row.get::<_, i64>(4)? as u64,
                         cache_write: row.get::<_, i64>(5)? as u64,
@@ -463,6 +542,7 @@ pub fn aggregate_usage_with_policy(connection: &Connection) -> Result<AggregateU
                         requests: row.get::<_, i64>(0)? as u64,
                         measured: row.get::<_, i64>(1)? as u64,
                         unavailable: row.get::<_, i64>(2)? as u64,
+                        anomalous,
                         input: row.get::<_, i64>(3)? as u64,
                         cache_read: row.get::<_, i64>(4)? as u64,
                         cache_write: row.get::<_, i64>(5)? as u64,
@@ -501,6 +581,7 @@ pub fn aggregate_usage_with_policy(connection: &Connection) -> Result<AggregateU
                         requests: row.get::<_, i64>(0)? as u64,
                         measured: row.get::<_, i64>(1)? as u64,
                         unavailable: row.get::<_, i64>(2)? as u64,
+                        anomalous,
                         input: row.get::<_, i64>(3)? as u64,
                         cache_read: row.get::<_, i64>(4)? as u64,
                         cache_write: row.get::<_, i64>(5)? as u64,

@@ -52,6 +52,7 @@ export interface FindBinaryOptions {
   readonly envBin?: string;
   readonly baseDir?: string;
   readonly platform?: string;
+  readonly arch?: string;
 }
 
 export function findNativeBinary(options: FindBinaryOptions = {}): string | undefined {
@@ -60,12 +61,19 @@ export function findNativeBinary(options: FindBinaryOptions = {}): string | unde
     return envBin;
   }
   const platform = options.platform ?? process.platform;
+  const arch = options.arch ?? process.arch;
+  const target = resolvePlatformTarget(platform, arch);
   const ext = platform === 'win32' ? '.exe' : '';
+  const binName = target?.binaryName ?? `tokentree${ext}`;
   const baseDir = options.baseDir ?? import.meta.dirname;
   const candidates = [
-    join(baseDir, '..', 'bin', `tokentree${ext}`),
-    join(baseDir, '..', '..', '..', 'target', 'release', `tokentree${ext}`),
-    join(baseDir, '..', '..', '..', 'target', 'debug', `tokentree${ext}`),
+    join(baseDir, '..', 'bin', binName),
+    ...(target ? [
+      join(baseDir, '..', 'vendor', target.rustTarget, binName),
+      join(baseDir, 'vendor', target.rustTarget, binName),
+    ] : []),
+    join(baseDir, '..', '..', '..', 'target', 'release', binName),
+    join(baseDir, '..', '..', '..', 'target', 'debug', binName),
   ];
   for (const c of candidates) {
     if (existsSync(c)) return c;

@@ -159,6 +159,7 @@ enum Command {
 #[derive(Subcommand)]
 enum ImportSource {
     Claude { path: Option<PathBuf> },
+    Codex { path: Option<PathBuf> },
 }
 
 fn main() {
@@ -188,6 +189,9 @@ fn run() -> Result<()> {
         Command::Import {
             source: ImportSource::Claude { path },
         } => import_claude(&home, path.unwrap_or_else(default_claude_path)),
+        Command::Import {
+            source: ImportSource::Codex { path },
+        } => import_codex(&home, path.unwrap_or_else(default_codex_path)),
         Command::Report {
             text,
             html,
@@ -285,6 +289,12 @@ fn default_claude_path() -> PathBuf {
         .join(".claude/projects")
 }
 
+fn default_codex_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".codex/sessions")
+}
+
 fn ledger(home: &Path) -> Result<Ledger> {
     Ledger::open(home.join("ledger.db"))
 }
@@ -302,13 +312,23 @@ fn load_snapshot(home: &Path) -> Result<PriceSnapshot> {
 fn doctor(home: &Path) -> Result<()> {
     let ledger = ledger(home)?;
     let claude = default_claude_path();
+    let codex = default_codex_path();
     println!("database: {}", ledger.path().display());
     println!("Claude transcripts: {}", claude.display());
+    println!("Codex sessions: {}", codex.display());
     println!("TokenTree home: {}", home.display());
     println!(
         "Claude capture mode: {}",
         if claude.exists() {
             "logs (fallback)"
+        } else {
+            "manual/unavailable"
+        }
+    );
+    println!(
+        "Codex capture mode: {}",
+        if codex.exists() {
+            "rollout/app-server logs"
         } else {
             "manual/unavailable"
         }
@@ -361,6 +381,41 @@ fn import_claude(home: &Path, root: PathBuf) -> Result<()> {
     Ok(())
 }
 
+fn import_codex(home: &Path, root: PathBuf) -> Result<()> {
+    let sessions = tokentree_codex::discover_sessions(&root);
+    let mut ledger = ledger(home)?;
+    let mut inserted = 0;
+    let mut duplicates = 0;
+    let mut unknown = 0;
+    let mut malformed = 0;
+    let mut anomalies = 0;
+    for path in &sessions {
+        let parsed = tokentree_codex::parse_session(path)?;
+        unknown += parsed.stats.unknown;
+        malformed += parsed.stats.malformed;
+        anomalies += parsed.anomalies.len() as u64;
+        for anom in &parsed.anomalies {
+            ledger.record_anomaly(
+                anom.session_id.as_deref(),
+                anom.turn_id.as_deref(),
+                &anom.anomaly_type,
+                &anom.details.to_string(),
+            )?;
+        }
+        let summary = ledger.ingest(parsed.observations)?;
+        inserted += summary.inserted;
+        duplicates += summary.duplicates;
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "sessions": sessions.len(), "inserted": inserted, "duplicates": duplicates,
+            "unknown": unknown, "malformed": malformed, "anomalies": anomalies,
+        }))?
+    );
+    Ok(())
+}
+
 fn report(home: &Path, project_filter: Option<&str>) -> Result<()> {
     let mut ledger = ledger(home)?;
     if let Ok(snapshot) = load_snapshot(home) {
@@ -372,11 +427,11 @@ fn report(home: &Path, project_filter: Option<&str>) -> Result<()> {
     println!("{rendered_trees}");
 
     let usage = ledger.aggregate_usage()?;
-    let completeness = token_completeness(usage.measured, usage.unavailable, 0);
+    let completeness = token_completeness(usage.measured, usage.unavailable, usage.anomalous);
     println!("\nTokenTree ledger report");
     println!(
-        "requests: {} measured {} unavailable {}",
-        usage.requests, usage.measured, usage.unavailable
+        "requests: {} measured {} unavailable {} anomalous {}",
+        usage.requests, usage.measured, usage.unavailable, usage.anomalous
     );
     println!(
         "tokens: input {} cache-read {} cache-write {} output {} reasoning {}",

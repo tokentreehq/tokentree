@@ -61,6 +61,9 @@
 
 ## Phase 4 — Hardening and distribution
 - [x] Cross-platform release pipeline with SHA-256 checksums and scoped npm launcher (code signing keys pending external organization release)
-- [x] End-to-end beta validation (Acceptance criteria 1–36 audited in `docs/public-beta-evidence.md`: 31 PASS, 4 PARTIAL, 1 DEFERRED)
+- [x] End-to-end beta validation (Acceptance criteria 1–36 audited in `docs/public-beta-evidence.md`: 33 PASS, 3 PARTIAL, 0 DEFERRED; Criteria 18 and 24 fully passed with automated test evidence)
+- [x] OpenAI Codex adapter (`crates/tokentree-codex` & `packages/adapters/codex`) with hook boundary correlation, cumulative counter resets, negative delta anomalies, subagent tracking, and privacy enforcement (Criterion 24 PASS)
+- [x] Isolated Claude plugin automation, zero-config report, and data preservation on uninstall (Criteria 1, 2, 18 PASS)
+
 
 

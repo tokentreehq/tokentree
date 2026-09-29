@@ -26,6 +26,7 @@ export interface PredictionRow {
 export interface BinaryMetrics {
   readonly precision: number | null;
   readonly recall: number | null;
+  readonly f1: number | null;
   readonly errorRate: number;
   readonly truePositive: number;
   readonly falsePositive: number;
@@ -102,11 +103,16 @@ function binaryMetrics(
     truePositive + falseNegative === 0
       ? null
       : truePositive / (truePositive + falseNegative);
+  const f1 =
+    precision === null || recall === null || precision + recall === 0
+      ? null
+      : (2 * precision * recall) / (precision + recall);
   const errorRate = total === 0 ? 0 : (falsePositive + falseNegative) / total;
 
   return {
     precision,
     recall,
+    f1,
     errorRate,
     truePositive,
     falsePositive,
@@ -174,10 +180,15 @@ function percent(value: number | null): string {
   return value === null ? 'N/A' : `${(value * 100).toFixed(1)}%`;
 }
 
-export function formatEvaluation(result: Evaluation): string {
+export function formatEvaluation(result: Evaluation, corpusInfo?: { train: number; eval: number }): string {
   const lines: string[] = [];
 
   lines.push('=== Classifier Evaluation Report ===');
+  if (corpusInfo) {
+    lines.push(
+      `Corpus Breakdown: Train: ${corpusInfo.train} records | Held-Out Eval: ${corpusInfo.eval} records | Combined: ${corpusInfo.train + corpusInfo.eval} records`
+    );
+  }
   lines.push(`Overall Accuracy:   ${percent(result.overallAccuracy)}`);
   lines.push(`Overall Error Rate: ${percent(result.overallErrorRate)}`);
   lines.push('');
@@ -186,7 +197,7 @@ export function formatEvaluation(result: Evaluation): string {
   for (const outcome of OUTCOMES) {
     const m = result[outcome];
     lines.push(
-      `  ${outcome.padEnd(10)} Precision: ${percent(m.precision).padEnd(8)} Recall: ${percent(m.recall).padEnd(8)} Error Rate: ${percent(m.errorRate)} (TP: ${m.truePositive}, FP: ${m.falsePositive}, FN: ${m.falseNegative})`
+      `  ${outcome.padEnd(10)} Precision: ${percent(m.precision).padEnd(8)} Recall: ${percent(m.recall).padEnd(8)} F1: ${percent(m.f1).padEnd(8)} Error Rate: ${percent(m.errorRate)} (TP: ${m.truePositive}, FP: ${m.falsePositive}, FN: ${m.falseNegative})`
     );
   }
   lines.push('');
@@ -219,8 +230,16 @@ if (labelsPath && import.meta.url === pathToFileURL(process.argv[1] ?? '').href)
     ? parseJsonLines<PredictionRow>(readFileSync(predictionsPath, 'utf8'))
     : predictDynamically(labels);
 
+  const trainPath = labelsPath.replace('eval.jsonl', 'train.jsonl');
+  let trainCount = 0;
+  try {
+    trainCount = parseJsonLines<LabelRow>(readFileSync(trainPath, 'utf8')).length;
+  } catch {
+    trainCount = 0;
+  }
+
   const result = evaluate(labels, predictions);
-  console.log(formatEvaluation(result));
+  console.log(formatEvaluation(result, trainCount > 0 ? { train: trainCount, eval: labels.length } : undefined));
   if (result.missingPredictions.length > 0 || result.overallErrorRate > 0.15) {
     process.exitCode = 1;
   }

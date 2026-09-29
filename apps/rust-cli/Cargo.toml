@@ -20,6 +20,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tokentree-claude = { path = "../../crates/tokentree-claude" }
+tokentree-codex = { path = "../../crates/tokentree-codex" }
 tokentree-core = { path = "../../crates/tokentree-core" }
 tokentree-ledger = { path = "../../crates/tokentree-ledger" }
 tokentree-otel = { path = "../../crates/tokentree-otel" }

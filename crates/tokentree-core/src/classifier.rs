@@ -115,12 +115,23 @@ pub fn classify_boundary(input: &BoundaryInput<'_>) -> BoundaryResult {
     let lower = input.text.to_ascii_lowercase();
     let mut signals = Vec::new();
 
-    let has_switch_phrase = lower.contains("switch")
-        || lower.contains("new task")
-        || lower.contains("unrelated")
-        || lower.contains("separately")
-        || lower.contains("start working on")
-        || lower.contains("pause this");
+    let has_negative_switch = lower.contains("switch statement")
+        || lower.contains("switch case")
+        || lower.contains("switch expression")
+        || lower.contains("switch block")
+        || lower.contains("switch syntax")
+        || lower.contains("switch branch");
+
+    let has_switch_phrase = !has_negative_switch
+        && (lower.contains("switch topics")
+            || lower.contains("switch to")
+            || lower.contains("switch gears")
+            || lower.contains("switch context")
+            || lower.contains("new task")
+            || lower.contains("unrelated")
+            || lower.contains("separately")
+            || lower.contains("start working on")
+            || lower.contains("pause this"));
 
     if input.issue_id_changed || has_switch_phrase {
         signals.push(
@@ -173,7 +184,8 @@ pub fn classify_boundary(input: &BoundaryInput<'_>) -> BoundaryResult {
         || lower.contains(" too")
         || lower.contains("above")
         || lower.contains("keep going")
-        || lower.contains("finish");
+        || lower.contains("finish")
+        || has_negative_switch;
 
     if has_continue_phrase {
         signals.push("continuity_language".to_owned());
