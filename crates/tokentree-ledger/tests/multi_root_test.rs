@@ -46,6 +46,7 @@ fn test_multi_root_project_identity_deduplication_and_lifecycle() {
     let obs_client = UsageObservation {
         adapter: "claude".to_string(),
         source: MeasurementSource::OfficialTelemetry,
+        source_subtype: None,
         source_event_id: Some("evt_client_1".to_string()),
         provider_session_id: "session_client_1".to_string(),
         request_id: Some("req_shared_client_1".to_string()),
@@ -74,6 +75,7 @@ fn test_multi_root_project_identity_deduplication_and_lifecycle() {
     let obs_server = UsageObservation {
         adapter: "claude".to_string(),
         source: MeasurementSource::OfficialTelemetry,
+        source_subtype: None,
         source_event_id: Some("evt_server_1".to_string()),
         provider_session_id: "session_server_1".to_string(),
         request_id: Some("req_server_1".to_string()),
@@ -246,6 +248,7 @@ fn test_multi_root_project_identity_deduplication_and_lifecycle() {
     let obs_backend = UsageObservation {
         adapter: "claude".to_string(),
         source: MeasurementSource::OfficialTelemetry,
+        source_subtype: None,
         source_event_id: Some("evt_backend_1".to_string()),
         provider_session_id: "session_backend_1".to_string(),
         request_id: Some("req_backend_1".to_string()),

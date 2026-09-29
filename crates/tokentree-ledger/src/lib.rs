@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+pub mod audit;
 pub mod corrections;
 pub mod export;
 pub mod manual;
@@ -6,6 +6,8 @@ pub mod pricing;
 pub mod prototype;
 pub mod spool;
 pub mod tree;
+
+pub use audit::{LeakageAuditResult, audit_prompt_leakage};
 
 pub use corrections::{
     add_note, attach_session, detach_session, ensure_session_attribution, merge_work_items,
@@ -159,6 +161,10 @@ impl Ledger {
 
     pub fn reconcile(&self) -> Result<ReconcileResult> {
         reconcile(&self.connection)
+    }
+
+    pub fn audit_prompt_leakage(&self, spool_dir: Option<&Path>) -> Result<LeakageAuditResult> {
+        audit_prompt_leakage(&self.connection, spool_dir)
     }
 }
 
@@ -373,7 +379,10 @@ pub fn ingest_observations(
             params![
                 stable_id("evt", &observation.canonical_identity()),
                 observation.adapter,
-                observation.source.as_str(),
+                observation
+                    .source_subtype
+                    .as_deref()
+                    .unwrap_or(observation.source.as_str()),
                 observation.source_event_id,
                 session_id,
                 turn_db_id,
@@ -496,6 +505,7 @@ pub fn aggregate_usage_with_policy(connection: &Connection) -> Result<AggregateU
         .max(0) as u64;
 
     let is_subagent = "(ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id))";
+    let is_covered_turn_counter = "(ue.source_kind IN ('codex_turn_counter', 'turn_counter', 'turn_summary', 'cumulative_turn_counter') AND EXISTS (SELECT 1 FROM usage_events d WHERE d.session_id = ue.session_id AND d.turn_id IS NOT NULL AND d.turn_id = ue.turn_id AND d.source_kind NOT IN ('codex_turn_counter', 'turn_counter', 'turn_summary', 'cumulative_turn_counter', 'final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter')))";
 
     match policy {
         SubagentPolicy::AlreadyInParent => {
@@ -508,7 +518,8 @@ pub fn aggregate_usage_with_policy(connection: &Connection) -> Result<AggregateU
                  coalesce(sum(input_tokens),0),coalesce(sum(cached_input_tokens),0),coalesce(sum(cache_write_tokens),0),coalesce(sum(output_tokens),0),coalesce(sum(reasoning_tokens),0)
                  FROM usage_events ue
                  WHERE ue.source_kind NOT IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter')
-                   AND NOT {is_subagent}"
+                   AND NOT {is_subagent}
+                   AND NOT {is_covered_turn_counter}"
             );
             connection
                 .query_row(&query, [], |row| {
@@ -529,15 +540,17 @@ pub fn aggregate_usage_with_policy(connection: &Connection) -> Result<AggregateU
         }
         SubagentPolicy::Independent => {
             // Independent child request events roll up exactly once.
-            let query =
+            let query = format!(
                 "SELECT count(*),
                  coalesce(sum(CASE WHEN input_tokens IS NOT NULL OR cached_input_tokens IS NOT NULL OR cache_write_tokens IS NOT NULL OR output_tokens IS NOT NULL OR reasoning_tokens IS NOT NULL THEN 1 ELSE 0 END),0),
                  coalesce(sum(CASE WHEN input_tokens IS NULL AND cached_input_tokens IS NULL AND cache_write_tokens IS NULL AND output_tokens IS NULL AND reasoning_tokens IS NULL THEN 1 ELSE 0 END),0),
                  coalesce(sum(input_tokens),0),coalesce(sum(cached_input_tokens),0),coalesce(sum(cache_write_tokens),0),coalesce(sum(output_tokens),0),coalesce(sum(reasoning_tokens),0)
                  FROM usage_events ue
-                 WHERE ue.source_kind NOT IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter')";
+                 WHERE ue.source_kind NOT IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter')
+                   AND NOT {is_covered_turn_counter}"
+            );
             connection
-                .query_row(query, [], |row| {
+                .query_row(&query, [], |row| {
                     Ok(AggregateUsage {
                         requests: row.get::<_, i64>(0)? as u64,
                         measured: row.get::<_, i64>(1)? as u64,
@@ -573,7 +586,8 @@ pub fn aggregate_usage_with_policy(connection: &Connection) -> Result<AggregateU
                  coalesce(sum(CASE WHEN {is_subagent} THEN 0 ELSE output_tokens END), 0),
                  coalesce(sum(CASE WHEN {is_subagent} THEN 0 ELSE reasoning_tokens END), 0)
                  FROM usage_events ue
-                 WHERE ue.source_kind NOT IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter')"
+                 WHERE ue.source_kind NOT IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter')
+                   AND NOT {is_covered_turn_counter}"
             );
             connection
                 .query_row(&query, [], |row| {
@@ -652,6 +666,7 @@ mod tests {
         UsageObservation {
             adapter: "claude".into(),
             source: MeasurementSource::TranscriptRequest,
+            source_subtype: None,
             source_event_id: None,
             provider_session_id: "s".into(),
             request_id: Some("r".into()),

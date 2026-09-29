@@ -95,6 +95,7 @@ fn test_subagent_reconciliation_capabilities_and_duplicate_counter_detection() {
     let obs_parent = UsageObservation {
         adapter: "claude".to_string(),
         source: MeasurementSource::OfficialTelemetry,
+        source_subtype: None,
         source_event_id: Some("evt_parent_turn_1".to_string()),
         provider_session_id: "parent_session_1".to_string(),
         request_id: Some("req_parent_1".to_string()),
@@ -123,6 +124,7 @@ fn test_subagent_reconciliation_capabilities_and_duplicate_counter_detection() {
     let obs_subagent = UsageObservation {
         adapter: "claude".to_string(),
         source: MeasurementSource::OfficialTelemetry,
+        source_subtype: None,
         source_event_id: Some("evt_subagent_turn_1".to_string()),
         provider_session_id: "subagent_session_1".to_string(),
         request_id: Some("req_subagent_1".to_string()),

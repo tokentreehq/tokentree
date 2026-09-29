@@ -987,8 +987,12 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "hex",
+ "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
  "tokentree-core",
  "tokentree-ledger",
  "walkdir",

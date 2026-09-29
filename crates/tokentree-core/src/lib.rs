@@ -77,6 +77,8 @@ impl TokenUsage {
 pub struct UsageObservation {
     pub adapter: String,
     pub source: MeasurementSource,
+    #[serde(default)]
+    pub source_subtype: Option<String>,
     pub source_event_id: Option<String>,
     pub provider_session_id: String,
     pub request_id: Option<String>,
@@ -106,6 +108,17 @@ impl UsageObservation {
         }
         if let Some(event) = &self.source_event_id {
             return format!("{}:event:{event}", self.adapter);
+        }
+        if (self.source_subtype.as_deref() == Some("codex_turn_counter")
+            || self.source == MeasurementSource::SnapshotDelta)
+            && self.turn_id.is_some()
+        {
+            return format!(
+                "{}:counter:{}:{}",
+                self.adapter,
+                self.provider_session_id,
+                self.turn_id.as_deref().unwrap_or_default()
+            );
         }
         format!(
             "{}:{}:{}:{}:{}:{}:{}:{}",
@@ -238,6 +251,7 @@ mod tests {
         UsageObservation {
             adapter: "claude".into(),
             source,
+            source_subtype: None,
             source_event_id: None,
             provider_session_id: "s".into(),
             request_id: Some("r".into()),

@@ -145,6 +145,7 @@ pub fn apply_prototype(
         let observation = UsageObservation {
             adapter: "prototype".into(),
             source: MeasurementSource::ExplicitCli,
+            source_subtype: Some("prototype_json".into()),
             source_event_id: Some(format!("{source_str}:{index}")),
             provider_session_id: session_key.to_owned(),
             request_id: Some(format!("prototype:{source_str}:{index}")),

@@ -118,6 +118,11 @@ pub fn parse_session(path: &Path) -> Result<ParseResult> {
         observations.push(UsageObservation {
             adapter: "claude".into(),
             source,
+            source_subtype: if record_type.is_empty() {
+                None
+            } else {
+                Some(record_type)
+            },
             source_event_id: string(&record, &["event_id", "uuid"]),
             provider_session_id: string(&record, &["session_id", "sessionId"])
                 .unwrap_or_else(|| fallback_session.into()),

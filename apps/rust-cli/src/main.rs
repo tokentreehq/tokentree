@@ -337,7 +337,24 @@ fn doctor(home: &Path) -> Result<()> {
 
     // Audit prompt persistence
     println!("prompt persistence: schema forbids prompt/completion/reasoning/tool payload columns");
-    println!("prompt leakage: 0 leaks detected across database and spool records");
+    let spool_dir = home.join("spool");
+    let audit = ledger.audit_prompt_leakage(if spool_dir.exists() {
+        Some(&spool_dir)
+    } else {
+        None
+    })?;
+    if audit.leaks_detected > 0 {
+        eprintln!(
+            "prompt leakage: {} leak(s) detected across database and spool records",
+            audit.leaks_detected
+        );
+        for detail in &audit.leak_details {
+            eprintln!("  - {detail}");
+        }
+        bail!("doctor security check failed: prompt/secret leakage detected");
+    } else {
+        println!("prompt leakage: 0 leaks detected across database and spool records");
+    }
 
     let snapshot = load_snapshot(home);
     match snapshot {
@@ -386,31 +403,18 @@ fn import_codex(home: &Path, root: PathBuf) -> Result<()> {
     let mut ledger = ledger(home)?;
     let mut inserted = 0;
     let mut duplicates = 0;
-    let mut unknown = 0;
-    let mut malformed = 0;
     let mut anomalies = 0;
     for path in &sessions {
-        let parsed = tokentree_codex::parse_session(path)?;
-        unknown += parsed.stats.unknown;
-        malformed += parsed.stats.malformed;
-        anomalies += parsed.anomalies.len() as u64;
-        for anom in &parsed.anomalies {
-            ledger.record_anomaly(
-                anom.session_id.as_deref(),
-                anom.turn_id.as_deref(),
-                &anom.anomaly_type,
-                &anom.details.to_string(),
-            )?;
-        }
-        let summary = ledger.ingest(parsed.observations)?;
-        inserted += summary.inserted;
-        duplicates += summary.duplicates;
+        let res = tokentree_codex::import_codex_file(ledger.connection_mut(), path)?;
+        inserted += res.inserted;
+        duplicates += res.duplicates;
+        anomalies += res.anomalies;
     }
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
             "sessions": sessions.len(), "inserted": inserted, "duplicates": duplicates,
-            "unknown": unknown, "malformed": malformed, "anomalies": anomalies,
+            "anomalies": anomalies,
         }))?
     );
     Ok(())

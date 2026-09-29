@@ -49,6 +49,6 @@ describe('Codex parser and hook correlation', () => {
     const dir = resolve(import.meta.dirname, '../../../../fixtures/parsers/codex');
     const sessions = discoverCodexSessions(dir);
     expect(sessions.length).toBeGreaterThan(0);
-    expect(sessions[0]?.sourcePath).toContain('public-small-codex.jsonl');
+    expect(sessions.some((s) => s.sourcePath.includes('public-small-codex.jsonl'))).toBe(true);
   });
 });

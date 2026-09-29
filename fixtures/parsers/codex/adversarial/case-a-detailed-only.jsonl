@@ -1,0 +1,4 @@
+{"type":"turn/started","turn_id":"turn_case_a","session_id":"ses_case_a","timestamp":"2026-03-30T10:00:00Z"}
+{"type":"thread/tokenUsage/updated","request_id":"req_case_a_1","turn_id":"turn_case_a","session_id":"ses_case_a","model":"o3-mini","token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":50,"reasoning_tokens":10},"timestamp":"2026-03-30T10:00:01Z"}
+{"type":"thread/tokenUsage/updated","request_id":"req_case_a_2","turn_id":"turn_case_a","session_id":"ses_case_a","model":"o3-mini","token_usage":{"input_tokens":150,"cached_input_tokens":30,"output_tokens":70,"reasoning_tokens":15},"timestamp":"2026-03-30T10:00:02Z"}
+{"type":"turn/completed","turn_id":"turn_case_a","session_id":"ses_case_a","timestamp":"2026-03-30T10:00:03Z"}

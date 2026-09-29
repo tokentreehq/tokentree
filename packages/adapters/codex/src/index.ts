@@ -241,6 +241,7 @@ export async function parseCodexSession(ref: SessionRef): Promise<ParseResult> {
     observations.push({
       adapter: 'codex',
       source,
+      sourceSubtype: sourceKind,
       sourceEventId: text(record.event_id ?? record.uuid),
       providerSessionId: activeSessionId ?? ref.providerSessionId,
       requestId,

@@ -12,6 +12,7 @@
     "typecheck": "tsc -b",
     "lint": "eslint .",
     "fixture:boundaries": "tsx packages/classifier/src/evaluate.ts fixtures/boundaries/eval.jsonl",
+    "generate:sbom": "tsx scripts/generate-sbom.ts",
     "check": "pnpm typecheck && pnpm test && pnpm fixture:boundaries && pnpm rust:check",
     "rust:check": "cargo fmt --all -- --check && cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings"
   },

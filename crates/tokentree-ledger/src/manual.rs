@@ -155,6 +155,7 @@ pub fn stop_manual(connection: &mut Connection, counts: ManualCounts) -> Result<
     let observation = UsageObservation {
         adapter: "manual".into(),
         source: MeasurementSource::ExplicitCli,
+        source_subtype: Some("manual_stop".into()),
         source_event_id: Some(run.id.clone()),
         provider_session_id: run.id.clone(),
         request_id: Some(format!("manual:{}", run.id)),

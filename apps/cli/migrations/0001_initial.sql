@@ -206,6 +206,8 @@ CREATE TABLE ingestion_checkpoints (
   modified_at TEXT NOT NULL,
   last_offset INTEGER NOT NULL CHECK (last_offset >= 0),
   last_event_hash TEXT,
+  file_hash TEXT,
+  parser_version TEXT,
   PRIMARY KEY (adapter, source_path)
 ) STRICT;
 

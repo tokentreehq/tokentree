@@ -150,6 +150,7 @@ mod tests {
             .ingest(vec![UsageObservation {
                 adapter: "claude".into(),
                 source: MeasurementSource::OfficialTelemetry,
+                source_subtype: None,
                 source_event_id: None,
                 provider_session_id: "s1".into(),
                 request_id: Some("req1".into()),

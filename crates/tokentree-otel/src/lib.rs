@@ -102,6 +102,7 @@ pub fn extract_api_requests(payload: &Value) -> Vec<UsageObservation> {
                 output.push(UsageObservation {
                     adapter: "claude".into(),
                     source: MeasurementSource::OfficialTelemetry,
+                    source_subtype: Some("otel_api_request".into()),
                     source_event_id: sequence_field(&fields)
                         .map(|seq| format!("otel:{session}:{seq}")),
                     provider_session_id: session,

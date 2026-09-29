@@ -37,6 +37,7 @@ fn build_fixture(cap_state: &str, cap_detail: Option<&str>) -> Ledger {
     let obs_parent = UsageObservation {
         adapter: "claude".to_string(),
         source: MeasurementSource::OfficialTelemetry,
+        source_subtype: None,
         source_event_id: Some("evt_parent_1".to_string()),
         provider_session_id: "parent_ses".to_string(),
         request_id: Some("req_parent_1".to_string()),
@@ -66,6 +67,7 @@ fn build_fixture(cap_state: &str, cap_detail: Option<&str>) -> Ledger {
     let obs_child = UsageObservation {
         adapter: "claude".to_string(),
         source: MeasurementSource::OfficialTelemetry,
+        source_subtype: None,
         source_event_id: Some("evt_child_1".to_string()),
         provider_session_id: "child_ses".to_string(),
         request_id: Some("req_child_1".to_string()),

@@ -75,13 +75,26 @@ jobs:
           path: tokentree-${{ matrix.target }}.${{ matrix.archive_ext }}
           if-no-files-found: error
 
-  publish:
-    name: Publish Release
+  verify:
+    name: Verify Release Artifacts
     needs: build
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a # v4.2.0
+        with:
+          node-version: 22
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@7088e561eb65bb68695d245aa206f005ef30921d # v4.1.0
+        with:
+          version: 10.17.1
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
 
       - name: Download all artifacts
         uses: actions/download-artifact@cc203385981b70ca67e1cc392babf9cc229d5806 # v4.1.9
@@ -90,9 +103,9 @@ jobs:
           pattern: binary-*
           merge-multiple: true
 
-      - name: Generate Software Bill of Materials (SBOM)
+      - name: Generate Software Bill of Materials (SPDX 2.3 and CycloneDX 1.5)
         run: |
-          cargo metadata --format-version 1 > release-assets/tokentree-cargo-sbom.json
+          npx tsx scripts/generate-sbom.ts release-assets
 
       - name: Generate SHA256 checksums
         run: |
@@ -100,9 +113,60 @@ jobs:
           sha256sum * > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
+      - name: Verify checksums
+        run: |
+          cd release-assets
+          sha256sum -c SHA256SUMS.txt
+
+      - name: Verify all target archives exist
+        run: |
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin; do
+            test -f "release-assets/tokentree-${target}.tar.gz" || exit 1
+          done
+          test -f "release-assets/tokentree-x86_64-pc-windows-msvc.zip" || exit 1
+
+      - name: Extract and verify execution of host release binary
+        run: |
+          mkdir -p extracted
+          tar -xvf release-assets/tokentree-x86_64-unknown-linux-gnu.tar.gz -C extracted
+          chmod +x extracted/tokentree
+          extracted/tokentree --version
+          extracted/tokentree doctor
+          extracted/tokentree import --codex fixtures/parsers/codex/app-server-v1.jsonl
+          extracted/tokentree report --text
+          extracted/tokentree export --format json > export-test.json
+          test -s export-test.json
+
+      - name: Test npm launcher against archive layout
+        run: |
+          pnpm build
+          mkdir -p apps/cli/vendor/x86_64-unknown-linux-gnu
+          cp extracted/tokentree apps/cli/vendor/x86_64-unknown-linux-gnu/
+          npx vitest run apps/cli/test/launcher.test.ts
+          node apps/cli/dist/index.js --version
+          node apps/cli/dist/index.js doctor
+
+      - name: Upload verified release assets
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
+        with:
+          name: verified-release-assets
+          path: release-assets/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish Release
+    needs: [build, verify]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download verified release assets
+        uses: actions/download-artifact@cc203385981b70ca67e1cc392babf9cc229d5806 # v4.1.9
+        with:
+          name: verified-release-assets
+          path: release-assets
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.2.1
-        if: startsWith(github.ref, 'refs/tags/')
         with:
           files: |
             release-assets/*

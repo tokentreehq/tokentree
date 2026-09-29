@@ -47,6 +47,7 @@ fn test_concurrent_wal_ingest_and_corrections() {
                 let obs = UsageObservation {
                     adapter: "claude".to_string(),
                     source: MeasurementSource::OfficialTelemetry,
+                    source_subtype: None,
                     source_event_id: Some(format!("event_{t_idx}_{i}")),
                     provider_session_id: format!("session_{t_idx}"),
                     request_id: Some(format!("req_{t_idx}_{i}")),

@@ -1,0 +1,4 @@
+{"type":"session_meta","version":"codex-rollout-v1","session_id":"ses_rollout_real_01","timestamp":"2026-03-30T15:00:00Z"}
+{"type":"turn_start","turn_id":"turn_roll_01","session_id":"ses_rollout_real_01","timestamp":"2026-03-30T15:00:01Z"}
+{"type":"model_request","request_id":"req_roll_01","turn_id":"turn_roll_01","session_id":"ses_rollout_real_01","model":"gpt-4o","usage":{"prompt_tokens":200,"prompt_tokens_details":{"cached_tokens":40},"completion_tokens":60,"completion_tokens_details":{"reasoning_tokens":10}},"timestamp":"2026-03-30T15:00:03Z"}
+{"type":"turn_end","turn_id":"turn_roll_01","session_id":"ses_rollout_real_01","timestamp":"2026-03-30T15:00:06Z"}

@@ -22,6 +22,7 @@ export interface TokenUsage {
 export interface UsageObservation extends TokenUsage {
   readonly adapter: string;
   readonly source: MeasurementSource;
+  readonly sourceSubtype?: string | undefined;
   readonly sourceEventId?: string | undefined;
   readonly sourceProcessId?: string | undefined;
   readonly sourceSequence?: number | undefined;
@@ -49,6 +50,9 @@ export function hasMeasuredTokens(value: TokenUsage): boolean {
 export function canonicalIdentity(observation: UsageObservation): string {
   if (observation.requestId) return `${observation.adapter}:request:${observation.requestId}`;
   if (observation.sourceEventId) return `${observation.adapter}:event:${observation.sourceEventId}`;
+  if ((observation.sourceSubtype === 'codex_turn_counter' || observation.source === 'snapshot_delta') && observation.turnId) {
+    return `${observation.adapter}:counter:${observation.providerSessionId}:${observation.turnId}`;
+  }
   return [observation.adapter, observation.providerSessionId, observation.turnId ?? '', observation.model ?? '', observation.sourceTimestamp ?? '', observation.inputTokens ?? '', observation.outputTokens ?? '', observation.sourceOffset].join(':');
 }
 
