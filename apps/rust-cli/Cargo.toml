@@ -1,0 +1,23 @@
+[package]
+name = "tokentree-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "tokentree"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+dirs.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokentree-claude = { path = "../../crates/tokentree-claude" }
+tokentree-core = { path = "../../crates/tokentree-core" }
+tokentree-ledger = { path = "../../crates/tokentree-ledger" }
+tokentree-otel = { path = "../../crates/tokentree-otel" }
+tokio.workspace = true

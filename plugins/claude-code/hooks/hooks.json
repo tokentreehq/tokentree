@@ -1,16 +1,127 @@
 {
-  "description":"TokenTree enqueue-only lifecycle capture. No transcript parsing or classification runs on the hook path.",
-  "hooks":{
-    "SessionStart":[{"hooks":[{"type":"command","command":"node \"${CLAUDE_PLUGIN_ROOT}/scripts/enqueue.mjs\"","timeout":5}]}],
-    "SessionEnd":[{"hooks":[{"type":"command","command":"node \"${CLAUDE_PLUGIN_ROOT}/scripts/enqueue.mjs\"","timeout":5}]}],
-    "UserPromptSubmit":[{"hooks":[{"type":"command","command":"node \"${CLAUDE_PLUGIN_ROOT}/scripts/enqueue.mjs\"","timeout":5}]}],
-    "TaskCreated":[{"hooks":[{"type":"command","command":"node \"${CLAUDE_PLUGIN_ROOT}/scripts/enqueue.mjs\"","timeout":5}]}],
-    "TaskCompleted":[{"hooks":[{"type":"command","command":"node \"${CLAUDE_PLUGIN_ROOT}/scripts/enqueue.mjs\"","timeout":5}]}],
-    "SubagentStart":[{"hooks":[{"type":"command","command":"node \"${CLAUDE_PLUGIN_ROOT}/scripts/enqueue.mjs\"","timeout":5}]}],
-    "SubagentStop":[{"hooks":[{"type":"command","command":"node \"${CLAUDE_PLUGIN_ROOT}/scripts/enqueue.mjs\"","timeout":5}]}],
-    "Stop":[{"hooks":[{"type":"command","command":"node \"${CLAUDE_PLUGIN_ROOT}/scripts/enqueue.mjs\"","timeout":5}]}],
-    "StopFailure":[{"hooks":[{"type":"command","command":"node \"${CLAUDE_PLUGIN_ROOT}/scripts/enqueue.mjs\"","timeout":5}]}],
-    "CwdChanged":[{"hooks":[{"type":"command","command":"node \"${CLAUDE_PLUGIN_ROOT}/scripts/enqueue.mjs\"","timeout":5}]}],
-    "PostToolUse":[{"matcher":"Write|Edit|MultiEdit","hooks":[{"type":"command","command":"node \"${CLAUDE_PLUGIN_ROOT}/scripts/enqueue.mjs\"","timeout":5}]}]
+  "description": "TokenTree enqueue-only lifecycle capture. No transcript parsing or classification runs on the hook path.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/enqueue.sh\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/enqueue.sh\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/enqueue.sh\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "TaskCreated": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/enqueue.sh\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "TaskCompleted": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/enqueue.sh\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/enqueue.sh\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/enqueue.sh\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/enqueue.sh\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/enqueue.sh\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "CwdChanged": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/enqueue.sh\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/enqueue.sh\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
   }
 }

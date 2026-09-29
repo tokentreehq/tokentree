@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Draft v5.1 — TokenTree product specification |
+| Status | Draft v5.1 — TokenTree product specification, Rust-first architecture amendment |
 | Date | 2026-09-29 |
 | Product | TokenTree |
 | Type | Open-source, local-first developer tool |
@@ -1251,18 +1251,31 @@ Also document interfaces for project resolvers and report exporters.
 
 ### 17.2 Stack
 
-- TypeScript and Node.js LTS
-- SQLite WAL
-- Streaming JSONL parsers
-- Runtime schema validation
-- Optional embedded local OTLP receiver or integration with an existing collector
-- Local HTTP dashboard and lightweight UI
-- Self-contained static HTML generator
-- Vitest, golden fixtures, schema compatibility tests, labeled boundary corpus
+TokenTree uses a **Rust-first local engine with a TypeScript UI and extension layer**.
 
-A Rust component or native rewrite is permitted when packaging, startup time, or parsing performance demonstrates a need. It must preserve public schemas.
+Rust is mandatory for:
 
-The Python prototype is a reference only.
+- the published `tokentree` CLI and hook-enqueue executable
+- SQLite WAL ownership, migrations, writer coordination, recovery, backup, and integrity checks
+- streaming host-log parsers, canonical event normalization, truth-ladder correlation, and deduplication
+- the embedded loopback OTLP receiver
+- exact integer-micro cost calculations, completeness, recursive aggregation, and report/query execution
+- filesystem permissions, atomic writes, bounded-memory imports, and cross-platform path resolution
+
+TypeScript and Node.js LTS are used for:
+
+- Claude/Codex plugin manifests, skills, and host-facing glue where the host requires JavaScript
+- the local dashboard and static HTML UI
+- a typed community-adapter SDK that communicates with the Rust engine through versioned JSON/JSONL or a loopback protocol
+- web-focused tests and UI tooling
+
+The Rust engine uses `rusqlite` with bundled SQLite, WAL mode, busy timeout, short transactions, and read-only report connections. The release pipeline produces signed native binaries for supported platforms. The scoped npm package `@tokentreehq/cli` is a thin installer/launcher for those binaries; it is not a second measurement implementation.
+
+The SQLite schema, normalized event JSON schema, adapter capability schema, and CLI JSON output are language-neutral public contracts. TypeScript must not reimplement authoritative measurement, deduplication, cost, or aggregation logic once the corresponding Rust path ships.
+
+Testing uses Rust unit/integration tests, Clippy, rustfmt, Vitest for TypeScript surfaces, golden parser fixtures, schema compatibility tests, and the labeled boundary corpus.
+
+The Python prototype is a migration source and behavioral reference only.
 
 ### 17.3 Concurrency and write coordination
 
@@ -1281,11 +1294,18 @@ Support several agent sessions, overlapping hooks, import during live tracking, 
 ```text
 tokentree/
 ├── apps/
-│   ├── cli/
+│   ├── rust-cli/
+│   ├── cli/            # temporary TypeScript migration/reference harness; not the published engine
 │   └── dashboard/
+├── crates/
+│   ├── tokentree-core/
+│   ├── tokentree-ledger/
+│   ├── tokentree-claude/
+│   ├── tokentree-otel/       # added only with working receiver tests
+│   └── tokentree-reports/
 ├── packages/
-│   ├── core/
-│   ├── database/
+│   ├── core/           # TypeScript contract/reference tests during migration
+│   ├── database/       # schema compatibility harness; Rust owns production writes
 │   ├── classifier/
 │   ├── pricing/
 │   ├── reports/
@@ -1527,7 +1547,9 @@ npm install -g @tokentreehq/cli
 npx skills add tokentreehq/tokentree
 ```
 
-Later: Homebrew, matching the scoped identity.
+`@tokentreehq/cli` installs and launches a checksummed, signed Rust binary for the current supported platform. It must fail clearly on an unsupported platform and must never silently fall back to a separate JavaScript measurement engine. The Claude plugin bundles the same known-good Rust binary version for hook enqueue and local commands.
+
+Later: Homebrew, matching the scoped identity and distributing the same signed Rust release artifacts.
 
 Provide: adapter, classifier, pricing-source, resolver, and exporter guides; sanitized fixture format; schema compatibility tests; eval harness; good-first issues; security policy; responsible disclosure; release and deprecation policy; public roadmap; and code of conduct.
 
@@ -1890,6 +1912,13 @@ tokentree migrate prototype --apply
 
 ## 33. Changelog
 
+### v5.1 architecture amendment — Rust-first hybrid stack (2026-09-29)
+
+- Makes Rust the production implementation for the CLI, hook enqueue, SQLite ownership, streaming parsers, OTLP receiver, measurement/cost core, and report/query execution.
+- Retains TypeScript for host-required plugin glue, dashboard/UI, and the community-adapter SDK.
+- Defines `@tokentreehq/cli` as a signed native-binary installer/launcher rather than an independent JavaScript measurement engine.
+- Keeps SQLite and normalized JSON contracts language-neutral during the migration.
+
 ### v5.1 — TokenTree name lock (2026-09-29)
 
 - Product display name is **TokenTree**.
@@ -1969,3 +1998,4 @@ Note: npm packages `tokenusage` and `tokenuse` are unrelated existing tools. Thi
 ---
 
 *End of PRD v5.0*
+

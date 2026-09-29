@@ -17,3 +17,8 @@
 - Sourced, checksummed Claude Sonnet 4.6 pricing persisted as versioned integer-micro calculations.
 - Public sanitized Claude Code 2.1.x compatibility fixture and camelCase/nested-usage parser support.
 - Readable hook-worker record and event-processing modules; README synchronized with pre-beta reality.
+- Adopted a Rust-first production architecture in the PRD and decisions.
+- Added executable Rust measurement, SQLite ledger, Claude parser, CLI, and hook-enqueue vertical slice.
+- Added Rust 1.98.1 pinning and rustfmt/test/Clippy gates to CI.
+- Claude plugin launcher now prefers the bundled Rust binary with a development-only Node fallback.
+- Added a loopback-only Rust OTLP/HTTP JSON receiver for official Claude `api_request` events, with bounded bodies, raw-body-event exclusion, and non-loopback rejection.

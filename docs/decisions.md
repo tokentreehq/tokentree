@@ -17,3 +17,8 @@ Defer a public tap until a signed CLI artifact exists. Reserved target: `tokentr
 
 ## Open human decisions
 Domain, default `tuse` alias, minimum Claude Code version after fixtures, and signed-release keyholder.
+
+## 2026-09-29 — Rust-first production engine (locked)
+The published CLI, hook enqueue, SQLite writer/migrations, streaming parsers, OTLP receiver, canonical measurement/deduplication, exact cost engine, and report/query aggregation are implemented in Rust. TypeScript remains for host-required plugin glue, dashboard/UI, and the community-adapter SDK. `@tokentreehq/cli` distributes signed Rust binaries and must not become a second JavaScript measurement implementation.
+
+Reason: these paths benefit directly from fast startup, bounded memory, native concurrency, one-binary packaging, stable filesystem permissions, and compile-time measurement-state modeling. The SQLite and JSON contracts remain language-neutral so the migration does not rewrite user data.
