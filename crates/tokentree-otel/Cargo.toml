@@ -1,0 +1,15 @@
+[package]
+name = "tokentree-otel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+chrono.workspace = true
+serde_json.workspace = true
+tokentree-core = { path = "../tokentree-core" }
+tokentree-ledger = { path = "../tokentree-ledger" }
+tokio.workspace = true

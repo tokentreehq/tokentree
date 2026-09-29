@@ -9,6 +9,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          components: rustfmt, clippy
       - uses: pnpm/action-setup@v4
         with: { version: 10.17.1 }
       - uses: actions/setup-node@v4
@@ -20,3 +23,6 @@ jobs:
       - run: pnpm test
       - run: pnpm fixture:boundaries
       - run: pnpm lint
+      - run: cargo fmt --all -- --check
+      - run: cargo test --workspace
+      - run: cargo clippy --workspace --all-targets -- -D warnings

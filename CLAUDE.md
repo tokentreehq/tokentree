@@ -15,10 +15,14 @@ It reports honest token, cost, provenance, and completeness data from a SQLite l
 Product: TokenTree. CLI: `tokentree`. npm: `@tokentreehq/cli`. GitHub: `tokentreehq/tokentree`. Config: `.tokentree.yml`. Data: `~/.tokentree/` or `TOKENTREE_HOME`. Never publish bare `tokenusage` or `tokenuse` and never use `github.com/tokentree`.
 
 ## Repository map
-- `apps/cli`: scoped CLI package and `tokentree` binary
+- `apps/rust-cli`: canonical published `tokentree` binary
+- `apps/cli`: temporary TypeScript migration/reference harness; not the production measurement engine
 - `apps/dashboard`: local dashboard (Phase 3)
-- `packages/core`: canonical types and architecture interfaces
-- `packages/database`: SQLite schema and migrations
+- `crates/tokentree-core`: canonical measurement, deduplication, completeness, and exact-cost logic
+- `crates/tokentree-ledger`: production SQLite owner, migrations, ingest, and aggregation
+- `crates/tokentree-claude`: bounded-memory Claude discovery/parser
+- `packages/core`: TypeScript contract/reference tests during migration
+- `packages/database`: schema compatibility harness; Rust owns production writes
 - `packages/classifier`: boundary corpus and evaluation harness
 - `packages/pricing`: checksummed price snapshots
 - `packages/reports`: ledger-only reports
@@ -36,6 +40,9 @@ pnpm typecheck
 pnpm lint
 pnpm fixture:boundaries
 pnpm check
+cargo fmt --all -- --check
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 # Phase 1+: tokentree doctor; tokentree reconcile
 # Phase 3+: pnpm --filter @tokentreehq/dashboard dev
 ```
@@ -43,6 +50,8 @@ pnpm check
 ## Architecture
 `spool → adapter → ledger → resolver → classifier worker → cost engine → UI`.
 The SQLite ledger is the only number any UI may show. Reports never read live JSONL.
+
+Rust is mandatory for the published CLI/hook enqueue, SQLite ownership, streaming parsers, OTLP, canonical measurement/deduplication, exact cost, and report/query aggregation. TypeScript is for host-required plugin glue, dashboard/UI, and the community-adapter SDK. Do not create two authoritative implementations.
 
 Truth ladder: official OTel/app-server telemetry → provider fields → transcript request → snapshot delta → CLI counts → unavailable.
 
@@ -58,7 +67,7 @@ Default local-only; no telemetry or network. Do not persist prompts, completions
 - `--text` must never bind a port.
 
 ## Current phase
-Phase 2 in progress: enqueue-only Claude hooks, project resolution, boundary classification, and manual capture exist. Recursive tree/query, verified pricing, attach/detach/note, and a checkpointed spool worker now exist. Next slice: transient-prompt classifier IPC, one-time clarification, broader compatibility/rates, and release CLI bundling. Phase 3 remains gated.
+Phase 2 in progress with a Rust-first engine migration. Rust core, ledger, Claude parser, loopback OTLP/HTTP JSON receiver, CLI doctor/import/report, and hook enqueue exist. Next slice: port recursive tree/query/corrections and pricing persistence to Rust, then package signed binaries. Phase 3 remains gated.
 
 ## Adding an adapter
 Discover sessions; stream and normalize requests; declare capabilities including `subagent_tokens_already_in_parent`; add sanitized fixtures and golden tests; pass the compatibility matrix; only then claim support.

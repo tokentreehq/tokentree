@@ -1,5 +1,18 @@
 # Delivery status
 
+
+## Rust-first engine migration
+- [x] PRD and decisions updated: Rust owns production measurement paths
+- [x] Rust canonical measurement/dedupe/completeness/exact-cost core
+- [x] Rust SQLite WAL ledger, shared migration, permissions, ingest, integrity, and aggregation
+- [x] Rust streaming Claude parser against public sanitized 2.1.x fixture
+- [x] Rust CLI `doctor`, `import claude`, `report --text`, and `hook-enqueue`
+- [x] CI rustfmt, tests, and Clippy warnings-as-errors
+- [ ] Port recursive tree/query/corrections and price persistence from TypeScript reference
+- [ ] Rust spool worker and transient classifier IPC
+- [x] Embedded loopback OTLP/HTTP JSON receiver for official Claude API-request events
+- [ ] Signed cross-platform binaries and scoped npm launcher
+
 ## Phase 0 — Fixtures, schema, and naming
 - [x] Locked names and distribution decisions
 - [x] Monorepo and CI baseline

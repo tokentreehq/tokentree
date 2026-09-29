@@ -3,14 +3,17 @@
   "private": true,
   "version": "0.0.0",
   "packageManager": "pnpm@10.17.1",
-  "engines": { "node": ">=22.13" },
+  "engines": {
+    "node": ">=22.13"
+  },
   "scripts": {
     "build": "pnpm -r build",
     "test": "vitest run",
     "typecheck": "tsc -b",
     "lint": "eslint .",
     "fixture:boundaries": "tsx packages/classifier/src/evaluate.ts fixtures/boundaries/corpus.jsonl fixtures/boundaries/predictions.example.jsonl",
-    "check": "pnpm typecheck && pnpm test && pnpm fixture:boundaries"
+    "check": "pnpm typecheck && pnpm test && pnpm fixture:boundaries && pnpm rust:check",
+    "rust:check": "cargo fmt --all -- --check && cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings"
   },
   "devDependencies": {
     "@eslint/js": "^9.36.0",
