@@ -50,5 +50,15 @@
 - [ ] One-time clarification flow
 - [ ] Bundled release CLI and real Claude compatibility proof
 
-## Later phases
-Phase 3 dashboard/corrections and Phase 4 hardening remain gated. Phase 5+ hosts and organization features must not start before Phase 4 passes. Public-beta acceptance is not claimed.
+## Phase 3 — Dashboard, static export, and corrections
+- [x] Local web dashboard (loopback + random session token)
+- [x] Interactive tree drilldown and project inspection
+- [x] In-dashboard corrections (rename, move, add note, attach, detach)
+- [x] Self-contained static HTML export (`tokentree report --html`)
+- [x] Structured JSON and CSV exports (`tokentree export`)
+
+## Phase 4 — Hardening and distribution
+- [ ] Signed cross-platform release pipeline and scoped npm launcher
+- [ ] Plugin binary distribution
+- [ ] End-to-end beta validation (Acceptance criteria 1–36)
+

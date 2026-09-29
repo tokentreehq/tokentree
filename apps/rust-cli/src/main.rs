@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
+mod dashboard;
+
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
@@ -12,8 +14,9 @@ use tokentree_claude::{discover_sessions, parse_session};
 use tokentree_core::{PriceSnapshot, token_completeness};
 use tokentree_ledger::{
     Ledger, ManualCounts, ManualStartInput, add_note, apply_prototype, attach_session,
-    detach_session, load_project_trees, move_work_item, preview_prototype, query_ledger,
-    rename_work_item, render_project_trees, start_manual, stop_manual,
+    detach_session, export_csv, export_html, export_json, load_project_trees, move_work_item,
+    preview_prototype, query_ledger, rename_work_item, render_project_trees, start_manual,
+    stop_manual,
 };
 
 const DISCLAIMER: &str = "Amounts are list-price estimates from public per-token rates unless labeled otherwise. They are not your provider invoice, prepaid credit balance, or subscription allowance.";
@@ -43,7 +46,25 @@ enum Command {
         #[arg(long)]
         text: bool,
         #[arg(long)]
+        html: bool,
+        #[arg(long)]
         project: Option<String>,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    Dashboard {
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long)]
+        no_open: bool,
+    },
+    Export {
+        #[arg(long, default_value = "json")]
+        format: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
     Query {
         #[arg(long)]
@@ -141,7 +162,9 @@ fn run() -> Result<()> {
         Some(cmd) => cmd,
         None => Command::Report {
             text: true,
+            html: false,
             project: None,
+            out: None,
         },
     };
 
@@ -151,12 +174,29 @@ fn run() -> Result<()> {
         Command::Import {
             source: ImportSource::Claude { path },
         } => import_claude(&home, path.unwrap_or_else(default_claude_path)),
-        Command::Report { text, project } => {
-            if !text {
-                bail!("use --text; it never binds a port")
+        Command::Report {
+            text,
+            html,
+            project,
+            out,
+        } => {
+            if html {
+                html_report_cmd(&home, project.as_deref(), out)
+            } else if text {
+                report(&home, project.as_deref())
+            } else {
+                report(&home, project.as_deref())?;
+                println!("\n  Interactive dashboard: run 'tokentree dashboard'");
+                println!("  Static HTML report: run 'tokentree report --html'\n");
+                Ok(())
             }
-            report(&home, project.as_deref())
         }
+        Command::Dashboard { port, no_open } => dashboard_cmd(&home, port, no_open),
+        Command::Export {
+            format,
+            project,
+            out,
+        } => export_cmd(&home, &format, project.as_deref(), out),
         Command::Query {
             project,
             work_item,
@@ -328,6 +368,67 @@ fn report(home: &Path, project_filter: Option<&str>) -> Result<()> {
     );
     println!("policy: causal-request");
     println!("\n{DISCLAIMER}");
+    Ok(())
+}
+
+fn html_report_cmd(home: &Path, project_filter: Option<&str>, out: Option<PathBuf>) -> Result<()> {
+    let mut ledger = ledger(home)?;
+    if let Ok(snapshot) = load_snapshot(home) {
+        let _ = ledger.apply_price_snapshot(&snapshot);
+    }
+    let trees = load_project_trees(ledger.connection(), project_filter)?;
+    let html = export_html(&trees, DISCLAIMER);
+    let target = out.unwrap_or_else(|| {
+        let reports_dir = home.join("reports");
+        let _ = std::fs::create_dir_all(&reports_dir);
+        let ts = Utc::now().format("%Y%m%d-%H%M%S");
+        reports_dir.join(format!("report-{ts}.html"))
+    });
+    if let Some(parent) = target.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(&target, html)
+        .with_context(|| format!("write HTML report to {}", target.display()))?;
+    println!("Static HTML report generated: {}", target.display());
+    Ok(())
+}
+
+fn dashboard_cmd(home: &Path, port: Option<u16>, no_open: bool) -> Result<()> {
+    let mut ledger = ledger(home)?;
+    if let Ok(snapshot) = load_snapshot(home) {
+        let _ = ledger.apply_price_snapshot(&snapshot);
+    }
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(dashboard::run_dashboard(home, port, no_open))
+}
+
+fn export_cmd(
+    home: &Path,
+    format: &str,
+    project_filter: Option<&str>,
+    out: Option<PathBuf>,
+) -> Result<()> {
+    let mut ledger = ledger(home)?;
+    if let Ok(snapshot) = load_snapshot(home) {
+        let _ = ledger.apply_price_snapshot(&snapshot);
+    }
+    let trees = load_project_trees(ledger.connection(), project_filter)?;
+    let content = match format.to_lowercase().as_str() {
+        "json" => export_json(&trees)?,
+        "csv" => export_csv(&trees)?,
+        "html" => export_html(&trees, DISCLAIMER),
+        other => bail!("unsupported export format '{other}'; supported: json, csv, html"),
+    };
+    if let Some(target) = out {
+        if let Some(parent) = target.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(&target, &content)
+            .with_context(|| format!("write export to {}", target.display()))?;
+        println!("Export written to: {}", target.display());
+    } else {
+        println!("{content}");
+    }
     Ok(())
 }
 
@@ -630,5 +731,29 @@ mod tests {
 
         // 8. Report
         report(&home, Some("game")).unwrap();
+
+        // 9. Static HTML report
+        let html_out = home.join("reports/test-report.html");
+        html_report_cmd(&home, Some("game"), Some(html_out.clone())).unwrap();
+        assert!(html_out.exists());
+        let html_content = fs::read_to_string(&html_out).unwrap();
+        assert!(html_content.contains("TokenTree"));
+        assert!(html_content.contains("Fix collision bug v2"));
+        assert!(html_content.contains("Space Game"));
+        assert!(html_content.contains(DISCLAIMER));
+
+        // 10. Exports (JSON and CSV)
+        let json_out = home.join("export.json");
+        export_cmd(&home, "json", Some("game"), Some(json_out.clone())).unwrap();
+        assert!(json_out.exists());
+        let json_content = fs::read_to_string(&json_out).unwrap();
+        assert!(json_content.contains("Space Game"));
+
+        let csv_out = home.join("export.csv");
+        export_cmd(&home, "csv", Some("game"), Some(csv_out.clone())).unwrap();
+        assert!(csv_out.exists());
+        let csv_content = fs::read_to_string(&csv_out).unwrap();
+        assert!(csv_content.contains("project_id,project_key"));
+        assert!(csv_content.contains("Space Game"));
     }
 }

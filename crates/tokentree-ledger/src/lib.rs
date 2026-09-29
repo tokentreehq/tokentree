@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 pub mod corrections;
+pub mod export;
 pub mod manual;
 pub mod pricing;
 pub mod prototype;
@@ -10,6 +11,7 @@ pub use corrections::{
     add_note, attach_session, detach_session, ensure_session_attribution, move_work_item,
     reclassify_work_item, rename_work_item,
 };
+pub use export::{export_csv, export_html, export_json, html_escape};
 pub use manual::{
     ManualCounts, ManualStartInput, ManualStartResult, ManualStopResult, start_manual, stop_manual,
 };

@@ -27,4 +27,6 @@
 - Implemented Rust conservative boundary classifier and secret-redacting label generator (`crates/tokentree-core/src/classifier.rs`).
 - Implemented Rust hook spool worker with crash-safe SQLite checkpointing (`crates/tokentree-ledger/src/spool.rs`).
 - Implemented Rust recursive project trees, structured queries, manual start/stop sessions, versioned corrections (attach, detach, note, rename, move), prototype migration, and parity subcommands in `apps/rust-cli`.
+- Implemented loopback-only interactive web dashboard (`tokentree dashboard`), self-contained static HTML report generator (`tokentree report --html`), and JSON/CSV exporters (`tokentree export`) with zero external CDNs, random session token auth, and strict CSP.
+
 

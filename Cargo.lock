@@ -962,9 +962,12 @@ name = "tokentree-cli"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "axum",
  "chrono",
  "clap",
  "dirs",
+ "hex",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",
