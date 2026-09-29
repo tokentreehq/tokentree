@@ -81,6 +81,10 @@ pub struct UsageObservation {
     pub provider_session_id: String,
     pub request_id: Option<String>,
     pub turn_id: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub parent_agent_id: Option<String>,
     pub source_timestamp: Option<String>,
     pub observed_at: String,
     pub model: Option<String>,
@@ -238,6 +242,8 @@ mod tests {
             provider_session_id: "s".into(),
             request_id: Some("r".into()),
             turn_id: None,
+            agent_id: None,
+            parent_agent_id: None,
             source_timestamp: None,
             observed_at: "2026-01-01T00:00:00Z".into(),
             model: Some("claude-sonnet-4-6".into()),

@@ -120,18 +120,76 @@ fn load_single_project_tree(connection: &Connection, project: &ProjectRow) -> Re
         amount_micros: i64,
     }
 
+    let policy = crate::resolve_subagent_policy(connection);
+    let policy_str = match policy {
+        crate::SubagentPolicy::AlreadyInParent => "AlreadyInParent",
+        crate::SubagentPolicy::Independent => "Independent",
+        crate::SubagentPolicy::Unknown => "Unknown",
+    };
+
     let mut stmt = connection.prepare(
         "SELECT wi.id, wi.parent_id, wi.title,
-                coalesce(sum(ue.input_tokens), 0) input,
-                coalesce(sum(ue.cached_input_tokens), 0) cache_read,
-                coalesce(sum(ue.cache_write_tokens), 0) cache_write,
-                coalesce(sum(ue.output_tokens), 0) output,
-                coalesce(sum(ue.reasoning_tokens), 0) reasoning,
-                count(ue.id) requests,
-                coalesce(sum(CASE WHEN us.measurement_status='measured' THEN 1 ELSE 0 END), 0) measured,
-                coalesce(sum(CASE WHEN us.measurement_status<>'measured' THEN 1 ELSE 0 END), 0) unavailable,
-                count(cc.usage_event_id) priced,
-                coalesce(sum(cc.amount_micros), 0) amount_micros
+                coalesce(sum(CASE
+                    WHEN ue.source_kind IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter') THEN 0
+                    WHEN ?2 = 'AlreadyInParent' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN 0
+                    WHEN ?2 = 'Unknown' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN 0
+                    ELSE CAST(ROUND(ue.input_tokens * a.weight_basis_points / 10000.0) AS INTEGER)
+                END), 0) input,
+                coalesce(sum(CASE
+                    WHEN ue.source_kind IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter') THEN 0
+                    WHEN ?2 = 'AlreadyInParent' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN 0
+                    WHEN ?2 = 'Unknown' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN 0
+                    ELSE CAST(ROUND(ue.cached_input_tokens * a.weight_basis_points / 10000.0) AS INTEGER)
+                END), 0) cache_read,
+                coalesce(sum(CASE
+                    WHEN ue.source_kind IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter') THEN 0
+                    WHEN ?2 = 'AlreadyInParent' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN 0
+                    WHEN ?2 = 'Unknown' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN 0
+                    ELSE CAST(ROUND(ue.cache_write_tokens * a.weight_basis_points / 10000.0) AS INTEGER)
+                END), 0) cache_write,
+                coalesce(sum(CASE
+                    WHEN ue.source_kind IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter') THEN 0
+                    WHEN ?2 = 'AlreadyInParent' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN 0
+                    WHEN ?2 = 'Unknown' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN 0
+                    ELSE CAST(ROUND(ue.output_tokens * a.weight_basis_points / 10000.0) AS INTEGER)
+                END), 0) output,
+                coalesce(sum(CASE
+                    WHEN ue.source_kind IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter') THEN 0
+                    WHEN ?2 = 'AlreadyInParent' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN 0
+                    WHEN ?2 = 'Unknown' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN 0
+                    ELSE CAST(ROUND(ue.reasoning_tokens * a.weight_basis_points / 10000.0) AS INTEGER)
+                END), 0) reasoning,
+                coalesce(sum(CASE
+                    WHEN ue.id IS NULL OR ue.source_kind IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter') THEN 0
+                    WHEN ?2 = 'AlreadyInParent' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN 0
+                    ELSE 1
+                END), 0) requests,
+                coalesce(sum(CASE
+                    WHEN ue.id IS NULL OR ue.source_kind IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter') THEN 0
+                    WHEN ?2 = 'AlreadyInParent' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN 0
+                    WHEN ?2 = 'Unknown' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN 0
+                    WHEN us.measurement_status='measured' THEN 1
+                    ELSE 0
+                END), 0) measured,
+                coalesce(sum(CASE
+                    WHEN ue.id IS NULL OR ue.source_kind IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter') THEN 0
+                    WHEN ?2 = 'AlreadyInParent' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN 0
+                    WHEN ?2 = 'Unknown' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN 1
+                    WHEN us.measurement_status<>'measured' THEN 1
+                    ELSE 0
+                END), 0) unavailable,
+                count(CASE
+                    WHEN cc.usage_event_id IS NULL THEN NULL
+                    WHEN ?2 = 'AlreadyInParent' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN NULL
+                    WHEN ?2 = 'Unknown' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN NULL
+                    ELSE cc.usage_event_id
+                END) priced,
+                coalesce(sum(CASE
+                    WHEN cc.amount_micros IS NULL THEN 0
+                    WHEN ?2 = 'AlreadyInParent' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN 0
+                    WHEN ?2 = 'Unknown' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN 0
+                    ELSE CAST(ROUND(cc.amount_micros * a.weight_basis_points / 10000.0) AS INTEGER)
+                END), 0) amount_micros
          FROM work_items wi
          LEFT JOIN attributions a ON a.work_item_id = wi.id
          LEFT JOIN attribution_groups ag ON ag.id = a.group_id AND ag.active = 1
@@ -146,7 +204,7 @@ fn load_single_project_tree(connection: &Connection, project: &ProjectRow) -> Re
     )?;
 
     let raw_rows = stmt
-        .query_map([&project.id], |row| {
+        .query_map([&project.id, policy_str], |row| {
             Ok(RawWorkItemRow {
                 id: row.get(0)?,
                 parent_id: row.get(1)?,

@@ -101,25 +101,7 @@ impl Ledger {
     }
 
     pub fn aggregate_usage(&self) -> Result<AggregateUsage> {
-        self.connection.query_row(
-            "SELECT count(*),
-             coalesce(sum(CASE WHEN input_tokens IS NOT NULL OR cached_input_tokens IS NOT NULL OR cache_write_tokens IS NOT NULL OR output_tokens IS NOT NULL OR reasoning_tokens IS NOT NULL THEN 1 ELSE 0 END),0),
-             coalesce(sum(CASE WHEN input_tokens IS NULL AND cached_input_tokens IS NULL AND cache_write_tokens IS NULL AND output_tokens IS NULL AND reasoning_tokens IS NULL THEN 1 ELSE 0 END),0),
-             coalesce(sum(input_tokens),0),coalesce(sum(cached_input_tokens),0),coalesce(sum(cache_write_tokens),0),coalesce(sum(output_tokens),0),coalesce(sum(reasoning_tokens),0)
-             FROM usage_events
-             WHERE source_kind NOT IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter')",
-            [],
-            |row| Ok(AggregateUsage {
-                requests: row.get::<_, i64>(0)? as u64,
-                measured: row.get::<_, i64>(1)? as u64,
-                unavailable: row.get::<_, i64>(2)? as u64,
-                input: row.get::<_, i64>(3)? as u64,
-                cache_read: row.get::<_, i64>(4)? as u64,
-                cache_write: row.get::<_, i64>(5)? as u64,
-                output: row.get::<_, i64>(6)? as u64,
-                reasoning: row.get::<_, i64>(7)? as u64,
-            }),
-        ).map_err(Into::into)
+        aggregate_usage_with_policy(&self.connection)
     }
 
     pub fn apply_price_snapshot(
@@ -315,11 +297,11 @@ pub fn ingest_observations(
             .context("source offset exceeds SQLite integer range")?;
         let changed = transaction.execute(
             "INSERT OR IGNORE INTO usage_events(
-              id,adapter,source_kind,source_event_id,session_id,turn_id,request_id,source_timestamp,
+              id,adapter,source_kind,source_event_id,session_id,turn_id,request_id,agent_id,parent_agent_id,source_timestamp,
               observed_at,ingested_at,model,service_tier,region,input_tokens,cached_input_tokens,
               cache_write_tokens,output_tokens,reasoning_tokens,provider_reported_cost_micros,
               source_path,source_offset,event_hash,adapter_version,parser_version
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 stable_id("evt", &observation.canonical_identity()),
                 observation.adapter,
@@ -328,6 +310,8 @@ pub fn ingest_observations(
                 session_id,
                 observation.turn_id,
                 observation.request_id,
+                observation.agent_id,
+                observation.parent_agent_id,
                 observation.source_timestamp,
                 observation.observed_at,
                 observation.observed_at,
@@ -366,6 +350,49 @@ fn sql_integer(value: Option<u64>) -> Result<Option<i64>> {
         .transpose()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SubagentPolicy {
+    /// Child/subagent tokens are already counted in parent totals → exclude child events
+    AlreadyInParent,
+    /// Child/subagent tokens are independent request streams → include all
+    Independent,
+    /// Capability unknown → include all but mark completeness as degraded
+    Unknown,
+}
+
+/// Resolve the subagent accounting policy from the adapter_capabilities table.
+pub fn resolve_subagent_policy(connection: &Connection) -> SubagentPolicy {
+    let cap_row: Option<(String, Option<String>)> = connection
+        .query_row(
+            "SELECT state, detail FROM adapter_capabilities
+             WHERE capability = 'subagent_tokens_already_in_parent'
+             ORDER BY checked_at DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok();
+
+    match cap_row {
+        Some((state, detail)) if state == "available" => {
+            let is_in_parent = detail
+                .as_deref()
+                .map(|d| {
+                    let s = d.trim().to_ascii_lowercase();
+                    s == "true"
+                        || s.contains("\"already_in_parent\":true")
+                        || s.contains("\"already_in_parent\": true")
+                })
+                .unwrap_or(false);
+            if is_in_parent {
+                SubagentPolicy::AlreadyInParent
+            } else {
+                SubagentPolicy::Independent
+            }
+        }
+        _ => SubagentPolicy::Unknown,
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub struct AggregateUsage {
     pub requests: u64,
@@ -376,6 +403,115 @@ pub struct AggregateUsage {
     pub cache_write: u64,
     pub output: u64,
     pub reasoning: u64,
+    /// True when subagent capability is unknown and totals may be inaccurate
+    pub completeness_degraded: bool,
+}
+
+/// Compute aggregate usage, applying the subagent accounting policy.
+///
+/// - `AlreadyInParent`: exclude events from child sessions (those with
+///   `root_session_id IS NOT NULL`, indicating they are sub-sessions) because
+///   the parent session's events already include the child's tokens.
+/// - `Independent`: include all events — child and parent streams are separate.
+/// - `Unknown`: include all events but mark `completeness_degraded = true`.
+pub fn aggregate_usage_with_policy(connection: &Connection) -> Result<AggregateUsage> {
+    let policy = resolve_subagent_policy(connection);
+
+    let is_subagent = "(ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id))";
+
+    match policy {
+        SubagentPolicy::AlreadyInParent => {
+            // Child/subagent events already represented in parent totals:
+            // exclude child events so parent totals are not added again.
+            let query = format!(
+                "SELECT count(*),
+                 coalesce(sum(CASE WHEN input_tokens IS NOT NULL OR cached_input_tokens IS NOT NULL OR cache_write_tokens IS NOT NULL OR output_tokens IS NOT NULL OR reasoning_tokens IS NOT NULL THEN 1 ELSE 0 END),0),
+                 coalesce(sum(CASE WHEN input_tokens IS NULL AND cached_input_tokens IS NULL AND cache_write_tokens IS NULL AND output_tokens IS NULL AND reasoning_tokens IS NULL THEN 1 ELSE 0 END),0),
+                 coalesce(sum(input_tokens),0),coalesce(sum(cached_input_tokens),0),coalesce(sum(cache_write_tokens),0),coalesce(sum(output_tokens),0),coalesce(sum(reasoning_tokens),0)
+                 FROM usage_events ue
+                 WHERE ue.source_kind NOT IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter')
+                   AND NOT {is_subagent}"
+            );
+            connection
+                .query_row(&query, [], |row| {
+                    Ok(AggregateUsage {
+                        requests: row.get::<_, i64>(0)? as u64,
+                        measured: row.get::<_, i64>(1)? as u64,
+                        unavailable: row.get::<_, i64>(2)? as u64,
+                        input: row.get::<_, i64>(3)? as u64,
+                        cache_read: row.get::<_, i64>(4)? as u64,
+                        cache_write: row.get::<_, i64>(5)? as u64,
+                        output: row.get::<_, i64>(6)? as u64,
+                        reasoning: row.get::<_, i64>(7)? as u64,
+                        completeness_degraded: false,
+                    })
+                })
+                .map_err(Into::into)
+        }
+        SubagentPolicy::Independent => {
+            // Independent child request events roll up exactly once.
+            let query =
+                "SELECT count(*),
+                 coalesce(sum(CASE WHEN input_tokens IS NOT NULL OR cached_input_tokens IS NOT NULL OR cache_write_tokens IS NOT NULL OR output_tokens IS NOT NULL OR reasoning_tokens IS NOT NULL THEN 1 ELSE 0 END),0),
+                 coalesce(sum(CASE WHEN input_tokens IS NULL AND cached_input_tokens IS NULL AND cache_write_tokens IS NULL AND output_tokens IS NULL AND reasoning_tokens IS NULL THEN 1 ELSE 0 END),0),
+                 coalesce(sum(input_tokens),0),coalesce(sum(cached_input_tokens),0),coalesce(sum(cache_write_tokens),0),coalesce(sum(output_tokens),0),coalesce(sum(reasoning_tokens),0)
+                 FROM usage_events ue
+                 WHERE ue.source_kind NOT IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter')";
+            connection
+                .query_row(query, [], |row| {
+                    Ok(AggregateUsage {
+                        requests: row.get::<_, i64>(0)? as u64,
+                        measured: row.get::<_, i64>(1)? as u64,
+                        unavailable: row.get::<_, i64>(2)? as u64,
+                        input: row.get::<_, i64>(3)? as u64,
+                        cache_read: row.get::<_, i64>(4)? as u64,
+                        cache_write: row.get::<_, i64>(5)? as u64,
+                        output: row.get::<_, i64>(6)? as u64,
+                        reasoning: row.get::<_, i64>(7)? as u64,
+                        completeness_degraded: false,
+                    })
+                })
+                .map_err(Into::into)
+        }
+        SubagentPolicy::Unknown => {
+            // When unknown/missing, report degraded completeness rather than silently selecting a policy.
+            // Parent events are measured normally.
+            // Child request events are unverified, counted in requests and unavailable, tokens not added to measured totals.
+            let query = format!(
+                "SELECT count(*),
+                 coalesce(sum(CASE
+                     WHEN {is_subagent} THEN 0
+                     WHEN input_tokens IS NOT NULL OR cached_input_tokens IS NOT NULL OR cache_write_tokens IS NOT NULL OR output_tokens IS NOT NULL OR reasoning_tokens IS NOT NULL THEN 1
+                     ELSE 0 END), 0),
+                 coalesce(sum(CASE
+                     WHEN {is_subagent} THEN 1
+                     WHEN input_tokens IS NULL AND cached_input_tokens IS NULL AND cache_write_tokens IS NULL AND output_tokens IS NULL AND reasoning_tokens IS NULL THEN 1
+                     ELSE 0 END), 0),
+                 coalesce(sum(CASE WHEN {is_subagent} THEN 0 ELSE input_tokens END), 0),
+                 coalesce(sum(CASE WHEN {is_subagent} THEN 0 ELSE cached_input_tokens END), 0),
+                 coalesce(sum(CASE WHEN {is_subagent} THEN 0 ELSE cache_write_tokens END), 0),
+                 coalesce(sum(CASE WHEN {is_subagent} THEN 0 ELSE output_tokens END), 0),
+                 coalesce(sum(CASE WHEN {is_subagent} THEN 0 ELSE reasoning_tokens END), 0)
+                 FROM usage_events ue
+                 WHERE ue.source_kind NOT IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter')"
+            );
+            connection
+                .query_row(&query, [], |row| {
+                    Ok(AggregateUsage {
+                        requests: row.get::<_, i64>(0)? as u64,
+                        measured: row.get::<_, i64>(1)? as u64,
+                        unavailable: row.get::<_, i64>(2)? as u64,
+                        input: row.get::<_, i64>(3)? as u64,
+                        cache_read: row.get::<_, i64>(4)? as u64,
+                        cache_write: row.get::<_, i64>(5)? as u64,
+                        output: row.get::<_, i64>(6)? as u64,
+                        reasoning: row.get::<_, i64>(7)? as u64,
+                        completeness_degraded: true,
+                    })
+                })
+                .map_err(Into::into)
+        }
+    }
 }
 
 fn apply_migrations(connection: &Connection) -> Result<()> {
@@ -439,6 +575,8 @@ mod tests {
             provider_session_id: "s".into(),
             request_id: Some("r".into()),
             turn_id: None,
+            agent_id: None,
+            parent_agent_id: None,
             source_timestamp: None,
             observed_at: "2026-01-01T00:00:00Z".into(),
             model: Some("fixture".into()),

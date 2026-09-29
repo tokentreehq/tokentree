@@ -154,6 +154,8 @@ mod tests {
                 provider_session_id: "s1".into(),
                 request_id: Some("req1".into()),
                 turn_id: None,
+                agent_id: None,
+                parent_agent_id: None,
                 source_timestamp: Some("2026-09-29T12:00:00Z".into()),
                 observed_at: "2026-09-29T12:00:00Z".into(),
                 model: Some("claude-sonnet-4-6".into()),

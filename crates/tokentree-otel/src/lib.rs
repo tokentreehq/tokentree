@@ -107,6 +107,8 @@ pub fn extract_api_requests(payload: &Value) -> Vec<UsageObservation> {
                     provider_session_id: session,
                     request_id: Some(request),
                     turn_id: string_field(&fields, &["prompt.id", "turn.id"]),
+                    agent_id: string_field(&fields, &["agent.id", "agent_id"]),
+                    parent_agent_id: string_field(&fields, &["parent_agent.id", "parent_agent_id"]),
                     source_timestamp: timestamp,
                     observed_at: Utc::now().to_rfc3339(),
                     model: string_field(&fields, &["model", "gen_ai.request.model"]),

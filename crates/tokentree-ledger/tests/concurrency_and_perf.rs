@@ -51,6 +51,8 @@ fn test_concurrent_wal_ingest_and_corrections() {
                     provider_session_id: format!("session_{t_idx}"),
                     request_id: Some(format!("req_{t_idx}_{i}")),
                     turn_id: None,
+                    agent_id: None,
+                    parent_agent_id: None,
                     source_timestamp: Some("2026-09-29T10:00:00Z".to_string()),
                     observed_at: "2026-09-29T10:00:00Z".to_string(),
                     model: Some("claude-sonnet-4.6".to_string()),

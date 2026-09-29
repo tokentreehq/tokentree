@@ -159,6 +159,8 @@ pub fn stop_manual(connection: &mut Connection, counts: ManualCounts) -> Result<
         provider_session_id: run.id.clone(),
         request_id: Some(format!("manual:{}", run.id)),
         turn_id: None,
+        agent_id: None,
+        parent_agent_id: None,
         source_timestamp: Some(now.clone()),
         observed_at: now.clone(),
         model: counts.model,

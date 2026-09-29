@@ -149,6 +149,8 @@ pub fn apply_prototype(
             provider_session_id: session_key.to_owned(),
             request_id: Some(format!("prototype:{source_str}:{index}")),
             turn_id: None,
+            agent_id: None,
+            parent_agent_id: None,
             source_timestamp: Some(timestamp.to_owned()),
             observed_at: timestamp.to_owned(),
             model,

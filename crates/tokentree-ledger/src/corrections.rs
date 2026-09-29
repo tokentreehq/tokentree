@@ -422,33 +422,17 @@ pub fn merge_work_items(
         bail!("Source work item {source_id} is already merged");
     }
 
-    struct ActiveAttr {
-        group_id: String,
-        usage_span_id: String,
-        role: String,
-        weight_basis_points: i64,
-        confidence: Option<f64>,
-    }
-
-    let mut stmt = connection.prepare(
-        "SELECT ag.id, ag.usage_span_id, a.role, a.weight_basis_points, a.confidence
-         FROM attribution_groups ag
-         JOIN attributions a ON a.group_id = ag.id
-         WHERE a.work_item_id = ?1 AND ag.active = 1",
-    )?;
-
-    let active_attrs = stmt
-        .query_map([source_id], |row| {
-            Ok(ActiveAttr {
-                group_id: row.get(0)?,
-                usage_span_id: row.get(1)?,
-                role: row.get(2)?,
-                weight_basis_points: row.get(3)?,
-                confidence: row.get(4)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    drop(stmt);
+    // Find all DISTINCT active groups that contain an attribution row for source_id.
+    let affected_group_ids: Vec<(String, String)> = {
+        let mut stmt = connection.prepare(
+            "SELECT DISTINCT ag.id, ag.usage_span_id
+             FROM attribution_groups ag
+             JOIN attributions a ON a.group_id = ag.id
+             WHERE a.work_item_id = ?1 AND ag.active = 1",
+        )?;
+        stmt.query_map([source_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
 
     let now = Utc::now().to_rfc3339();
     let tx = connection.transaction()?;
@@ -465,35 +449,51 @@ pub fn merge_work_items(
         params![target_id, source_id],
     )?;
 
-    // 3. Re-attribute usage spans: deactivate old group, create replacement group pointing to target_id
+    // 3. For each affected group, reproduce ALL attribution rows,
+    //    replacing source → target and combining weights if target already present.
     let mut reattributed_spans = 0;
-    for attr in active_attrs {
+    for (old_group_id, usage_span_id) in &affected_group_ids {
+        // Read all rows from the superseded group
+        let all_rows = read_group_attributions(&tx, old_group_id)?;
+
+        // Deactivate the old group
         tx.execute(
             "UPDATE attribution_groups SET active = 0 WHERE id = ?1",
-            [&attr.group_id],
+            [old_group_id],
         )?;
 
-        let new_group_id = stable_id("attr", &format!("{}:{target_id}:{now}", attr.usage_span_id));
+        // Build merged row set: replace source→target, combine if target already present
+        let merged_rows = merge_attribution_rows(&all_rows, source_id, target_id);
+
+        // Create replacement group
+        let new_group_id = stable_id(
+            "attr",
+            &format!("{usage_span_id}:merge:{target_id}:{now}:{reattributed_spans}"),
+        );
         tx.execute(
             "INSERT INTO attribution_groups(
                 id, usage_span_id, policy, supersedes_group_id, active, created_at
             ) VALUES(?,?,'causal-request',?,1,?)",
-            params![new_group_id, attr.usage_span_id, attr.group_id, now],
+            params![new_group_id, usage_span_id, old_group_id, now],
         )?;
 
-        tx.execute(
-            "INSERT INTO attributions(
-                group_id, project_id, work_item_id, role, weight_basis_points, method, confidence, verified_by_user
-            ) VALUES(?,?,?,?,?,'manual_merge',?,1)",
-            params![
-                new_group_id,
-                target.project_id,
-                target_id,
-                attr.role,
-                attr.weight_basis_points,
-                attr.confidence.unwrap_or(1.0)
-            ],
-        )?;
+        // Insert all replacement attribution rows
+        for row in &merged_rows {
+            tx.execute(
+                "INSERT INTO attributions(
+                    group_id, project_id, work_item_id, role, weight_basis_points,
+                    method, confidence, verified_by_user
+                ) VALUES(?,?,?,?,?,'manual_merge',?,1)",
+                params![
+                    new_group_id,
+                    row.project_id,
+                    row.work_item_id,
+                    row.role,
+                    row.weight_basis_points,
+                    row.confidence.unwrap_or(1.0)
+                ],
+            )?;
+        }
 
         validate_group_invariant(&tx, &new_group_id)?;
         reattributed_spans += 1;
@@ -541,41 +541,36 @@ pub fn split_work_item(
         )
         .with_context(|| format!("Source work item {source_id} not found"))?;
 
-    struct SpanAttr {
+    // Validate span selections and collect their group info
+    struct SpanInfo {
         span_id: String,
         group_id: String,
-        role: String,
-        weight_basis_points: i64,
-        confidence: Option<f64>,
     }
 
-    let mut span_attrs = Vec::new();
+    let mut span_infos = Vec::new();
     for span_id in span_ids {
-        let attr: Option<SpanAttr> = connection
+        let info: Option<SpanInfo> = connection
             .query_row(
-                "SELECT ag.usage_span_id, ag.id, a.role, a.weight_basis_points, a.confidence
+                "SELECT ag.usage_span_id, ag.id
                  FROM attribution_groups ag
                  JOIN attributions a ON a.group_id = ag.id
                  WHERE ag.usage_span_id = ?1 AND a.work_item_id = ?2 AND ag.active = 1",
                 params![span_id, source_id],
                 |row| {
-                    Ok(SpanAttr {
+                    Ok(SpanInfo {
                         span_id: row.get(0)?,
                         group_id: row.get(1)?,
-                        role: row.get(2)?,
-                        weight_basis_points: row.get(3)?,
-                        confidence: row.get(4)?,
                     })
                 },
             )
             .ok();
 
-        let Some(attr) = attr else {
+        let Some(info) = info else {
             bail!(
                 "Invalid span selection: span {span_id} is not currently actively attributed to work item {source_id}"
             );
         };
-        span_attrs.push(attr);
+        span_infos.push(info);
     }
 
     let now = Utc::now().to_rfc3339();
@@ -596,43 +591,180 @@ pub fn split_work_item(
         ],
     )?;
 
-    // 2. Re-attribute selected spans to new work item with replacement groups
-    for attr in span_attrs {
+    // 2. For each selected span, create a replacement group reproducing ALL rows
+    //    but retargeting the source's row to the new work item.
+    for (idx, info) in span_infos.iter().enumerate() {
+        // Read ALL attribution rows from the superseded group
+        let all_rows = read_group_attributions(&tx, &info.group_id)?;
+
+        // Deactivate the old group
         tx.execute(
             "UPDATE attribution_groups SET active = 0 WHERE id = ?1",
-            [&attr.group_id],
+            [&info.group_id],
         )?;
 
+        // Build split row set: retarget source → new_work_item_id,
+        // preserving all other targets exactly as-is
+        let split_rows = split_attribution_rows(&all_rows, source_id, &new_work_item_id);
+
+        // Create replacement group
         let new_group_id = stable_id(
             "attr",
-            &format!("{}:{new_work_item_id}:{now}", attr.span_id),
+            &format!("{}:split:{new_work_item_id}:{now}:{idx}", info.span_id),
         );
         tx.execute(
             "INSERT INTO attribution_groups(
                 id, usage_span_id, policy, supersedes_group_id, active, created_at
             ) VALUES(?,?,'causal-request',?,1,?)",
-            params![new_group_id, attr.span_id, attr.group_id, now],
+            params![new_group_id, info.span_id, info.group_id, now],
         )?;
 
-        tx.execute(
-            "INSERT INTO attributions(
-                group_id, project_id, work_item_id, role, weight_basis_points, method, confidence, verified_by_user
-            ) VALUES(?,?,?,?,?,'manual_split',?,1)",
-            params![
-                new_group_id,
-                source.project_id,
-                new_work_item_id,
-                attr.role,
-                attr.weight_basis_points,
-                attr.confidence.unwrap_or(1.0)
-            ],
-        )?;
+        // Insert all replacement attribution rows
+        for row in &split_rows {
+            tx.execute(
+                "INSERT INTO attributions(
+                    group_id, project_id, work_item_id, role, weight_basis_points,
+                    method, confidence, verified_by_user
+                ) VALUES(?,?,?,?,?,'manual_split',?,1)",
+                params![
+                    new_group_id,
+                    row.project_id,
+                    row.work_item_id,
+                    row.role,
+                    row.weight_basis_points,
+                    row.confidence.unwrap_or(1.0)
+                ],
+            )?;
+        }
 
         validate_group_invariant(&tx, &new_group_id)?;
     }
 
     tx.commit()?;
     Ok(new_work_item_id)
+}
+
+// ── Attribution row helpers ──────────────────────────────────────────────────
+
+/// A single attribution row read from an existing group.
+#[derive(Clone, Debug)]
+struct AttrRow {
+    project_id: Option<String>,
+    work_item_id: Option<String>,
+    role: String,
+    weight_basis_points: i64,
+    confidence: Option<f64>,
+}
+
+/// Read ALL attribution rows from a group (active or not).
+fn read_group_attributions(conn: &Connection, group_id: &str) -> Result<Vec<AttrRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT project_id, work_item_id, role, weight_basis_points, confidence
+         FROM attributions WHERE group_id = ?1
+         ORDER BY role",
+    )?;
+    let rows = stmt
+        .query_map([group_id], |row| {
+            Ok(AttrRow {
+                project_id: row.get(0)?,
+                work_item_id: row.get(1)?,
+                role: row.get(2)?,
+                weight_basis_points: row.get(3)?,
+                confidence: row.get(4)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// For merge: reproduce all rows from the old group, but replace any row
+/// targeting `source_id` with `target_id`. If `target_id` already has a row,
+/// combine the weights (and take the higher confidence).
+fn merge_attribution_rows(rows: &[AttrRow], source_id: &str, target_id: &str) -> Vec<AttrRow> {
+    let mut result: Vec<AttrRow> = Vec::new();
+    let mut target_combined = false;
+
+    for row in rows {
+        let is_source = row.work_item_id.as_deref() == Some(source_id);
+        let is_target = row.work_item_id.as_deref() == Some(target_id);
+
+        if is_source {
+            // Find if target already exists in result or in remaining rows
+            if let Some(existing) = result
+                .iter_mut()
+                .find(|r| r.work_item_id.as_deref() == Some(target_id))
+            {
+                // Combine: add source weight to existing target row
+                existing.weight_basis_points += row.weight_basis_points;
+                existing.confidence = match (existing.confidence, row.confidence) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (a, b) => a.or(b),
+                };
+                target_combined = true;
+            } else {
+                // No target row yet; retarget source → target
+                let mut new_row = row.clone();
+                new_row.work_item_id = Some(target_id.to_string());
+                // Derive a role suffix when combining later
+                result.push(new_row);
+            }
+        } else if is_target && target_combined {
+            // Already combined into the retargeted source row above;
+            // this shouldn't happen because we process sequentially, but guard.
+            continue;
+        } else {
+            // Keep unmodified
+            result.push(row.clone());
+        }
+    }
+
+    // Second pass: if target appeared AFTER the source row in the original,
+    // we need to combine it into the already-pushed retargeted row.
+    let mut final_result: Vec<AttrRow> = Vec::new();
+    let mut seen_target = false;
+    for row in result {
+        let is_target = row.work_item_id.as_deref() == Some(target_id);
+        if is_target {
+            if seen_target {
+                // Duplicate target; combine into the first
+                if let Some(first) = final_result
+                    .iter_mut()
+                    .find(|r| r.work_item_id.as_deref() == Some(target_id))
+                {
+                    first.weight_basis_points += row.weight_basis_points;
+                    first.confidence = match (first.confidence, row.confidence) {
+                        (Some(a), Some(b)) => Some(a.max(b)),
+                        (a, b) => a.or(b),
+                    };
+                    continue;
+                }
+            }
+            seen_target = true;
+        }
+        final_result.push(row);
+    }
+
+    final_result
+}
+
+/// For split: reproduce all rows from the old group, but retarget the source's
+/// row to `new_work_item_id`, preserving all other active targets exactly.
+fn split_attribution_rows(
+    rows: &[AttrRow],
+    source_id: &str,
+    new_work_item_id: &str,
+) -> Vec<AttrRow> {
+    rows.iter()
+        .map(|row| {
+            if row.work_item_id.as_deref() == Some(source_id) {
+                let mut new_row = row.clone();
+                new_row.work_item_id = Some(new_work_item_id.to_string());
+                new_row
+            } else {
+                row.clone()
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
