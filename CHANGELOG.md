@@ -12,3 +12,8 @@
 - Safe project resolver, conservative boundary classifier, and explicit manual start/stop attribution.
 - Pre-release Claude marketplace/plugin with enqueue-only privacy-safe lifecycle hooks and a ledger-only skill.
 - Checkpointed background hook worker that resolves projects and creates fingerprint-only pending turns off the hook clock.
+- Recursive project/work-item terminal trees and structured direct/descendant query.
+- Attach/detach replacement attribution and explicit notes.
+- Sourced, checksummed Claude Sonnet 4.6 pricing persisted as versioned integer-micro calculations.
+- Public sanitized Claude Code 2.1.x compatibility fixture and camelCase/nested-usage parser support.
+- Readable hook-worker record and event-processing modules; README synchronized with pre-beta reality.

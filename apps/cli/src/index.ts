@@ -4,7 +4,8 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import { tokenCompleteness } from '@tokentreehq/core';
-import { ingestObservations, openLedger } from '@tokentreehq/database';
+import { ingestObservations, openLedger, stableId } from '@tokentreehq/database';
+import { ensureSessionAttribution } from './attribution.js';
 import { discoverClaudeSessions, parseClaudeSession } from '@tokentreehq/adapter-claude';
 
 export const DISCLAIMER='Amounts are list-price estimates from public per-token rates unless labeled otherwise. They are not your provider invoice, prepaid credit balance, or subscription allowance.';
@@ -41,6 +42,7 @@ export async function importClaude(db:DatabaseSync,root:string):Promise<{session
   let sessions=0,inserted=0,duplicates=0,unknown=0,malformed=0,anomalies=0;
   for(const ref of discoverClaudeSessions(root)){
     const parsed=await parseClaudeSession(ref); const summary=ingestObservations(db,parsed.observations,parsed.anomalies.map((item)=>({...item,providerSessionId:ref.providerSessionId})));
+    ensureSessionAttribution(db,stableId('ses',`claude:${ref.providerSessionId}`));
     sessions++;inserted+=summary.inserted;duplicates+=summary.duplicates;unknown+=parsed.stats.unknown;malformed+=parsed.stats.malformed;anomalies+=summary.anomalies;
     const stat=statSync(ref.sourcePath); const last=parsed.observations.at(-1);
     db.prepare(`INSERT INTO ingestion_checkpoints(adapter,source_path,file_size,modified_at,last_offset,last_event_hash) VALUES ('claude',?,?,?,?,?) ON CONFLICT(adapter,source_path) DO UPDATE SET file_size=excluded.file_size,modified_at=excluded.modified_at,last_offset=excluded.last_offset,last_event_hash=excluded.last_event_hash`).run(ref.sourcePath,stat.size,stat.mtime.toISOString(),stat.size,last?.requestId??null);
@@ -69,3 +71,8 @@ export { startManual, stopManual } from './manual.js';
 export type { ManualCounts, ManualStart } from './manual.js';
 export { processClaudeHookSpool } from './hooks-worker.js';
 export type { HookWorkerSummary } from './hooks-worker.js';
+export { applyPriceSnapshot } from './pricing-ledger.js';
+export type { PricingSummary } from './pricing-ledger.js';
+export { addNote, attachSession, detachSession, ensureSessionAttribution } from './attribution.js';
+export { loadProjectTrees, queryLedger, renderProjectTrees } from './tree.js';
+export type { ProjectTree, UsageTotals, WorkTreeNode } from './tree.js';

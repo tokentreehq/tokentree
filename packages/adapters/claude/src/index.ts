@@ -25,7 +25,7 @@ function extractUsage(record: JsonObject): TokenUsage | null {
     cachedInputTokens: count(usage.cache_read_input_tokens ?? usage.cached_input_tokens ?? usage.cachedInputTokens),
     cacheWriteTokens: count(usage.cache_creation_input_tokens ?? usage.cache_write_tokens ?? usage.cacheWriteTokens),
     outputTokens: count(usage.output_tokens ?? usage.outputTokens),
-    reasoningTokens: count(usage.reasoning_tokens ?? usage.reasoningTokens)
+    reasoningTokens: count(usage.reasoning_tokens ?? usage.reasoningTokens ?? object(usage.output_tokens_details)?.thinking_tokens)
   };
   return Object.values(result).every((value) => value === null) ? null : result;
 }
@@ -37,12 +37,12 @@ function observation(record: JsonObject, ref: SessionRef, offset: number, usage:
     sourceEventId:text(record.event_id ?? record.uuid),
     sourceProcessId:text(record.process_id),
     sourceSequence:count(record.sequence) ?? undefined,
-    providerSessionId:text(record.session_id) ?? ref.providerSessionId,
-    requestId:text(record.request_id ?? message?.id),
-    turnId:text(record.turn_id ?? record.prompt_id),
-    agentId:text(record.agent_id), parentAgentId:text(record.parent_agent_id),
+    providerSessionId:text(record.session_id ?? record.sessionId) ?? ref.providerSessionId,
+    requestId:text(record.request_id ?? record.requestId ?? message?.id),
+    turnId:text(record.turn_id ?? record.prompt_id ?? record.promptId),
+    agentId:text(record.agent_id ?? record.agentId), parentAgentId:text(record.parent_agent_id ?? record.parentAgentId),
     sourceTimestamp:text(record.timestamp), observedAt:new Date().toISOString(),
-    model:text(record.model ?? message?.model), serviceTier:text(record.service_tier), region:text(record.region),
+    model:text(record.model ?? message?.model), serviceTier:text(record.service_tier ?? object(message?.usage)?.service_tier), region:text(record.region ?? object(message?.usage)?.inference_geo),
     providerReportedCostMicros:count(record.cost_micros) ?? undefined,
     ...usage, sourcePath:ref.sourcePath, sourceOffset:offset,
     adapterVersion:CLAUDE_ADAPTER_VERSION, parserVersion:CLAUDE_PARSER_VERSION

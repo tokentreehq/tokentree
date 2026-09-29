@@ -9,7 +9,7 @@ const fixture = new URL('../data/prices.json', import.meta.url).pathname;
 
 describe('price snapshots', () => {
   it('accepts a correctly hashed snapshot', () => {
-    expect(loadPriceSnapshot(fixture).models).toEqual([]);
+    expect(loadPriceSnapshot(fixture).models).toHaveLength(1);
   });
   it('rejects tampering', () => {
     const target = join(mkdtempSync(join(tmpdir(), 'tokentree-')), 'prices.json');

@@ -58,7 +58,7 @@ Default local-only; no telemetry or network. Do not persist prompts, completions
 - `--text` must never bind a port.
 
 ## Current phase
-Phase 2 in progress: enqueue-only Claude hooks, project resolution, boundary classification, and manual capture exist. Next slice: background spool consumption, recursive tree/query, and attach/detach/note. Phase 3 remains gated.
+Phase 2 in progress: enqueue-only Claude hooks, project resolution, boundary classification, and manual capture exist. Recursive tree/query, verified pricing, attach/detach/note, and a checkpointed spool worker now exist. Next slice: transient-prompt classifier IPC, one-time clarification, broader compatibility/rates, and release CLI bundling. Phase 3 remains gated.
 
 ## Adding an adapter
 Discover sessions; stream and normalize requests; declare capabilities including `subagent_tokens_already_in_parent`; add sanitized fixtures and golden tests; pass the compatibility matrix; only then claim support.

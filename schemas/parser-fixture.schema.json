@@ -12,6 +12,7 @@
     "scenario": { "type": "string" },
     "input": { "type": "string" },
     "expected": { "type": "string" },
-    "sanitization": { "enum": ["synthetic", "irreversibly_redacted"] }
+    "sanitization": { "enum": ["synthetic", "irreversibly_redacted"] },
+    "source": { "type": "string", "format": "uri" }
   }
 }

@@ -17,7 +17,8 @@
 - [x] `doctor`, `reconcile`, `report --text`, and `import claude`
 - [x] Prototype migration preview/apply, backup, and idempotence
 - [ ] Real-version Claude compatibility matrix and official OTLP receiver
-- [ ] Verified public rate snapshot and cost persistence
+- [x] Verified Sonnet 4.6 rate snapshot and versioned cost persistence
+- [ ] Broader verified model-rate coverage
 - [ ] Crash-spool recovery integration and large-history performance proof
 
 ## Phase 2 — Plugin and classification
@@ -29,8 +30,9 @@
 - [x] Ledger-only TokenTree skill
 - [x] Checkpointed background hook spool consumer
 - [ ] Transient-prompt classifier worker
-- [ ] Recursive `/tokentree` project/work-item tree and structured query
-- [ ] Attach/detach/note and one-time clarification flow
+- [x] Recursive `/tokentree` project/work-item tree and structured query
+- [x] Attach/detach/note corrections
+- [ ] One-time clarification flow
 - [ ] Bundled release CLI and real Claude compatibility proof
 
 ## Later phases

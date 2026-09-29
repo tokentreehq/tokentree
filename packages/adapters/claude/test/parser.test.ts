@@ -28,3 +28,13 @@ describe('Claude JSONL fallback', () => {
     expect(discoverClaudeSessions(root)).toHaveLength(1);
   });
 });
+
+describe('public sanitized Claude Code compatibility fixture',()=>{
+  it('parses camelCase request/session IDs and nested usage from v2.1.x records',async()=>{
+    const path=new URL('../../../../fixtures/parsers/claude/public-small-v2.1.80.jsonl',import.meta.url).pathname;
+    const result=await parseClaudeSession({providerSessionId:'fallback',sourcePath:path});
+    const row=result.observations.find((item)=>item.requestId==='req_stage0_nested');
+    expect(row).toMatchObject({providerSessionId:'ses_stage0_small',inputTokens:10,outputTokens:5,model:'claude-opus-5'});
+    expect(result.stats.unknown).toBeGreaterThan(0);
+  });
+});

@@ -1,3 +1,4 @@
 host,host_version,scenario,fixture,status,notes
 claude,unverified,unknown-fields,claude/unknown-fields.manifest.json,pending,Phase 1 parser must ignore unknown fields
 claude,unverified,truncated,claude/truncated.manifest.json,pending,Phase 1 parser must leave checkpoint consistent
+claude,2.1.80-2.1.220,public-sanitized-mixed,claude/public-small-v2.1.80.manifest.json,passing,CamelCase IDs and nested usage parsed; unknown records tolerated

@@ -45,3 +45,11 @@ function isPriceSnapshot(value: unknown): value is PriceSnapshot {
 }
 export { calculateApiEquivalentCost } from './cost.js';
 export type { CostResult, ExactRates } from './cost.js';
+
+export function resolveSnapshotRate(snapshot: PriceSnapshot, model: string, at = new Date()): PriceRate | null {
+  const candidates=snapshot.models.filter((rate)=>{
+    const matches=rate.modelPattern.endsWith('*')?model.startsWith(rate.modelPattern.slice(0,-1)):model===rate.modelPattern;
+    return matches&&new Date(rate.effectiveFrom).getTime()<=at.getTime();
+  });
+  return candidates.sort((a,b)=>b.effectiveFrom.localeCompare(a.effectiveFrom))[0]??null;
+}
