@@ -208,6 +208,7 @@ CREATE TABLE ingestion_checkpoints (
   last_event_hash TEXT,
   file_hash TEXT,
   parser_version TEXT,
+  adapter_state_json TEXT,
   PRIMARY KEY (adapter, source_path)
 ) STRICT;
 

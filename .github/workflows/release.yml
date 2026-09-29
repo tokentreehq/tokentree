@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'v*'
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -51,6 +52,27 @@ jobs:
       - name: Build binary
         run: cargo build --release --target ${{ matrix.target }} -p tokentree-cli
 
+      - name: Native smoke test before packaging (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          target/${{ matrix.target }}/release/${{ matrix.binary_name }} --version
+          target/${{ matrix.target }}/release/${{ matrix.binary_name }} doctor
+          target/${{ matrix.target }}/release/${{ matrix.binary_name }} import --codex fixtures/parsers/codex/app-server-v1.jsonl
+          target/${{ matrix.target }}/release/${{ matrix.binary_name }} report --text
+          target/${{ matrix.target }}/release/${{ matrix.binary_name }} export --format json > export-test.json
+          test -s export-test.json
+
+      - name: Native smoke test before packaging (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          .\target\${{ matrix.target }}\release\${{ matrix.binary_name }} --version
+          .\target\${{ matrix.target }}\release\${{ matrix.binary_name }} doctor
+          .\target\${{ matrix.target }}\release\${{ matrix.binary_name }} import --codex fixtures/parsers/codex/app-server-v1.jsonl
+          .\target\${{ matrix.target }}\release\${{ matrix.binary_name }} report --text
+          .\target\${{ matrix.target }}\release\${{ matrix.binary_name }} export --format json > export-test.json
+          if ((Get-Item export-test.json).Length -eq 0) { throw "export-test.json is empty" }
+
       - name: Package archive (Unix)
         if: matrix.archive_ext == 'tar.gz'
         run: |
@@ -67,6 +89,23 @@ jobs:
           New-Item -ItemType Directory -Force -Path staging
           Copy-Item target/${{ matrix.target }}/release/${{ matrix.binary_name }} staging/
           Compress-Archive -Path staging/* -DestinationPath tokentree-${{ matrix.target }}.zip
+
+      - name: Native smoke test extracted archive (Unix)
+        if: matrix.archive_ext == 'tar.gz'
+        run: |
+          mkdir -p test-extracted
+          tar -xzf tokentree-${{ matrix.target }}.tar.gz -C test-extracted
+          chmod +x test-extracted/${{ matrix.binary_name }}
+          test-extracted/${{ matrix.binary_name }} --version
+          test-extracted/${{ matrix.binary_name }} doctor
+
+      - name: Native smoke test extracted archive (Windows)
+        if: matrix.archive_ext == 'zip'
+        shell: pwsh
+        run: |
+          Expand-Archive -Path tokentree-${{ matrix.target }}.zip -DestinationPath test-extracted
+          .\test-extracted\${{ matrix.binary_name }} --version
+          .\test-extracted\${{ matrix.binary_name }} doctor
 
       - name: Upload artifact
         uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
@@ -103,7 +142,7 @@ jobs:
           pattern: binary-*
           merge-multiple: true
 
-      - name: Generate Software Bill of Materials (SPDX 2.3 and CycloneDX 1.5)
+      - name: Generate and validate Software Bill of Materials (SPDX 2.3 and CycloneDX 1.5)
         run: |
           npx tsx scripts/generate-sbom.ts release-assets
 

@@ -1,21 +1,41 @@
 // SPDX-License-Identifier: Apache-2.0
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import Ajv from 'ajv';
+import addFormats from 'ajv-formats';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const rootDir = resolve(here, '..');
 
-interface CargoPackage {
+export interface SbomPackage {
+  ecosystem: 'cargo' | 'npm';
   name: string;
   version: string;
+  purl: string;
+  license?: string;
   source?: string;
   checksum?: string;
 }
 
-function parseCargoLock(cargoLockContent: string): CargoPackage[] {
-  const packages: CargoPackage[] = [];
+export function getReleaseVersion(): string {
+  const cargoPath = join(rootDir, 'Cargo.toml');
+  if (existsSync(cargoPath)) {
+    const cargoToml = readFileSync(cargoPath, 'utf8');
+    const m = cargoToml.match(/\[workspace\.package\][^[]*?version\s*=\s*"([^"]+)"/s);
+    if (m) return m[1];
+  }
+  const cliPkgPath = join(rootDir, 'apps/cli/package.json');
+  if (existsSync(cliPkgPath)) {
+    const pkg = JSON.parse(readFileSync(cliPkgPath, 'utf8'));
+    if (pkg.version) return pkg.version;
+  }
+  return '0.2.0';
+}
+
+export function parseCargoLock(cargoLockContent: string): SbomPackage[] {
+  const packages: SbomPackage[] = [];
   const blocks = cargoLockContent.split('[[package]]');
 
   for (const block of blocks) {
@@ -25,9 +45,25 @@ function parseCargoLock(cargoLockContent: string): CargoPackage[] {
     const checksumMatch = block.match(/checksum\s*=\s*"([^"]+)"/);
 
     if (nameMatch && versionMatch) {
+      const name = nameMatch[1];
+      const version = versionMatch[1];
+      // Filter out root workspace members
+      if (
+        name === 'tokentree-cli' ||
+        name === 'tokentree-core' ||
+        name === 'tokentree-ledger' ||
+        name === 'tokentree-codex' ||
+        name === 'tokentree-claude' ||
+        name === 'tokentree-otel'
+      ) {
+        continue;
+      }
+
       packages.push({
-        name: nameMatch[1],
-        version: versionMatch[1],
+        ecosystem: 'cargo',
+        name,
+        version,
+        purl: `pkg:cargo/${name}@${version}`,
         source: sourceMatch ? sourceMatch[1] : undefined,
         checksum: checksumMatch ? checksumMatch[1] : undefined,
       });
@@ -37,25 +73,105 @@ function parseCargoLock(cargoLockContent: string): CargoPackage[] {
   return packages;
 }
 
+export function collectNpmPackages(releaseVersion: string): SbomPackage[] {
+  const packages: SbomPackage[] = [];
+  const seen = new Set<string>();
+
+  const scanDirs = [
+    join(rootDir, 'apps'),
+    join(rootDir, 'packages'),
+    join(rootDir, 'packages/adapters'),
+    join(rootDir, 'plugins'),
+  ];
+
+  for (const parent of scanDirs) {
+    if (!existsSync(parent)) continue;
+    for (const entry of readdirSync(parent)) {
+      const pkgJsonPath = join(parent, entry, 'package.json');
+      if (existsSync(pkgJsonPath) && statSync(pkgJsonPath).isFile()) {
+        try {
+          const pkg = JSON.parse(readFileSync(pkgJsonPath, 'utf8'));
+          if (pkg.name) {
+            const version = pkg.version === '0.0.0' ? releaseVersion : pkg.version || releaseVersion;
+            const key = `${pkg.name}@${version}`;
+            if (!seen.has(key)) {
+              seen.add(key);
+              let purl: string;
+              if (pkg.name.startsWith('@')) {
+                const [scope, unscoped] = pkg.name.split('/');
+                purl = `pkg:npm/%40${scope.slice(1)}/${unscoped}@${version}`;
+              } else {
+                purl = `pkg:npm/${pkg.name}@${version}`;
+              }
+
+              packages.push({
+                ecosystem: 'npm',
+                name: pkg.name,
+                version,
+                purl,
+                license: pkg.license || 'Apache-2.0',
+              });
+            }
+
+            // Also check declared production dependencies
+            if (pkg.dependencies && typeof pkg.dependencies === 'object') {
+              for (const [depName, depVer] of Object.entries(pkg.dependencies)) {
+                if (typeof depVer === 'string' && !depVer.startsWith('workspace:')) {
+                  const cleanVer = depVer.replace(/^[\^~]/, '');
+                  const depKey = `${depName}@${cleanVer}`;
+                  if (!seen.has(depKey)) {
+                    seen.add(depKey);
+                    let purl: string;
+                    if (depName.startsWith('@')) {
+                      const [scope, unscoped] = depName.split('/');
+                      purl = `pkg:npm/%40${scope.slice(1)}/${unscoped}@${cleanVer}`;
+                    } else {
+                      purl = `pkg:npm/${depName}@${cleanVer}`;
+                    }
+                    packages.push({
+                      ecosystem: 'npm',
+                      name: depName,
+                      version: cleanVer,
+                      purl,
+                      license: 'NOASSERTION',
+                    });
+                  }
+                }
+              }
+            }
+          }
+        } catch {
+          // ignore unparseable package.json
+        }
+      }
+    }
+  }
+
+  return packages;
+}
+
 export function generateSbom(outputDir: string) {
   mkdirSync(outputDir, { recursive: true });
 
+  const releaseVersion = getReleaseVersion();
   const cargoLockPath = join(rootDir, 'Cargo.lock');
-  let cargoPackages: CargoPackage[] = [];
+  let cargoPackages: SbomPackage[] = [];
   if (existsSync(cargoLockPath)) {
     const lockContent = readFileSync(cargoLockPath, 'utf8');
     cargoPackages = parseCargoLock(lockContent);
   }
 
+  const npmPackages = collectNpmPackages(releaseVersion);
+  const allPackages = [...cargoPackages, ...npmPackages];
+
   const timestamp = new Date().toISOString();
-  const rootVersion = '0.2.0';
 
   // 1. Generate SPDX 2.3 JSON
   const spdxPackages = [
     {
       SPDXID: 'SPDXRef-Package-tokentree',
       name: 'tokentree',
-      versionInfo: rootVersion,
+      versionInfo: releaseVersion,
       downloadLocation: 'git+https://github.com/tokentreehq/tokentree.git',
       filesAnalyzed: false,
       licenseConcluded: 'Apache-2.0',
@@ -65,7 +181,7 @@ export function generateSbom(outputDir: string) {
         {
           referenceCategory: 'PACKAGE-MANAGER',
           referenceType: 'purl',
-          referenceLocator: `pkg:cargo/tokentree@${rootVersion}`,
+          referenceLocator: `pkg:cargo/tokentree@${releaseVersion}`,
         },
       ],
     },
@@ -79,26 +195,25 @@ export function generateSbom(outputDir: string) {
     },
   ];
 
-  for (const pkg of cargoPackages) {
-    if (pkg.name === 'tokentree-cli' || pkg.name === 'tokentree-core' || pkg.name === 'tokentree-ledger') {
-      continue;
-    }
+  for (const pkg of allPackages) {
     const cleanName = pkg.name.replace(/[^a-zA-Z0-9-]/g, '-');
-    const spdxId = `SPDXRef-Package-cargo-${cleanName}-${pkg.version.replace(/[^a-zA-Z0-9-]/g, '-')}`;
+    const cleanVer = pkg.version.replace(/[^a-zA-Z0-9-]/g, '-');
+    const spdxId = `SPDXRef-Package-${pkg.ecosystem}-${cleanName}-${cleanVer}`;
+
     spdxPackages.push({
       SPDXID: spdxId,
       name: pkg.name,
       versionInfo: pkg.version,
       downloadLocation: 'NOASSERTION',
       filesAnalyzed: false,
-      licenseConcluded: 'NOASSERTION',
-      licenseDeclared: 'NOASSERTION',
+      licenseConcluded: pkg.license || 'NOASSERTION',
+      licenseDeclared: pkg.license || 'NOASSERTION',
       supplier: 'NOASSERTION',
       externalRefs: [
         {
           referenceCategory: 'PACKAGE-MANAGER',
           referenceType: 'purl',
-          referenceLocator: `pkg:cargo/${pkg.name}@${pkg.version}`,
+          referenceLocator: pkg.purl,
         },
       ],
     });
@@ -115,7 +230,7 @@ export function generateSbom(outputDir: string) {
     dataLicense: 'CC0-1.0',
     SPDXID: 'SPDXRef-DOCUMENT',
     name: 'tokentree',
-    documentNamespace: `https://github.com/tokentreehq/tokentree/spdx/tokentree-${rootVersion}-${Date.now()}`,
+    documentNamespace: `https://github.com/tokentreehq/tokentree/spdx/tokentree-${releaseVersion}-${Date.now()}`,
     creationInfo: {
       created: timestamp,
       creators: ['Tool: tokentree-sbom-generator-1.0', 'Organization: tokentreehq'],
@@ -128,18 +243,16 @@ export function generateSbom(outputDir: string) {
   writeFileSync(spdxPath, JSON.stringify(spdxDoc, null, 2), 'utf8');
 
   // 2. Generate CycloneDX 1.5 JSON
-  const cyclonedxComponents = cargoPackages
-    .filter((p) => p.name !== 'tokentree-cli' && p.name !== 'tokentree-core' && p.name !== 'tokentree-ledger')
-    .map((pkg) => ({
-      type: 'library',
-      name: pkg.name,
-      version: pkg.version,
-      purl: `pkg:cargo/${pkg.name}@${pkg.version}`,
-      'bom-ref': `pkg:cargo/${pkg.name}@${pkg.version}`,
-    }));
+  const cyclonedxComponents = allPackages.map((pkg) => ({
+    type: 'library',
+    name: pkg.name,
+    version: pkg.version,
+    purl: pkg.purl,
+    'bom-ref': pkg.purl,
+  }));
 
   const cyclonedxDoc = {
-    $schema: 'http://cyclonedx.org/schema/bom-1.5.json',
+    $schema: 'http://cyclonedx.org/schema/bom-1.5.schema.json',
     bomFormat: 'CycloneDX',
     specVersion: '1.5',
     serialNumber: `urn:uuid:${randomUUID()}`,
@@ -156,8 +269,8 @@ export function generateSbom(outputDir: string) {
       component: {
         type: 'application',
         name: 'tokentree',
-        version: rootVersion,
-        purl: `pkg:cargo/tokentree@${rootVersion}`,
+        version: releaseVersion,
+        purl: `pkg:cargo/tokentree@${releaseVersion}`,
         licenses: [
           {
             license: {
@@ -173,9 +286,59 @@ export function generateSbom(outputDir: string) {
   const cyclonedxPath = join(outputDir, 'tokentree-cyclonedx-sbom.json');
   writeFileSync(cyclonedxPath, JSON.stringify(cyclonedxDoc, null, 2), 'utf8');
 
-  console.log(`[SBOM] Generated SPDX 2.3 SBOM at: ${spdxPath} (${spdxPackages.length} packages)`);
-  console.log(`[SBOM] Generated CycloneDX 1.5 SBOM at: ${cyclonedxPath} (${cyclonedxComponents.length} components)`);
+  console.log(`[SBOM] Generated SPDX 2.3 SBOM at: ${spdxPath} (${spdxPackages.length} packages, version ${releaseVersion})`);
+  console.log(`[SBOM] Generated CycloneDX 1.5 SBOM at: ${cyclonedxPath} (${cyclonedxComponents.length} components, version ${releaseVersion})`);
 }
 
-const targetDir = process.argv[2] || resolve(rootDir, 'release-assets');
-generateSbom(targetDir);
+export function validateSbomFiles(outputDir: string): { spdxValid: boolean; cyclonedxValid: boolean } {
+  const schemasDir = join(rootDir, 'schemas');
+  const spdxSchemaPath = join(schemasDir, 'spdx-2.3.schema.json');
+  const cdxSchemaPath = join(schemasDir, 'cyclonedx-1.5.schema.json');
+  const cdxSpdxPath = join(schemasDir, 'spdx.schema.json');
+  const jsfSchemaPath = join(schemasDir, 'jsf-0.82.schema.json');
+
+  if (!existsSync(spdxSchemaPath) || !existsSync(cdxSchemaPath)) {
+    throw new Error(`Official schemas missing in ${schemasDir}`);
+  }
+
+  const ajv = new Ajv({ allErrors: true, strict: false });
+  addFormats(ajv);
+  ajv.addFormat('iri-reference', true);
+  ajv.addFormat('idn-email', true);
+
+  if (existsSync(cdxSpdxPath)) {
+    ajv.addSchema(JSON.parse(readFileSync(cdxSpdxPath, 'utf8')), 'spdx.schema.json');
+  }
+  if (existsSync(jsfSchemaPath)) {
+    ajv.addSchema(JSON.parse(readFileSync(jsfSchemaPath, 'utf8')), 'jsf-0.82.schema.json');
+  }
+
+  const spdxSchema = JSON.parse(readFileSync(spdxSchemaPath, 'utf8'));
+  const validateSpdx = ajv.compile(spdxSchema);
+
+  const spdxDoc = JSON.parse(readFileSync(join(outputDir, 'tokentree-spdx-sbom.json'), 'utf8'));
+  const spdxValid = Boolean(validateSpdx(spdxDoc));
+  if (!spdxValid) {
+    console.error('[SBOM Validation Error] SPDX 2.3 schema errors:', validateSpdx.errors);
+    throw new Error(`SPDX 2.3 schema validation failed: ${JSON.stringify(validateSpdx.errors)}`);
+  }
+
+  const cdxSchema = JSON.parse(readFileSync(cdxSchemaPath, 'utf8'));
+  const validateCdx = ajv.compile(cdxSchema);
+
+  const cdxDoc = JSON.parse(readFileSync(join(outputDir, 'tokentree-cyclonedx-sbom.json'), 'utf8'));
+  const cyclonedxValid = Boolean(validateCdx(cdxDoc));
+  if (!cyclonedxValid) {
+    console.error('[SBOM Validation Error] CycloneDX 1.5 schema errors:', validateCdx.errors);
+    throw new Error(`CycloneDX 1.5 schema validation failed: ${JSON.stringify(validateCdx.errors)}`);
+  }
+
+  console.log('[SBOM Validation] SPDX 2.3 and CycloneDX 1.5 both validated successfully against official schemas.');
+  return { spdxValid, cyclonedxValid };
+}
+
+if (process.argv[1] && process.argv[1].endsWith('generate-sbom.ts')) {
+  const targetDir = process.argv[2] || resolve(rootDir, 'release-assets');
+  generateSbom(targetDir);
+  validateSbomFiles(targetDir);
+}

@@ -46,11 +46,24 @@ pub struct CodexAnomaly {
     pub details: Value,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct CodexParserState {
+    pub version: u32,
+    pub active_session_id: Option<String>,
+    pub active_turn_id: Option<String>,
+    pub active_agent_id: Option<String>,
+    pub active_parent_agent_id: Option<String>,
+    pub cumulative_counters: HashMap<String, TokenUsage>,
+    pub protocol_version: Option<String>,
+    pub turn_detailed_tokens: HashMap<String, TokenUsage>,
+}
+
 #[derive(Debug)]
 pub struct ParseResult {
     pub observations: Vec<UsageObservation>,
     pub anomalies: Vec<CodexAnomaly>,
     pub stats: ParseStats,
+    pub final_state: CodexParserState,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -80,13 +93,14 @@ pub fn discover_sessions(root: &Path) -> Vec<PathBuf> {
 
 pub fn parse_session(path: &Path) -> Result<ParseResult> {
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    parse_reader(BufReader::new(file), path, 0)
+    parse_reader(BufReader::new(file), path, 0, CodexParserState::default())
 }
 
 pub fn parse_reader<R: BufRead>(
     mut reader: R,
     path: &Path,
     start_offset: u64,
+    initial_state: CodexParserState,
 ) -> Result<ParseResult> {
     let fallback_session = path
         .file_stem()
@@ -98,12 +112,14 @@ pub fn parse_reader<R: BufRead>(
     let mut stats = ParseStats::default();
     let mut offset = start_offset;
 
-    let mut active_session_id: Option<String> = None;
-    let mut active_turn_id: Option<String> = None;
-    let mut active_agent_id: Option<String> = None;
-    let mut active_parent_agent_id: Option<String> = None;
+    let mut active_session_id: Option<String> = initial_state.active_session_id;
+    let mut active_turn_id: Option<String> = initial_state.active_turn_id;
+    let mut active_agent_id: Option<String> = initial_state.active_agent_id;
+    let mut active_parent_agent_id: Option<String> = initial_state.active_parent_agent_id;
+    let mut active_protocol_version: Option<String> = initial_state.protocol_version;
 
-    let mut cumulative_counters: HashMap<String, TokenUsage> = HashMap::new();
+    let mut cumulative_counters: HashMap<String, TokenUsage> = initial_state.cumulative_counters;
+    let mut turn_detailed_tokens: HashMap<String, TokenUsage> = initial_state.turn_detailed_tokens;
 
     let mut line_buf = String::new();
     loop {
@@ -168,6 +184,8 @@ pub fn parse_reader<R: BufRead>(
                     details: serde_json::json!({ "unsupported_version": ver }),
                 });
                 continue;
+            } else {
+                active_protocol_version = Some(ver);
             }
         }
 
@@ -212,6 +230,20 @@ pub fn parse_reader<R: BufRead>(
                 })
             {
                 active_parent_agent_id = Some(pa_id);
+            }
+        }
+
+        if is_hook_boundary_end(&record_type) {
+            if record_type == "turn/completed"
+                || record_type == "turn_complete"
+                || record_type == "turn/end"
+            {
+                active_turn_id = None;
+            } else if record_type == "session/completed" {
+                active_session_id = None;
+                active_turn_id = None;
+                active_agent_id = None;
+                active_parent_agent_id = None;
             }
         }
 
@@ -527,6 +559,26 @@ pub fn parse_reader<R: BufRead>(
             let deduped = deduplicate(detailed);
             let detailed_events = deduped.canonical;
 
+            // Track detailed tokens for this turn in state so subsequent restarts know this turn is covered
+            let turn_key = format!("{session}:{turn}");
+            let entry = turn_detailed_tokens.entry(turn_key).or_default();
+            for d in &detailed_events {
+                entry.input_tokens =
+                    Some(entry.input_tokens.unwrap_or(0) + d.usage.input_tokens.unwrap_or(0));
+                entry.cached_input_tokens = Some(
+                    entry.cached_input_tokens.unwrap_or(0)
+                        + d.usage.cached_input_tokens.unwrap_or(0),
+                );
+                entry.cache_write_tokens = Some(
+                    entry.cache_write_tokens.unwrap_or(0) + d.usage.cache_write_tokens.unwrap_or(0),
+                );
+                entry.output_tokens =
+                    Some(entry.output_tokens.unwrap_or(0) + d.usage.output_tokens.unwrap_or(0));
+                entry.reasoning_tokens = Some(
+                    entry.reasoning_tokens.unwrap_or(0) + d.usage.reasoning_tokens.unwrap_or(0),
+                );
+            }
+
             if !counters.is_empty() {
                 // There is a covering counter!
                 // Verify whether counter matches sum of detailed events
@@ -588,17 +640,74 @@ pub fn parse_reader<R: BufRead>(
 
             final_observations.extend(detailed_events);
         } else if !counters.is_empty() {
-            // No detailed events cover this turn: the turn counter is the fallback.
-            // Deduplicate repeated counters so only 1 counter is added.
-            let deduped = deduplicate(counters);
-            final_observations.extend(deduped.canonical);
+            let turn_key = format!("{session}:{turn}");
+            if let Some(prev_detailed) = turn_detailed_tokens.get(&turn_key) {
+                // Covered by detailed events from a previous batch before restart!
+                let counter = &counters[0];
+                let ctr_input = counter.usage.input_tokens.unwrap_or(0);
+                let ctr_cached = counter.usage.cached_input_tokens.unwrap_or(0);
+                let ctr_output = counter.usage.output_tokens.unwrap_or(0);
+                let ctr_reasoning = counter.usage.reasoning_tokens.unwrap_or(0);
+
+                let det_input = prev_detailed.input_tokens.unwrap_or(0);
+                let det_cached = prev_detailed.cached_input_tokens.unwrap_or(0);
+                let det_output = prev_detailed.output_tokens.unwrap_or(0);
+                let det_reasoning = prev_detailed.reasoning_tokens.unwrap_or(0);
+
+                if det_input != ctr_input
+                    || det_output != ctr_output
+                    || det_cached != ctr_cached
+                    || det_reasoning != ctr_reasoning
+                {
+                    stats.anomalies += 1;
+                    anomalies.push(CodexAnomaly {
+                        anomaly_type: "counter_conflict".to_string(),
+                        session_id: Some(session.clone()),
+                        turn_id: Some(turn.clone()),
+                        source_path: counter.source_path.clone(),
+                        source_offset: counter.source_offset,
+                        details: serde_json::json!({
+                            "detailed_sum": {
+                                "input_tokens": det_input,
+                                "cached_input_tokens": det_cached,
+                                "output_tokens": det_output,
+                                "reasoning_tokens": det_reasoning
+                            },
+                            "counter": {
+                                "input_tokens": ctr_input,
+                                "cached_input_tokens": ctr_cached,
+                                "output_tokens": ctr_output,
+                                "reasoning_tokens": ctr_reasoning
+                            }
+                        }),
+                    });
+                }
+                // Suppressed! Do not emit counter.
+            } else {
+                // No detailed events cover this turn: the turn counter is the fallback.
+                // Deduplicate repeated counters so only 1 counter is added.
+                let deduped = deduplicate(counters);
+                final_observations.extend(deduped.canonical);
+            }
         }
     }
+
+    let final_state = CodexParserState {
+        version: 1,
+        active_session_id,
+        active_turn_id,
+        active_agent_id,
+        active_parent_agent_id,
+        cumulative_counters,
+        protocol_version: active_protocol_version,
+        turn_detailed_tokens,
+    };
 
     Ok(ParseResult {
         observations: final_observations,
         anomalies,
         stats,
+        final_state,
     })
 }
 
@@ -615,12 +724,13 @@ pub fn import_codex_file(connection: &mut Connection, path: &Path) -> Result<Cod
         last_offset: i64,
         file_hash: Option<String>,
         parser_version: Option<String>,
+        adapter_state_json: Option<String>,
     }
 
     // Query existing checkpoint
     let checkpoint: Option<IngestionCheckpointRow> = connection
         .query_row(
-            "SELECT last_offset, file_hash, parser_version
+            "SELECT last_offset, file_hash, parser_version, adapter_state_json
              FROM ingestion_checkpoints
              WHERE adapter = 'codex' AND source_path = ?1",
             [&source_path_str],
@@ -629,12 +739,14 @@ pub fn import_codex_file(connection: &mut Connection, path: &Path) -> Result<Cod
                     last_offset: row.get(0)?,
                     file_hash: row.get(1)?,
                     parser_version: row.get(2)?,
+                    adapter_state_json: row.get(3)?,
                 })
             },
         )
         .ok();
 
     let mut start_offset = 0_u64;
+    let mut initial_state = CodexParserState::default();
     if let Some(cp) = checkpoint {
         let last_off = cp.last_offset.max(0) as u64;
         let is_truncated = current_size < last_off;
@@ -657,6 +769,11 @@ pub fn import_codex_file(connection: &mut Connection, path: &Path) -> Result<Cod
 
         if !is_truncated && !is_rotated && !is_parser_changed {
             start_offset = last_off;
+            if let Some(state_json) = cp.adapter_state_json {
+                if let Ok(st) = serde_json::from_str::<CodexParserState>(&state_json) {
+                    initial_state = st;
+                }
+            }
         }
     }
 
@@ -694,7 +811,12 @@ pub fn import_codex_file(connection: &mut Connection, path: &Path) -> Result<Cod
     let slice_to_parse = &read_buf[..valid_len];
     let end_offset = start_offset + valid_len as u64;
 
-    let parse_res = parse_reader(BufReader::new(slice_to_parse), path, start_offset)?;
+    let parse_res = parse_reader(
+        BufReader::new(slice_to_parse),
+        path,
+        start_offset,
+        initial_state,
+    )?;
 
     // Commit observations, anomalies, and checkpoint in a single atomic transaction
     let tx = connection.transaction()?;
@@ -782,19 +904,19 @@ pub fn import_codex_file(connection: &mut Connection, path: &Path) -> Result<Cod
     }
 
     for anom in &parse_res.anomalies {
+        let file_id = if anom.source_path.is_empty() {
+            &source_path_str
+        } else {
+            &anom.source_path
+        };
+        let stable_file_id = hex::encode(&Sha256::digest(file_id.as_bytes())[..8]);
+        let raw_key = format!(
+            "codex:{}:{}:{}:{}",
+            stable_file_id, anom.source_offset, anom.anomaly_type, PARSER_VERSION
+        );
         let anom_id = format!(
             "anom_{}",
-            hex::encode(
-                &Sha256::digest(
-                    format!(
-                        "{}:{}:{}",
-                        anom.anomaly_type,
-                        anom.source_offset,
-                        Utc::now()
-                    )
-                    .as_bytes()
-                )[..8]
-            )
+            &hex::encode(Sha256::digest(raw_key.as_bytes()))[..16]
         );
         let resolved_session: Option<String> = if let Some(s) = &anom.session_id {
             tx.query_row(
@@ -816,7 +938,7 @@ pub fn import_codex_file(connection: &mut Connection, path: &Path) -> Result<Cod
         };
 
         tx.execute(
-            "INSERT INTO measurement_anomalies (id, session_id, turn_id, type, source_values_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT OR IGNORE INTO measurement_anomalies (id, session_id, turn_id, type, source_values_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 anom_id,
                 resolved_session,
@@ -839,18 +961,21 @@ pub fn import_codex_file(connection: &mut Connection, path: &Path) -> Result<Cod
         None
     };
 
+    let state_json = serde_json::to_string(&parse_res.final_state).unwrap_or_default();
+
     // Update ingestion checkpoint
     tx.execute(
         "INSERT INTO ingestion_checkpoints(
-            adapter, source_path, file_size, modified_at, last_offset, last_event_hash, file_hash, parser_version
-         ) VALUES ('codex', ?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            adapter, source_path, file_size, modified_at, last_offset, last_event_hash, file_hash, parser_version, adapter_state_json
+         ) VALUES ('codex', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT(adapter, source_path) DO UPDATE SET
             file_size = excluded.file_size,
             modified_at = excluded.modified_at,
             last_offset = excluded.last_offset,
             last_event_hash = excluded.last_event_hash,
             file_hash = excluded.file_hash,
-            parser_version = excluded.parser_version",
+            parser_version = excluded.parser_version,
+            adapter_state_json = excluded.adapter_state_json",
         params![
             source_path_str,
             current_size as i64,
@@ -859,6 +984,7 @@ pub fn import_codex_file(connection: &mut Connection, path: &Path) -> Result<Cod
             last_event_hash,
             commit_file_hash,
             PARSER_VERSION,
+            state_json,
         ],
     )?;
 
