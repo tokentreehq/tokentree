@@ -1,7 +1,34 @@
 #!/usr/bin/env node
 // SPDX-License-Identifier: Apache-2.0
+import { spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { addNote,applyPriceSnapshot,DISCLAIMER,applyPrototype,attachSession,detachSession,doctor,importClaude,loadProjectTrees,openDefaultLedger,previewPrototype,processClaudeHookSpool,queryLedger,reconcile,renderProjectTrees,renderTextReport,resolvePaths,startManual,stopManual } from './index.js';
+
+function findNativeBinary(): string | undefined {
+  if (process.env.TOKENTREE_BIN && existsSync(process.env.TOKENTREE_BIN)) {
+    return process.env.TOKENTREE_BIN;
+  }
+  const ext = process.platform === 'win32' ? '.exe' : '';
+  const candidates = [
+    join(import.meta.dirname, '..', 'bin', `tokentree${ext}`),
+    join(import.meta.dirname, '..', '..', '..', 'target', 'release', `tokentree${ext}`),
+    join(import.meta.dirname, '..', '..', '..', 'target', 'debug', `tokentree${ext}`),
+  ];
+  for (const c of candidates) {
+    if (existsSync(c)) return c;
+  }
+  return undefined;
+}
+
+if (!process.env.TOKENTREE_FORCE_JS) {
+  const nativeBin = findNativeBinary();
+  if (nativeBin) {
+    const result = spawnSync(nativeBin, process.argv.slice(2), { stdio: 'inherit' });
+    process.exit(result.status ?? (result.signal ? 1 : 0));
+  }
+}
+
 const args=process.argv.slice(2); const command=args[0]; const paths=resolvePaths(); const pricesPath=join(import.meta.dirname,'../../../packages/pricing/data/prices.json');
 async function main():Promise<number>{
  if(!command||command==='help'||command==='--help'){console.log('tokentree <doctor|import claude|report --text|query|attach|detach|note|reconcile|migrate prototype --preview|--apply|start|stop|classify>');return 0;}

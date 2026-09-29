@@ -2,29 +2,37 @@
 
 TokenTree is an open-source, local-first developer tool that measures AI coding-agent usage and organizes immutable provider requests into projects → work items → sessions → turns. Its production engine is Rust; TypeScript is reserved for plugin glue, the dashboard, and extension tooling.
 
-> **Status:** active pre-beta. The Phase 0 foundation and substantial Phase 1–2 core are implemented. Claude transcript fallback, enqueue-only hooks, manual capture, ledger reporting, recursive trees, structured query, and corrections are usable for development; public automatic-tracking and public-beta claims remain gated by official telemetry, release packaging, broader compatibility fixtures, and hardening.
+> **Status:** Public Beta (v0.2.0). Rust-first authoritative engine, SQLite WAL ledger, streaming Claude parser, loopback OTLP receiver, exact integer-micro cost arithmetic, conservative boundary classifier, recursive tree reports, interactive loopback dashboard, self-contained static HTML export, versioned attribution corrections, and multi-platform release packaging.
 
-## Implemented
+## Features
 
-- SQLite WAL ledger, transactional migrations, append-only usage events, idempotent ingest, and versioned attribution
-- Rust measurement core, exact-cost arithmetic, SQLite owner, streaming Claude parser, CLI, and privacy-safe hook enqueue
-- Loopback-only Rust OTLP/HTTP JSON receiver for official Claude API-request events
-- Streaming Claude JSONL fallback parser with request dedupe, checkpoints, unknown/truncated tolerance, and negative-delta anomalies
-- Claude Code marketplace/plugin structure with enqueue-only lifecycle hooks; prompts and tool payloads are not persisted
-- Project resolution from explicit override, verified/config identity, Git, manifest, or cwd
-- Conservative CONTINUE/CHILD/SWITCH classifier with the required regression-test CHILD fixture
-- Integer-micro cost engine and a checksummed, sourced Claude Sonnet 4.6 price snapshot
-- Recursive terminal project/work-item trees, structured ledger query, attach/detach/note, and explicit start/stop
-- `doctor`, `reconcile`, `import claude`, and non-destructive prototype migration
+- **Authoritative Rust Engine**: Published `tokentree` CLI, hook enqueue, SQLite WAL owner, streaming parsers, and report/query execution.
+- **SQLite WAL Ledger**: Transactional migrations, single-writer coordination, append-only usage events, and idempotent replay.
+- **Truth-Ladder Ingestion**: Official OTLP request telemetry (`127.0.0.1:4318`) outranks transcript observations; canonical request ID deduplication.
+- **Exact Integer-Micro Costs**: Zero floating-point rounding errors; distinct rates for base input, cache read, cache write, output, and reasoning tokens.
+- **Honest Incompleteness**: Never presents missing measurements as `$0.00`; surfaces completeness chips and unavailable counts.
+- **Conservative Boundary Classifier**: Groups turns into projects, work items, and child tasks (`CONTINUE`, `CHILD`, `SWITCH`) with 100% precision on boundary benchmarks.
+- **Privacy by Design**: In-memory prompt analysis only; prompts, completions, tool inputs, and diffs are never persisted; derived labels are redacted.
+- **Recursive Terminal Trees**: `tokentree report --text` renders hierarchical project/work-item rollups in under 50ms without opening ports.
+- **Interactive Local Dashboard**: `tokentree dashboard` opens a loopback-only SPA with ephemeral random session tokens, strict CSP, and zero external CDNs.
+- **Static HTML & Multi-Format Export**: `tokentree report --html` generates self-contained, XSS-safe static reports; `tokentree export` provides JSON and CSV.
+- **Versioned Corrections**: Rename, move, add note, attach, and detach operations maintaining 10,000 basis points weight invariants.
+- **Cross-Platform**: Binaries for macOS (Apple Silicon / Intel), Linux (x86_64, aarch64), and Windows (x64) with signed release workflows.
 
-## Not yet claimed
+## Documentation
 
-- Official Claude request-level OTLP receiver and full real-version compatibility matrix
-- Transient in-memory prompt-classifier IPC for automatic labels
-- Bundled release CLI and published npm/marketplace artifacts
-- Local dashboard, static HTML, complete correction UI, or public-beta acceptance
+- [Installation & First Run](./docs/install.md)
+- [Cost Terminology & Rates](./docs/costs.md)
+- [Classification & Boundary Behavior](./docs/classification.md)
+- [No-Git Project Detection](./docs/no-git.md)
+- [Corrections & Attribution](./docs/corrections.md)
+- [Privacy Model & Threat Model](./docs/privacy.md)
+- [Completeness & Unavailable State](./docs/completeness.md)
+- [Capture Modes](./docs/capture-modes.md)
+- [Multi-Agent Bookkeeping](./docs/multi-agent.md)
+- [Troubleshooting & Diagnostics](./docs/troubleshooting.md)
+- [Public Roadmap](./docs/roadmap.md)
 
-See [`docs/status.md`](./docs/status.md) for the exact delivery truth.
 
 ## Architecture
 

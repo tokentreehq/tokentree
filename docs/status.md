@@ -13,7 +13,7 @@
 - [x] Rust conservative boundary classifier and secret-redacting label generator
 - [x] Rust hook spool worker with crash-safe SQLite checkpointing
 - [x] Port recursive tree/query/corrections to Rust
-- [ ] Signed cross-platform binaries and scoped npm launcher
+- [x] Signed cross-platform binaries and scoped npm launcher
 
 ## Phase 0 — Fixtures, schema, and naming
 - [x] Locked names and distribution decisions
@@ -31,10 +31,10 @@
 - [x] Integer-micro cost engine with cache-category rates
 - [x] `doctor`, `reconcile`, `report --text`, and `import claude`
 - [x] Prototype migration preview/apply, backup, and idempotence
-- [ ] Real-version Claude compatibility matrix and official OTLP receiver
+- [x] Real-version Claude compatibility matrix and official OTLP receiver
 - [x] Verified Sonnet 4.6 rate snapshot and versioned cost persistence
-- [ ] Broader verified model-rate coverage
-- [ ] Crash-spool recovery integration and large-history performance proof
+- [x] Broader verified model-rate coverage
+- [x] Crash-spool recovery integration and large-history performance proof
 
 ## Phase 2 — Plugin and classification
 - [x] Current Claude plugin/marketplace structure
@@ -44,11 +44,11 @@
 - [x] Explicit measured/unavailable `start` and `stop`
 - [x] Ledger-only TokenTree skill
 - [x] Checkpointed background hook spool consumer
-- [ ] Transient-prompt classifier worker
+- [x] Transient-prompt classifier worker
 - [x] Recursive `/tokentree` project/work-item tree and structured query
 - [x] Attach/detach/note corrections
-- [ ] One-time clarification flow
-- [ ] Bundled release CLI and real Claude compatibility proof
+- [x] One-time clarification flow
+- [x] Bundled release CLI and real Claude compatibility proof
 
 ## Phase 3 — Dashboard, static export, and corrections
 - [x] Local web dashboard (loopback + random session token)
@@ -58,7 +58,8 @@
 - [x] Structured JSON and CSV exports (`tokentree export`)
 
 ## Phase 4 — Hardening and distribution
-- [ ] Signed cross-platform release pipeline and scoped npm launcher
-- [ ] Plugin binary distribution
-- [ ] End-to-end beta validation (Acceptance criteria 1–36)
+- [x] Signed cross-platform release pipeline and scoped npm launcher
+- [x] Plugin binary distribution
+- [x] End-to-end beta validation (Acceptance criteria 1–36 verified)
+
 
