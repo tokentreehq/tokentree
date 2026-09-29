@@ -1,4 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
+pub mod pricing;
+pub mod spool;
+
+pub use pricing::PricingSummary;
+pub use spool::HookWorkerSummary;
+
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, params};
 use std::fs;
@@ -146,6 +152,17 @@ impl Ledger {
                 reasoning: row.get::<_, i64>(7)? as u64,
             }),
         ).map_err(Into::into)
+    }
+
+    pub fn apply_price_snapshot(
+        &mut self,
+        snapshot: &tokentree_core::PriceSnapshot,
+    ) -> Result<PricingSummary> {
+        pricing::apply_price_snapshot(&mut self.connection, snapshot)
+    }
+
+    pub fn process_claude_hook_spool(&mut self, spool_path: &Path) -> Result<HookWorkerSummary> {
+        spool::process_claude_hook_spool(&mut self.connection, spool_path)
     }
 }
 

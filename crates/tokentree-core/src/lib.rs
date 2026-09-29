@@ -1,4 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
+pub mod classifier;
+pub mod pricing;
+pub mod project;
+
+pub use classifier::{
+    BoundaryInput, BoundaryOutcome, BoundaryResult, classify_boundary, redacted_label,
+};
+pub use pricing::{PriceRate, PriceSnapshot};
+pub use project::{
+    ProjectCandidate, ProjectDetectionMethod, ResolveProjectInput, format_title, resolve_project,
+    slug_key,
+};
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;

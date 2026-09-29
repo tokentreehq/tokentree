@@ -67,6 +67,8 @@ importers:
         specifier: workspace:*
         version: link:../core
 
+  plugins/claude-code: {}
+
 packages:
 
   '@esbuild/aix-ppc64@0.28.2':

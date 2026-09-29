@@ -8,9 +8,11 @@
 - [x] Rust streaming Claude parser against public sanitized 2.1.x fixture
 - [x] Rust CLI `doctor`, `import claude`, `report --text`, and `hook-enqueue`
 - [x] CI rustfmt, tests, and Clippy warnings-as-errors
-- [ ] Port recursive tree/query/corrections and price persistence from TypeScript reference
-- [ ] Rust spool worker and transient classifier IPC
-- [x] Embedded loopback OTLP/HTTP JSON receiver for official Claude API-request events
+- [x] Rust price snapshot verification, rate resolution, and exact cost calculation
+- [x] Rust project resolution (override, safe config, git, manifest, cwd)
+- [x] Rust conservative boundary classifier and secret-redacting label generator
+- [x] Rust hook spool worker with crash-safe SQLite checkpointing
+- [ ] Port recursive tree/query/corrections to Rust
 - [ ] Signed cross-platform binaries and scoped npm launcher
 
 ## Phase 0 — Fixtures, schema, and naming

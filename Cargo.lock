@@ -978,9 +978,13 @@ dependencies = [
 name = "tokentree-core"
 version = "0.2.0"
 dependencies = [
+ "anyhow",
+ "dirs",
  "hex",
  "serde",
+ "serde_json",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -988,7 +992,10 @@ name = "tokentree-ledger"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "rusqlite",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokentree-core",
 ]

@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-import{readFileSync,statSync}from'node:fs';import{mkdtempSync}from'node:fs';import{tmpdir}from'node:os';import{join}from'node:path';import{describe,expect,it}from'vitest';import{enqueue,sanitizeHook}from'../scripts/enqueue.mjs';
+import { readFileSync, statSync, mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { describe, expect, it } from 'vitest';
+import { enqueue, sanitizeHook } from '../scripts/enqueue.mjs';
 describe('Claude enqueue hook',()=>{
  it('never stores prompt text or tool payloads',()=>{const value=sanitizeHook({hook_event_name:'UserPromptSubmit',session_id:'s',prompt:'secret full prompt',tool_input:{content:'source code'}});const json=JSON.stringify(value);expect(json).not.toContain('secret full prompt');expect(json).not.toContain('source code');expect(value.payload.prompt_fingerprint).toMatch(/^[a-f0-9]{64}$/);});
  it('keeps only file path for selected write tools',()=>{const value=sanitizeHook({hook_event_name:'PostToolUse',tool_name:'Write',tool_input:{file_path:'/tmp/a.ts',content:'private'}});expect(value.payload.file_path).toBe('/tmp/a.ts');expect(JSON.stringify(value)).not.toContain('private');});
