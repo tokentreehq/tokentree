@@ -1,0 +1,23 @@
+{
+  "files": [],
+  "references": [
+    {
+      "path": "packages/core"
+    },
+    {
+      "path": "packages/database"
+    },
+    {
+      "path": "packages/pricing"
+    },
+    {
+      "path": "packages/classifier"
+    },
+    {
+      "path": "packages/adapters/claude"
+    },
+    {
+      "path": "apps/cli"
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "name":"tokentree",
+  "displayName":"TokenTree",
+  "version":"0.1.0",
+  "description":"Local-first AI coding-agent usage measurement with enqueue-only lifecycle hooks.",
+  "author":{"name":"TokenTree contributors","url":"https://github.com/tokentreehq/tokentree"},
+  "homepage":"https://github.com/tokentreehq/tokentree",
+  "repository":"https://github.com/tokentreehq/tokentree",
+  "license":"Apache-2.0",
+  "keywords":["usage","tokens","local-first"],
+  "defaultEnabled":true
+}

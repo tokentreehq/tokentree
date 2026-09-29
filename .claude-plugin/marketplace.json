@@ -1,0 +1,5 @@
+{
+  "name":"tokentreehq",
+  "owner":{"name":"TokenTree contributors","url":"https://github.com/tokentreehq/tokentree"},
+  "plugins":[{"name":"tokentree","source":"./plugins/claude-code","description":"Local-first AI coding-agent usage measurement","version":"0.1.0"}]
+}

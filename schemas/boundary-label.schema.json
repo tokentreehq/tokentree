@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tokentree.dev/schemas/boundary-label.schema.json",
+  "title": "TokenTree boundary corpus row",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "sanitized_input", "expected", "confidence", "parent_evidence", "moved_later"],
+  "properties": {
+    "id": { "type": "string", "minLength": 1 },
+    "sanitized_input": { "type": "string", "minLength": 1, "description": "Synthetic or irreversibly sanitized text only." },
+    "expected": { "enum": ["CONTINUE", "CHILD", "SWITCH", "UNCERTAIN"] },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+    "parent_evidence": { "type": "boolean" },
+    "moved_later": { "type": "boolean" },
+    "tags": { "type": "array", "items": { "type": "string" }, "uniqueItems": true }
+  }
+}

@@ -1,0 +1,1 @@
+{"type":"synthetic_usage","request_id":"req_fixture_1","model":"fixture-model","usage":{"input_tokens":12,"output_tokens":3},"future_field":{"ignored":true}}

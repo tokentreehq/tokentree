@@ -1,0 +1,4 @@
+{"id":"child-regression-test","predicted":"CHILD","confidence":0.94}
+{"id":"continue-follow-up","predicted":"CONTINUE","confidence":0.9}
+{"id":"explicit-switch","predicted":"SWITCH","confidence":0.92}
+{"id":"ambiguous-next","predicted":"UNCERTAIN","confidence":0.45}

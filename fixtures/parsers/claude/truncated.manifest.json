@@ -1,0 +1,1 @@
+{"id":"claude-truncated","host":"claude","host_version":"unverified","scenario":"truncated terminal record","input":"truncated.input.jsonl","expected":"truncated.expected.json","sanitization":"synthetic"}

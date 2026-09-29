@@ -1,0 +1,10 @@
+{
+  "id":"claude-public-small-v2.1.80",
+  "host":"claude",
+  "host_version":"2.1.80–2.1.220 mixed public fixture",
+  "scenario":"public sanitized transcript with current camelCase identities, nested usage, hooks, subagents, fallbacks, and unknown records",
+  "input":"public-small-v2.1.80.jsonl",
+  "expected":"public-small-v2.1.80.expected.json",
+  "sanitization":"irreversibly_redacted",
+  "source":"https://github.com/jazzyalex/agent-sessions/blob/a93b22b6b31c2c092a4820b1e32ae1c391ade9e5/Resources/Fixtures/stage0/agents/claude/small.jsonl"
+}

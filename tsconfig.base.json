@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "declaration": true,
+    "sourceMap": true,
+    "composite": true,
+    "skipLibCheck": true,
+    "verbatimModuleSyntax": true,
+    "baseUrl": ".",
+    "paths": {
+      "@tokentreehq/core": ["packages/core/src/index.ts"],
+      "@tokentreehq/database": ["packages/database/src/index.ts"],
+      "@tokentreehq/pricing": ["packages/pricing/src/index.ts"],
+      "@tokentreehq/adapter-claude": ["packages/adapters/claude/src/index.ts"]
+    }
+  }
+}

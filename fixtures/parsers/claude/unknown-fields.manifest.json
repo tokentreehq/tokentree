@@ -1,0 +1,1 @@
+{"id":"claude-unknown-fields","host":"claude","host_version":"unverified","scenario":"unknown schema fields","input":"unknown-fields.input.jsonl","expected":"unknown-fields.expected.json","sanitization":"synthetic"}
