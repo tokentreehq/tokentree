@@ -1,25 +1,10 @@
 #!/usr/bin/env node
 // SPDX-License-Identifier: Apache-2.0
 import { spawnSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { addNote,applyPriceSnapshot,DISCLAIMER,applyPrototype,attachSession,detachSession,doctor,importClaude,loadProjectTrees,openDefaultLedger,previewPrototype,processClaudeHookSpool,queryLedger,reconcile,renderProjectTrees,renderTextReport,resolvePaths,startManual,stopManual } from './index.js';
 
-function findNativeBinary(): string | undefined {
-  if (process.env.TOKENTREE_BIN && existsSync(process.env.TOKENTREE_BIN)) {
-    return process.env.TOKENTREE_BIN;
-  }
-  const ext = process.platform === 'win32' ? '.exe' : '';
-  const candidates = [
-    join(import.meta.dirname, '..', 'bin', `tokentree${ext}`),
-    join(import.meta.dirname, '..', '..', '..', 'target', 'release', `tokentree${ext}`),
-    join(import.meta.dirname, '..', '..', '..', 'target', 'debug', `tokentree${ext}`),
-  ];
-  for (const c of candidates) {
-    if (existsSync(c)) return c;
-  }
-  return undefined;
-}
+import { findNativeBinary } from './launcher.js';
 
 if (!process.env.TOKENTREE_FORCE_JS) {
   const nativeBin = findNativeBinary();

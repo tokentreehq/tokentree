@@ -423,14 +423,8 @@ pub fn generate_session_token() -> String {
     hex::encode(hasher.finalize())
 }
 
-pub async fn run_dashboard(home: &Path, port: Option<u16>, no_open: bool) -> Result<()> {
-    let session_token = generate_session_token();
-    let state = Arc::new(AppState {
-        home: home.to_path_buf(),
-        session_token: session_token.clone(),
-    });
-
-    let app = Router::new()
+pub fn create_router(state: Arc<AppState>) -> Router {
+    Router::new()
         .route("/", get(handle_index))
         .route("/api/projects", get(handle_api_projects))
         .route("/api/status", get(handle_api_status))
@@ -439,7 +433,17 @@ pub async fn run_dashboard(home: &Path, port: Option<u16>, no_open: bool) -> Res
         .route("/api/corrections/note", post(handle_note))
         .route("/api/corrections/attach", post(handle_attach))
         .route("/api/corrections/detach", post(handle_detach))
-        .with_state(state);
+        .with_state(state)
+}
+
+pub async fn run_dashboard(home: &Path, port: Option<u16>, no_open: bool) -> Result<()> {
+    let session_token = generate_session_token();
+    let state = Arc::new(AppState {
+        home: home.to_path_buf(),
+        session_token: session_token.clone(),
+    });
+
+    let app = create_router(state);
 
     let chosen_port = port.unwrap_or(0);
     let bind_addr = SocketAddr::from(([127, 0, 0, 1], chosen_port));
@@ -1239,5 +1243,168 @@ mod tests {
         assert!(html.contains("Content-Security-Policy"));
         assert!(html.contains("TokenTree"));
         assert!(html.contains("Projects &amp; Trees"));
+    }
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    fn test_app() -> (Router, String, tempfile::TempDir) {
+        let temp = tempfile::tempdir().unwrap();
+        let ledger_path = temp.path().join("ledger.db");
+        let ledger = Ledger::open(&ledger_path).unwrap();
+        drop(ledger);
+        let token = "test_secret_session_token_12345678901234567890123456789012".to_string();
+        let state = Arc::new(AppState {
+            home: temp.path().to_path_buf(),
+            session_token: token.clone(),
+        });
+        (create_router(state), token, temp)
+    }
+
+    #[tokio::test]
+    async fn auth_token_in_query_param_succeeds() {
+        let (app, token, _temp) = test_app();
+        let req = Request::builder()
+            .uri(format!("/?token={token}"))
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn auth_token_in_bearer_header_succeeds() {
+        let (app, token, _temp) = test_app();
+        let req = Request::builder()
+            .uri("/api/status")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn auth_token_in_custom_header_succeeds() {
+        let (app, token, _temp) = test_app();
+        let req = Request::builder()
+            .uri("/api/status")
+            .header("x-tokentree-token", &token)
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn auth_missing_token_returns_401() {
+        let (app, _token, _temp) = test_app();
+        let req = Request::builder()
+            .uri("/api/status")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_invalid_token_returns_401() {
+        let (app, _token, _temp) = test_app();
+        let req = Request::builder()
+            .uri("/?token=invalid_forged_token")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn security_headers_enforced_on_all_responses() {
+        let (app, token, _temp) = test_app();
+        let req = Request::builder()
+            .uri(format!("/?token={token}"))
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let headers = res.headers();
+        let csp = headers
+            .get("Content-Security-Policy")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(csp.contains("frame-ancestors 'none'"));
+        assert!(csp.contains("default-src 'self' 'unsafe-inline' data:"));
+        assert!(csp.contains("connect-src 'self'"));
+        assert!(csp.contains("object-src 'none'"));
+
+        assert_eq!(headers.get("X-Frame-Options").unwrap(), "DENY");
+        assert_eq!(headers.get("X-Content-Type-Options").unwrap(), "nosniff");
+        assert_eq!(headers.get("Referrer-Policy").unwrap(), "no-referrer");
+    }
+
+    #[test]
+    fn zero_external_cdn_assets() {
+        let token = "test_token";
+        let html = render_dashboard_spa(token);
+        // Ensure no external scripts, CDNs, or external stylesheet links
+        assert!(!html.contains("cdn.jsdelivr.net"));
+        assert!(!html.contains("unpkg.com"));
+        assert!(!html.contains("cdnjs.cloudflare.com"));
+        assert!(!html.contains("fonts.googleapis.com"));
+        assert!(!html.contains("http://"));
+        assert!(!html.contains("https://"));
+    }
+
+    #[tokio::test]
+    async fn route_denial_no_transcript_or_traversal_endpoints() {
+        let (app1, token, _temp) = test_app();
+        let req1 = Request::builder()
+            .uri(format!("/api/transcripts?token={token}"))
+            .body(Body::empty())
+            .unwrap();
+        let res1 = app1.oneshot(req1).await.unwrap();
+        assert_eq!(res1.status(), StatusCode::NOT_FOUND);
+
+        let (app2, token, _temp) = test_app();
+        let req2 = Request::builder()
+            .uri(format!("/transcripts?token={token}"))
+            .body(Body::empty())
+            .unwrap();
+        let res2 = app2.oneshot(req2).await.unwrap();
+        assert_eq!(res2.status(), StatusCode::NOT_FOUND);
+
+        let (app3, token, _temp) = test_app();
+        let req3 = Request::builder()
+            .uri(format!("/api/raw?token={token}"))
+            .body(Body::empty())
+            .unwrap();
+        let res3 = app3.oneshot(req3).await.unwrap();
+        assert_eq!(res3.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn rejects_malformed_json_payload() {
+        let (app, token, _temp) = test_app();
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/corrections/rename?token={token}"))
+            .header("Content-Type", "application/json")
+            .body(Body::from("{malformed_json:"))
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert!(res.status().is_client_error());
+    }
+
+    #[test]
+    fn escapes_work_item_titles_against_xss() {
+        let evil_title = "<script>alert('xss')</script>\"'><img src=x onerror=alert(1)>";
+        let escaped = tokentree_ledger::html_escape(evil_title);
+        assert!(!escaped.contains("<script>"));
+        assert!(!escaped.contains("<img"));
+        assert!(escaped.contains("&lt;script&gt;"));
+        assert!(escaped.contains("&quot;"));
     }
 }

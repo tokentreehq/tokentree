@@ -59,7 +59,6 @@
 
 ## Phase 4 — Hardening and distribution
 - [x] Signed cross-platform release pipeline and scoped npm launcher
-- [x] Plugin binary distribution
-- [x] End-to-end beta validation (Acceptance criteria 1–36 verified)
+- [x] End-to-end beta validation (Acceptance criteria 1–36 audited in `docs/public-beta-evidence.md`: 35 PASS, 1 DEFERRED)
 
 

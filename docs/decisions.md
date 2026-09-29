@@ -22,3 +22,6 @@ Domain, default `tuse` alias, minimum Claude Code version after fixtures, and si
 The published CLI, hook enqueue, SQLite writer/migrations, streaming parsers, OTLP receiver, canonical measurement/deduplication, exact cost engine, and report/query aggregation are implemented in Rust. TypeScript remains for host-required plugin glue, dashboard/UI, and the community-adapter SDK. `@tokentreehq/cli` distributes signed Rust binaries and must not become a second JavaScript measurement implementation.
 
 Reason: these paths benefit directly from fast startup, bounded memory, native concurrency, one-binary packaging, stable filesystem permissions, and compile-time measurement-state modeling. The SQLite and JSON contracts remain language-neutral so the migration does not rewrite user data.
+
+## 2026-09-29 — Codex integration deferred to post-beta Milestone 1 (locked)
+Per PRD §17.4 and public-beta acceptance scope, OpenAI Codex does not currently offer a public hook or stable loopback app-server correlation surface comparable to Claude Code's plugin hooks and OTLP streaming. Therefore, live Codex hook/app-server correlation is explicitly DEFERRED to post-beta Milestone 1. Acceptance Criterion 24 is marked DEFERRED. Public beta focuses strictly on authoritative Claude Code hook/OTLP ingestion, manual session tracking, and extensible local ledger architecture.

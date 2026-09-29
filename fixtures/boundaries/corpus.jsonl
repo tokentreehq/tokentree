@@ -1,4 +1,21 @@
 {"id":"child-regression-test","sanitized_input":"fix that and add a regression test","expected":"CHILD","confidence":0.94,"parent_evidence":true,"moved_later":false,"tags":["required","regression","parent-open"]}
+{"id":"child-benchmark","sanitized_input":"write a microbenchmark for this query parser","expected":"CHILD","confidence":0.91,"parent_evidence":true,"moved_later":false,"tags":["subtask","performance"]}
+{"id":"child-extract-helper","sanitized_input":"extract this token counter into a separate helper module","expected":"CHILD","confidence":0.88,"parent_evidence":true,"moved_later":false,"tags":["refactor","subtask"]}
+{"id":"child-investigate-ci","sanitized_input":"investigate why that test failed on CI and fix the timeout","expected":"CHILD","confidence":0.92,"parent_evidence":true,"moved_later":false,"tags":["bugfix","investigation"]}
+{"id":"child-profile-memory","sanitized_input":"profile memory allocations in the streaming loop","expected":"CHILD","confidence":0.89,"parent_evidence":true,"moved_later":false,"tags":["profiling","subtask"]}
 {"id":"continue-follow-up","sanitized_input":"also update the nearby assertion","expected":"CONTINUE","confidence":0.9,"parent_evidence":true,"moved_later":false,"tags":["same-task"]}
+{"id":"continue-lint-fix","sanitized_input":"make sure to run linter on that file too","expected":"CONTINUE","confidence":0.89,"parent_evidence":true,"moved_later":false,"tags":["same-task","lint"]}
+{"id":"continue-comment-typo","sanitized_input":"fix the typo in the docstring above","expected":"CONTINUE","confidence":0.93,"parent_evidence":true,"moved_later":false,"tags":["same-task","docs"]}
+{"id":"continue-null-test","sanitized_input":"add one more test case for the null input case","expected":"CONTINUE","confidence":0.91,"parent_evidence":true,"moved_later":false,"tags":["same-task","test"]}
+{"id":"continue-finish-branch","sanitized_input":"keep going and finish implementing the second branch","expected":"CONTINUE","confidence":0.95,"parent_evidence":true,"moved_later":false,"tags":["same-task","continuation"]}
 {"id":"explicit-switch","sanitized_input":"switch topics and improve the release notes","expected":"SWITCH","confidence":0.92,"parent_evidence":false,"moved_later":false,"tags":["explicit-switch"]}
+{"id":"switch-auth-service","sanitized_input":"now let's start working on the auth service","expected":"SWITCH","confidence":0.94,"parent_evidence":false,"moved_later":false,"tags":["new-feature","switch"]}
+{"id":"switch-dashboard-css","sanitized_input":"switch to fixing the bug in dashboard css layout","expected":"SWITCH","confidence":0.9,"parent_evidence":false,"moved_later":false,"tags":["switch","ui-bug"]}
+{"id":"switch-pr-review","sanitized_input":"let's pause this and look at the PR review feedback on repo B","expected":"SWITCH","confidence":0.93,"parent_evidence":false,"moved_later":false,"tags":["switch","code-review"]}
+{"id":"switch-export-csv","sanitized_input":"start a new task: implement export to CSV","expected":"SWITCH","confidence":0.95,"parent_evidence":false,"moved_later":false,"tags":["new-task","switch"]}
 {"id":"ambiguous-next","sanitized_input":"take a look at the other thing","expected":"UNCERTAIN","confidence":0.45,"parent_evidence":false,"moved_later":true,"tags":["ambiguous"]}
+{"id":"ambiguous-opinion","sanitized_input":"what do you think about this?","expected":"UNCERTAIN","confidence":0.4,"parent_evidence":false,"moved_later":false,"tags":["ambiguous","discussion"]}
+{"id":"ambiguous-logs","sanitized_input":"check the logs","expected":"UNCERTAIN","confidence":0.48,"parent_evidence":false,"moved_later":true,"tags":["ambiguous","vague"]}
+{"id":"ambiguous-maybe","sanitized_input":"maybe try the second approach instead","expected":"UNCERTAIN","confidence":0.52,"parent_evidence":false,"moved_later":false,"tags":["ambiguous","tentative"]}
+{"id":"ambiguous-alternatives","sanitized_input":"not sure about this design, let's explore alternatives","expected":"UNCERTAIN","confidence":0.46,"parent_evidence":false,"moved_later":true,"tags":["ambiguous","exploratory"]}
+{"id":"ambiguous-what-happened","sanitized_input":"wait, what happened here?","expected":"UNCERTAIN","confidence":0.35,"parent_evidence":false,"moved_later":false,"tags":["ambiguous","exclamation"]}
