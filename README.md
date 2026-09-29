@@ -31,6 +31,7 @@ TokenTree is an open-source, local-first developer tool that measures AI coding-
 - [Capture Modes](./docs/capture-modes.md)
 - [Multi-Agent Bookkeeping](./docs/multi-agent.md)
 - [Troubleshooting & Diagnostics](./docs/troubleshooting.md)
+- [Public Beta Acceptance Evidence](./docs/public-beta-evidence.md)
 - [Public Roadmap](./docs/roadmap.md)
 
 
