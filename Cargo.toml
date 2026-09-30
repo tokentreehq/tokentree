@@ -5,6 +5,8 @@ members = [
   "crates/tokentree-ledger",
   "crates/tokentree-claude",
   "crates/tokentree-codex",
+  "crates/tokentree-grok",
+  "crates/tokentree-hermes",
   "crates/tokentree-otel",
   "apps/rust-cli",
 ]

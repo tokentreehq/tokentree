@@ -66,6 +66,18 @@ importers:
         specifier: workspace:*
         version: link:../../core
 
+  packages/adapters/grok:
+    dependencies:
+      '@tokentreehq/core':
+        specifier: workspace:*
+        version: link:../../core
+
+  packages/adapters/hermes:
+    dependencies:
+      '@tokentreehq/core':
+        specifier: workspace:*
+        version: link:../../core
+
   packages/classifier: {}
 
   packages/core: {}

@@ -53,6 +53,8 @@ export function parseCargoLock(cargoLockContent: string): SbomPackage[] {
         name === 'tokentree-core' ||
         name === 'tokentree-ledger' ||
         name === 'tokentree-codex' ||
+        name === 'tokentree-grok' ||
+        name === 'tokentree-hermes' ||
         name === 'tokentree-claude' ||
         name === 'tokentree-otel'
       ) {

@@ -975,6 +975,8 @@ dependencies = [
  "tokentree-claude",
  "tokentree-codex",
  "tokentree-core",
+ "tokentree-grok",
+ "tokentree-hermes",
  "tokentree-ledger",
  "tokentree-otel",
  "tokio",
@@ -1009,6 +1011,40 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+]
+
+[[package]]
+name = "tokentree-grok"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "hex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokentree-core",
+ "tokentree-ledger",
+ "walkdir",
+]
+
+[[package]]
+name = "tokentree-hermes"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "hex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokentree-core",
+ "tokentree-ledger",
+ "walkdir",
 ]
 
 [[package]]
