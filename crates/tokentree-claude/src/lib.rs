@@ -118,6 +118,11 @@ pub fn parse_session(path: &Path) -> Result<ParseResult> {
         observations.push(UsageObservation {
             adapter: "claude".into(),
             source,
+            source_subtype: if record_type.is_empty() {
+                None
+            } else {
+                Some(record_type)
+            },
             source_event_id: string(&record, &["event_id", "uuid"]),
             provider_session_id: string(&record, &["session_id", "sessionId"])
                 .unwrap_or_else(|| fallback_session.into()),
@@ -128,6 +133,8 @@ pub fn parse_session(path: &Path) -> Result<ParseResult> {
                     .map(str::to_owned)
             }),
             turn_id: string(&record, &["turn_id", "prompt_id", "promptId"]),
+            agent_id: string(&record, &["agent_id", "agentId"]),
+            parent_agent_id: string(&record, &["parent_agent_id", "parentAgentId"]),
             source_timestamp: string(&record, &["timestamp"]),
             observed_at,
             model: string(&record, &["model"]).or_else(|| {

@@ -1,4 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
+pub mod classifier;
+pub mod pricing;
+pub mod project;
+
+pub use classifier::{
+    BoundaryInput, BoundaryOutcome, BoundaryResult, classify_boundary, redacted_label,
+};
+pub use pricing::{PriceRate, PriceSnapshot};
+pub use project::{
+    ProjectCandidate, ProjectDetectionMethod, ResolveProjectInput, format_title, resolve_project,
+    slug_key,
+};
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -64,10 +77,16 @@ impl TokenUsage {
 pub struct UsageObservation {
     pub adapter: String,
     pub source: MeasurementSource,
+    #[serde(default)]
+    pub source_subtype: Option<String>,
     pub source_event_id: Option<String>,
     pub provider_session_id: String,
     pub request_id: Option<String>,
     pub turn_id: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub parent_agent_id: Option<String>,
     pub source_timestamp: Option<String>,
     pub observed_at: String,
     pub model: Option<String>,
@@ -89,6 +108,17 @@ impl UsageObservation {
         }
         if let Some(event) = &self.source_event_id {
             return format!("{}:event:{event}", self.adapter);
+        }
+        if (self.source_subtype.as_deref() == Some("codex_turn_counter")
+            || self.source == MeasurementSource::SnapshotDelta)
+            && self.turn_id.is_some()
+        {
+            return format!(
+                "{}:counter:{}:{}",
+                self.adapter,
+                self.provider_session_id,
+                self.turn_id.as_deref().unwrap_or_default()
+            );
         }
         format!(
             "{}:{}:{}:{}:{}:{}:{}:{}",
@@ -221,10 +251,13 @@ mod tests {
         UsageObservation {
             adapter: "claude".into(),
             source,
+            source_subtype: None,
             source_event_id: None,
             provider_session_id: "s".into(),
             request_id: Some("r".into()),
             turn_id: None,
+            agent_id: None,
+            parent_agent_id: None,
             source_timestamp: None,
             observed_at: "2026-01-01T00:00:00Z".into(),
             model: Some("claude-sonnet-4-6".into()),

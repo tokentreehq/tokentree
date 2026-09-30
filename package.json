@@ -11,13 +11,17 @@
     "test": "vitest run",
     "typecheck": "tsc -b",
     "lint": "eslint .",
-    "fixture:boundaries": "tsx packages/classifier/src/evaluate.ts fixtures/boundaries/corpus.jsonl fixtures/boundaries/predictions.example.jsonl",
+    "fixture:boundaries": "tsx packages/classifier/src/evaluate.ts fixtures/boundaries/eval.jsonl",
+    "generate:sbom": "tsx scripts/generate-sbom.ts",
     "check": "pnpm typecheck && pnpm test && pnpm fixture:boundaries && pnpm rust:check",
     "rust:check": "cargo fmt --all -- --check && cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings"
   },
   "devDependencies": {
     "@eslint/js": "^9.36.0",
     "@types/node": "^24.5.2",
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1",
+    "esbuild": "^0.28.2",
     "eslint": "^9.36.0",
     "tsx": "^4.20.5",
     "typescript": "^5.9.2",

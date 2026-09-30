@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "updated": "2026-09-29",
+  "currency": "USD",
+  "models": [
+    {
+      "provider": "anthropic",
+      "modelPattern": "claude-sonnet-4-6",
+      "effectiveFrom": "2026-02-01",
+      "inputPerMillion": "3.00",
+      "cachedInputPerMillion": "0.30",
+      "cacheWritePerMillion": "3.75",
+      "outputPerMillion": "15.00",
+      "source": "https://platform.claude.com/docs/en/models/sonnet-4-6/overview"
+    }
+  ],
+  "sha256": "285fcc5fa2ddebe65ac8ca43bb4070ee73e88a2e481e982bbd73989f6d4bb777"
+}

@@ -1,0 +1,3 @@
+{"method":"turn/start","protocol_version":"2024-11-05","params":{"threadId":"th_app_server_real_01","turnId":"turn_real_01","agentId":"codex_primary"},"timestamp":"2026-03-30T14:00:00Z"}
+{"method":"thread/tokenUsage/updated","protocol_version":"2024-11-05","params":{"threadId":"th_app_server_real_01","turnId":"turn_real_01","requestId":"req_app_01","model":"o3-mini","tokenUsage":{"inputTokens":120,"cachedInputTokens":25,"outputTokens":45,"reasoningTokens":15}},"timestamp":"2026-03-30T14:00:02Z"}
+{"method":"turn/complete","protocol_version":"2024-11-05","params":{"threadId":"th_app_server_real_01","turnId":"turn_real_01"},"timestamp":"2026-03-30T14:00:05Z"}

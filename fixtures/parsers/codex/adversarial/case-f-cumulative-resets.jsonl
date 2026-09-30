@@ -1,0 +1,6 @@
+{"type":"turn/started","turn_id":"turn_case_f_1","session_id":"ses_case_f","timestamp":"2026-03-30T10:00:00Z"}
+{"type":"thread/tokenUsage/updated","is_cumulative":true,"request_id":"req_case_f_1","turn_id":"turn_case_f_1","session_id":"ses_case_f","model":"o3-mini","cumulative_token_usage":{"input_tokens":500,"output_tokens":100},"timestamp":"2026-03-30T10:00:01Z"}
+{"type":"turn/completed","turn_id":"turn_case_f_1","session_id":"ses_case_f","timestamp":"2026-03-30T10:00:02Z"}
+{"type":"turn/started","turn_id":"turn_case_f_2","session_id":"ses_case_f","timestamp":"2026-03-30T10:00:03Z"}
+{"type":"thread/tokenUsage/updated","is_cumulative":true,"request_id":"req_case_f_2","turn_id":"turn_case_f_2","session_id":"ses_case_f","model":"o3-mini","cumulative_token_usage":{"input_tokens":200,"output_tokens":50},"timestamp":"2026-03-30T10:00:04Z"}
+{"type":"turn/completed","turn_id":"turn_case_f_2","session_id":"ses_case_f","timestamp":"2026-03-30T10:00:05Z"}

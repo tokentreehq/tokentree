@@ -1,0 +1,2 @@
+{"type":"turn/started","turn_id":"turn_unk","session_id":"ses_unk","protocol_version":"v999.0","timestamp":"2026-03-30T10:00:00Z"}
+{"type":"thread/tokenUsage/updated","protocol_version":"v999.0","request_id":"req_unk_1","model":"o3-mini","token_usage":{"input_tokens":50,"output_tokens":10},"timestamp":"2026-03-30T10:00:01Z"}

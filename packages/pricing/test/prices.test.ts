@@ -2,10 +2,11 @@
 import { copyFileSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { loadPriceSnapshot } from '../src/index.js';
 
-const fixture = new URL('../data/prices.json', import.meta.url).pathname;
+const fixture = fileURLToPath(new URL('../data/prices.json', import.meta.url));
 
 describe('price snapshots', () => {
   it('accepts a correctly hashed snapshot', () => {

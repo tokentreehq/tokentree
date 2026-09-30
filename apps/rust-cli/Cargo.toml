@@ -11,13 +11,22 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+axum.workspace = true
 chrono.workspace = true
 clap.workspace = true
 dirs.workspace = true
+hex.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tokentree-claude = { path = "../../crates/tokentree-claude" }
+tokentree-codex = { path = "../../crates/tokentree-codex" }
 tokentree-core = { path = "../../crates/tokentree-core" }
 tokentree-ledger = { path = "../../crates/tokentree-ledger" }
 tokentree-otel = { path = "../../crates/tokentree-otel" }
 tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tower.workspace = true
+http-body-util.workspace = true

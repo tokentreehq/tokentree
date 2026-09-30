@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
+mod dashboard;
+
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
@@ -9,10 +11,16 @@ use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use tokentree_claude::{discover_sessions, parse_session};
-use tokentree_core::token_completeness;
-use tokentree_ledger::Ledger;
+use tokentree_core::{PriceSnapshot, token_completeness};
+use tokentree_ledger::{
+    Ledger, ManualCounts, ManualStartInput, add_note, apply_prototype, attach_session,
+    detach_session, export_csv, export_html, export_json, load_project_trees, merge_work_items,
+    move_work_item, preview_prototype, query_ledger, rename_work_item, render_project_trees,
+    split_work_item, start_manual, stop_manual,
+};
 
 const DISCLAIMER: &str = "Amounts are list-price estimates from public per-token rates unless labeled otherwise. They are not your provider invoice, prepaid credit balance, or subscription allowance.";
+const DEFAULT_PRICES_JSON: &str = include_str!("../../../packages/pricing/data/prices.json");
 
 #[derive(Parser)]
 #[command(
@@ -24,7 +32,7 @@ struct Cli {
     #[arg(long, global = true, env = "TOKENTREE_HOME")]
     home: Option<PathBuf>,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -37,6 +45,108 @@ enum Command {
     Report {
         #[arg(long)]
         text: bool,
+        #[arg(long)]
+        html: bool,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    Dashboard {
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long)]
+        no_open: bool,
+    },
+    Export {
+        #[arg(long, default_value = "json")]
+        format: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    Query {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        work_item: Option<String>,
+        #[arg(long)]
+        include_descendants: bool,
+    },
+    Start {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        task: String,
+        #[arg(long)]
+        parent: Option<String>,
+    },
+    Stop {
+        #[arg(long)]
+        input: Option<u64>,
+        #[arg(long)]
+        output: Option<u64>,
+        #[arg(long)]
+        cache_read: Option<u64>,
+        #[arg(long)]
+        cache_write: Option<u64>,
+        #[arg(long)]
+        reasoning: Option<u64>,
+        #[arg(long)]
+        model: Option<String>,
+    },
+    Attach {
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        task: String,
+    },
+    Detach {
+        #[arg(long)]
+        session: String,
+    },
+    Note {
+        #[arg(long)]
+        text: String,
+        #[arg(long)]
+        task: Option<String>,
+    },
+    Rename {
+        #[arg(long)]
+        task: String,
+        #[arg(long)]
+        title: String,
+    },
+    Move {
+        #[arg(long)]
+        task: String,
+        #[arg(long)]
+        parent: Option<String>,
+    },
+    Merge {
+        #[arg(long)]
+        source: String,
+        #[arg(long)]
+        target: String,
+    },
+    Split {
+        #[arg(long)]
+        source: String,
+        #[arg(long)]
+        title: String,
+        #[arg(long, value_delimiter = ',')]
+        spans: Vec<String>,
+    },
+    Classify,
+    Reconcile,
+    MigratePrototype {
+        #[arg(long)]
+        source: Option<PathBuf>,
+        #[arg(long)]
+        preview: bool,
+        #[arg(long)]
+        apply: bool,
     },
     OtlpServe {
         #[arg(long, default_value = "127.0.0.1:4318")]
@@ -49,6 +159,7 @@ enum Command {
 #[derive(Subcommand)]
 enum ImportSource {
     Claude { path: Option<PathBuf> },
+    Codex { path: Option<PathBuf> },
 }
 
 fn main() {
@@ -61,18 +172,100 @@ fn main() {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     let home = cli.home.unwrap_or_else(default_home);
-    match cli.command {
+
+    let command = match cli.command {
+        Some(cmd) => cmd,
+        None => Command::Report {
+            text: true,
+            html: false,
+            project: None,
+            out: None,
+        },
+    };
+
+    match command {
         Command::HookEnqueue => enqueue_hook(&home),
         Command::Doctor => doctor(&home),
         Command::Import {
             source: ImportSource::Claude { path },
         } => import_claude(&home, path.unwrap_or_else(default_claude_path)),
-        Command::Report { text } => {
-            if !text {
-                bail!("use --text; it never binds a port")
+        Command::Import {
+            source: ImportSource::Codex { path },
+        } => import_codex(&home, path.unwrap_or_else(default_codex_path)),
+        Command::Report {
+            text,
+            html,
+            project,
+            out,
+        } => {
+            if html {
+                html_report_cmd(&home, project.as_deref(), out)
+            } else if text {
+                report(&home, project.as_deref())
+            } else {
+                report(&home, project.as_deref())?;
+                println!("\n  Interactive dashboard: run 'tokentree dashboard'");
+                println!("  Static HTML report: run 'tokentree report --html'\n");
+                Ok(())
             }
-            report(&home)
         }
+        Command::Dashboard { port, no_open } => dashboard_cmd(&home, port, no_open),
+        Command::Export {
+            format,
+            project,
+            out,
+        } => export_cmd(&home, &format, project.as_deref(), out),
+        Command::Query {
+            project,
+            work_item,
+            include_descendants,
+        } => query(
+            &home,
+            project.as_deref(),
+            work_item.as_deref(),
+            include_descendants,
+        ),
+        Command::Start {
+            project,
+            task,
+            parent,
+        } => start(&home, &project, &task, parent.as_deref()),
+        Command::Stop {
+            input,
+            output,
+            cache_read,
+            cache_write,
+            reasoning,
+            model,
+        } => stop(
+            &home,
+            ManualCounts {
+                input,
+                output,
+                cache_read,
+                cache_write,
+                reasoning,
+                model,
+            },
+        ),
+        Command::Attach { session, task } => attach(&home, &session, &task),
+        Command::Detach { session } => detach(&home, &session),
+        Command::Note { text, task } => note(&home, &text, task.as_deref()),
+        Command::Rename { task, title } => rename(&home, &task, &title),
+        Command::Move { task, parent } => move_item(&home, &task, parent.as_deref()),
+        Command::Merge { source, target } => merge(&home, &source, &target),
+        Command::Split {
+            source,
+            title,
+            spans,
+        } => split(&home, &source, &title, &spans),
+        Command::Classify => classify(&home),
+        Command::Reconcile => reconcile_cmd(&home),
+        Command::MigratePrototype {
+            source,
+            preview,
+            apply,
+        } => migrate_prototype(&home, source, preview, apply),
         Command::OtlpServe { address } => {
             println!("TokenTree OTLP receiver: http://{address}/v1/logs");
             println!(
@@ -89,20 +282,40 @@ fn default_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".tokentree")
 }
+
 fn default_claude_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".claude/projects")
 }
+
+fn default_codex_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".codex/sessions")
+}
+
 fn ledger(home: &Path) -> Result<Ledger> {
     Ledger::open(home.join("ledger.db"))
+}
+
+fn load_snapshot(home: &Path) -> Result<PriceSnapshot> {
+    let local = home.join("prices.json");
+    if local.exists() {
+        if let Ok(s) = PriceSnapshot::load_from_file(&local) {
+            return Ok(s);
+        }
+    }
+    PriceSnapshot::load_from_str(DEFAULT_PRICES_JSON)
 }
 
 fn doctor(home: &Path) -> Result<()> {
     let ledger = ledger(home)?;
     let claude = default_claude_path();
+    let codex = default_codex_path();
     println!("database: {}", ledger.path().display());
     println!("Claude transcripts: {}", claude.display());
+    println!("Codex sessions: {}", codex.display());
     println!("TokenTree home: {}", home.display());
     println!(
         "Claude capture mode: {}",
@@ -112,8 +325,51 @@ fn doctor(home: &Path) -> Result<()> {
             "manual/unavailable"
         }
     );
+    println!(
+        "Codex capture mode: {}",
+        if codex.exists() {
+            "rollout/app-server logs"
+        } else {
+            "manual/unavailable"
+        }
+    );
     println!("database integrity: {}", ledger.integrity_check()?);
+
+    // Audit prompt persistence
     println!("prompt persistence: schema forbids prompt/completion/reasoning/tool payload columns");
+    let spool_dir = home.join("spool");
+    let audit = ledger.audit_prompt_leakage(if spool_dir.exists() {
+        Some(&spool_dir)
+    } else {
+        None
+    })?;
+    if audit.leaks_detected > 0 {
+        eprintln!(
+            "prompt leakage: {} leak(s) detected across database and spool records",
+            audit.leaks_detected
+        );
+        for detail in &audit.leak_details {
+            eprintln!("  - {detail}");
+        }
+        bail!("doctor security check failed: prompt/secret leakage detected");
+    } else {
+        println!("prompt leakage: 0 leaks detected across database and spool records");
+    }
+
+    let snapshot = load_snapshot(home);
+    match snapshot {
+        Ok(s) => {
+            println!(
+                "pricing status: active snapshot version {} ({} models, SHA-256 verified)",
+                s.version,
+                s.models.len()
+            );
+        }
+        Err(e) => {
+            println!("pricing status: unavailable ({e})");
+        }
+    }
+
     Ok(())
 }
 
@@ -142,14 +398,44 @@ fn import_claude(home: &Path, root: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn report(home: &Path) -> Result<()> {
-    let ledger = ledger(home)?;
-    let usage = ledger.aggregate_usage()?;
-    let completeness = token_completeness(usage.measured, usage.unavailable, 0);
-    println!("TokenTree ledger report");
+fn import_codex(home: &Path, root: PathBuf) -> Result<()> {
+    let sessions = tokentree_codex::discover_sessions(&root);
+    let mut ledger = ledger(home)?;
+    let mut inserted = 0;
+    let mut duplicates = 0;
+    let mut anomalies = 0;
+    for path in &sessions {
+        let res = tokentree_codex::import_codex_file(ledger.connection_mut(), path)?;
+        inserted += res.inserted;
+        duplicates += res.duplicates;
+        anomalies += res.anomalies;
+    }
     println!(
-        "requests: {} measured {} unavailable {}",
-        usage.requests, usage.measured, usage.unavailable
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "sessions": sessions.len(), "inserted": inserted, "duplicates": duplicates,
+            "anomalies": anomalies,
+        }))?
+    );
+    Ok(())
+}
+
+fn report(home: &Path, project_filter: Option<&str>) -> Result<()> {
+    let mut ledger = ledger(home)?;
+    if let Ok(snapshot) = load_snapshot(home) {
+        let _ = ledger.apply_price_snapshot(&snapshot);
+    }
+
+    let trees = load_project_trees(ledger.connection(), project_filter)?;
+    let rendered_trees = render_project_trees(&trees);
+    println!("{rendered_trees}");
+
+    let usage = ledger.aggregate_usage()?;
+    let completeness = token_completeness(usage.measured, usage.unavailable, usage.anomalous);
+    println!("\nTokenTree ledger report");
+    println!(
+        "requests: {} measured {} unavailable {} anomalous {}",
+        usage.requests, usage.measured, usage.unavailable, usage.anomalous
     );
     println!(
         "tokens: input {} cache-read {} cache-write {} output {} reasoning {}",
@@ -160,9 +446,231 @@ fn report(home: &Path) -> Result<()> {
         completeness.map_or_else(|| "—".into(), |value| format!("{value:.1}%"))
     );
     println!("policy: causal-request");
-    println!("cost: unavailable unless a verified versioned calculation exists");
     println!("\n{DISCLAIMER}");
     Ok(())
+}
+
+fn html_report_cmd(home: &Path, project_filter: Option<&str>, out: Option<PathBuf>) -> Result<()> {
+    let mut ledger = ledger(home)?;
+    if let Ok(snapshot) = load_snapshot(home) {
+        let _ = ledger.apply_price_snapshot(&snapshot);
+    }
+    let trees = load_project_trees(ledger.connection(), project_filter)?;
+    let html = export_html(&trees, DISCLAIMER);
+    let target = out.unwrap_or_else(|| {
+        let reports_dir = home.join("reports");
+        let _ = std::fs::create_dir_all(&reports_dir);
+        let ts = Utc::now().format("%Y%m%d-%H%M%S");
+        reports_dir.join(format!("report-{ts}.html"))
+    });
+    if let Some(parent) = target.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(&target, html)
+        .with_context(|| format!("write HTML report to {}", target.display()))?;
+    println!("Static HTML report generated: {}", target.display());
+    Ok(())
+}
+
+fn dashboard_cmd(home: &Path, port: Option<u16>, no_open: bool) -> Result<()> {
+    let mut ledger = ledger(home)?;
+    if let Ok(snapshot) = load_snapshot(home) {
+        let _ = ledger.apply_price_snapshot(&snapshot);
+    }
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(dashboard::run_dashboard(home, port, no_open))
+}
+
+fn export_cmd(
+    home: &Path,
+    format: &str,
+    project_filter: Option<&str>,
+    out: Option<PathBuf>,
+) -> Result<()> {
+    let mut ledger = ledger(home)?;
+    if let Ok(snapshot) = load_snapshot(home) {
+        let _ = ledger.apply_price_snapshot(&snapshot);
+    }
+    let trees = load_project_trees(ledger.connection(), project_filter)?;
+    let content = match format.to_lowercase().as_str() {
+        "json" => export_json(&trees)?,
+        "csv" => export_csv(&trees)?,
+        "html" => export_html(&trees, DISCLAIMER),
+        other => bail!("unsupported export format '{other}'; supported: json, csv, html"),
+    };
+    if let Some(target) = out {
+        if let Some(parent) = target.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(&target, &content)
+            .with_context(|| format!("write export to {}", target.display()))?;
+        println!("Export written to: {}", target.display());
+    } else {
+        println!("{content}");
+    }
+    Ok(())
+}
+
+fn query(
+    home: &Path,
+    project: Option<&str>,
+    work_item: Option<&str>,
+    include_descendants: bool,
+) -> Result<()> {
+    let mut ledger = ledger(home)?;
+    if let Ok(snapshot) = load_snapshot(home) {
+        let _ = ledger.apply_price_snapshot(&snapshot);
+    }
+    let res = query_ledger(ledger.connection(), project, work_item, include_descendants)?;
+    println!("{}", serde_json::to_string_pretty(&res)?);
+    Ok(())
+}
+
+fn start(home: &Path, project: &str, task: &str, parent: Option<&str>) -> Result<()> {
+    let mut ledger = ledger(home)?;
+    let cwd = std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .to_string_lossy()
+        .to_string();
+    let res = start_manual(
+        ledger.connection_mut(),
+        ManualStartInput {
+            project_key: project,
+            project_title: None,
+            task_title: task,
+            parent_title: parent,
+            cwd: &cwd,
+        },
+    )?;
+    println!("{}", serde_json::to_string_pretty(&res)?);
+    Ok(())
+}
+
+fn stop(home: &Path, counts: ManualCounts) -> Result<()> {
+    let mut ledger = ledger(home)?;
+    let res = stop_manual(ledger.connection_mut(), counts)?;
+    println!("{}", serde_json::to_string_pretty(&res)?);
+    Ok(())
+}
+
+fn attach(home: &Path, session: &str, task: &str) -> Result<()> {
+    let mut ledger = ledger(home)?;
+    let changed = attach_session(ledger.connection_mut(), session, task)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({ "changed": changed }))?
+    );
+    Ok(())
+}
+
+fn detach(home: &Path, session: &str) -> Result<()> {
+    let mut ledger = ledger(home)?;
+    let changed = detach_session(ledger.connection_mut(), session)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({ "changed": changed }))?
+    );
+    Ok(())
+}
+
+fn note(home: &Path, text: &str, task: Option<&str>) -> Result<()> {
+    let mut ledger = ledger(home)?;
+    let id = add_note(ledger.connection_mut(), text, task)?;
+    println!("{}", serde_json::to_string_pretty(&json!({ "id": id }))?);
+    Ok(())
+}
+
+fn rename(home: &Path, task: &str, title: &str) -> Result<()> {
+    let mut ledger = ledger(home)?;
+    rename_work_item(ledger.connection_mut(), task, title)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({ "renamed": true }))?
+    );
+    Ok(())
+}
+
+fn move_item(home: &Path, task: &str, parent: Option<&str>) -> Result<()> {
+    let mut ledger = ledger(home)?;
+    move_work_item(ledger.connection_mut(), task, parent)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({ "moved": true }))?
+    );
+    Ok(())
+}
+
+fn merge(home: &Path, source: &str, target: &str) -> Result<()> {
+    let mut ledger = ledger(home)?;
+    let reattributed = merge_work_items(ledger.connection_mut(), source, target)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(
+            &json!({ "merged": true, "spans_reattributed": reattributed })
+        )?
+    );
+    Ok(())
+}
+
+fn split(home: &Path, source: &str, title: &str, spans: &[String]) -> Result<()> {
+    let mut ledger = ledger(home)?;
+    let new_id = split_work_item(ledger.connection_mut(), source, title, spans)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({ "split": true, "new_work_item_id": new_id }))?
+    );
+    Ok(())
+}
+
+fn classify(home: &Path) -> Result<()> {
+    let mut ledger = ledger(home)?;
+    let spool = home.join("spool/claude-hooks.jsonl");
+    let summary = ledger.process_claude_hook_spool(&spool)?;
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+    Ok(())
+}
+
+fn reconcile_cmd(home: &Path) -> Result<()> {
+    let ledger = ledger(home)?;
+    let res = ledger.reconcile()?;
+    println!("sessions: {}", res.sessions);
+    println!(
+        "duplicate canonical request IDs: {}",
+        res.duplicate_request_ids
+    );
+    println!("unresolved anomalies: {}", res.unresolved_anomalies);
+    println!("subagent reconciliation: {}", res.subagent_reconciliation);
+    println!(
+        "duplicate subagent counters: {}",
+        res.duplicate_subagent_counters
+    );
+    Ok(())
+}
+
+fn migrate_prototype(
+    home: &Path,
+    source: Option<PathBuf>,
+    preview: bool,
+    apply: bool,
+) -> Result<()> {
+    let src = source.unwrap_or_else(|| {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".task-usage/ledger.json")
+    });
+    if preview {
+        let res = preview_prototype(&src)?;
+        println!("{}", serde_json::to_string_pretty(&res)?);
+        return Ok(());
+    }
+    if apply {
+        let mut ledger = ledger(home)?;
+        let backup_dir = home.join("backups");
+        let res = apply_prototype(ledger.connection_mut(), &src, &backup_dir)?;
+        println!("{}", serde_json::to_string_pretty(&res)?);
+        return Ok(());
+    }
+    bail!("Choose --preview or --apply")
 }
 
 fn enqueue_hook(home: &Path) -> Result<()> {
@@ -245,12 +753,112 @@ fn set_mode(_: &Path, _: u32) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
+
     #[test]
     fn hook_sanitizer_drops_prompt_and_payload() {
         let input = json!({"hook_event_name":"UserPromptSubmit","session_id":"s","prompt":"secret full prompt","tool_input":{"content":"source code"}});
-        let output = sanitize_hook(&input).to_string();
-        assert!(!output.contains("secret full prompt"));
-        assert!(!output.contains("source code"));
-        assert!(output.contains("prompt_fingerprint"));
+        let payload = sanitize_hook(&input);
+        let stringified = payload.to_string();
+        assert!(!stringified.contains("secret full prompt"));
+        assert!(!stringified.contains("source code"));
+        assert!(payload.get("prompt_fingerprint").is_some());
+    }
+
+    #[test]
+    fn full_cli_vertical_slice_workflow() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+
+        // 1. Doctor runs clean
+        doctor(&home).unwrap();
+
+        // 2. Start manual run
+        let start_res = start_manual(
+            ledger(&home).unwrap().connection_mut(),
+            ManualStartInput {
+                project_key: "game",
+                project_title: Some("Space Game"),
+                task_title: "Fix collision bug",
+                parent_title: Some("Build playable game"),
+                cwd: "/tmp/game",
+            },
+        )
+        .unwrap();
+        assert!(!start_res.project_id.is_empty());
+
+        // 3. Stop manual run with counts
+        let stop_res = stop_manual(
+            ledger(&home).unwrap().connection_mut(),
+            ManualCounts {
+                input: Some(1_000_000),
+                output: Some(1_000_000),
+                cache_read: Some(1_000_000),
+                cache_write: Some(1_000_000),
+                reasoning: None,
+                model: Some("claude-sonnet-4-6".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(stop_res.measurement_status, "measured");
+
+        // 4. Query ledger
+        let q = query_ledger(
+            ledger(&home).unwrap().connection(),
+            Some("game"),
+            Some("Build playable"),
+            true,
+        )
+        .unwrap();
+        assert!(q.get("inclusive").is_some());
+
+        // 5. Note
+        let note_res = add_note(
+            ledger(&home).unwrap().connection_mut(),
+            "Collision bug reproducible on Windows",
+            Some(&start_res.work_item_id),
+        )
+        .unwrap();
+        assert!(note_res.starts_with("note_"));
+
+        // 6. Rename
+        rename_work_item(
+            ledger(&home).unwrap().connection_mut(),
+            &start_res.work_item_id,
+            "Fix collision bug v2",
+        )
+        .unwrap();
+
+        // 7. Reconcile
+        let rec = ledger(&home).unwrap().reconcile().unwrap();
+        assert_eq!(rec.sessions, 1);
+        assert_eq!(rec.duplicate_request_ids, 0);
+
+        // 8. Report
+        report(&home, Some("game")).unwrap();
+
+        // 9. Static HTML report
+        let html_out = home.join("reports/test-report.html");
+        html_report_cmd(&home, Some("game"), Some(html_out.clone())).unwrap();
+        assert!(html_out.exists());
+        let html_content = fs::read_to_string(&html_out).unwrap();
+        assert!(html_content.contains("TokenTree"));
+        assert!(html_content.contains("Fix collision bug v2"));
+        assert!(html_content.contains("Space Game"));
+        assert!(html_content.contains(DISCLAIMER));
+
+        // 10. Exports (JSON and CSV)
+        let json_out = home.join("export.json");
+        export_cmd(&home, "json", Some("game"), Some(json_out.clone())).unwrap();
+        assert!(json_out.exists());
+        let json_content = fs::read_to_string(&json_out).unwrap();
+        assert!(json_content.contains("Space Game"));
+
+        let csv_out = home.join("export.csv");
+        export_cmd(&home, "csv", Some("game"), Some(csv_out.clone())).unwrap();
+        assert!(csv_out.exists());
+        let csv_content = fs::read_to_string(&csv_out).unwrap();
+        assert!(csv_content.contains("project_id,project_key"));
+        assert!(csv_content.contains("Space Game"));
     }
 }

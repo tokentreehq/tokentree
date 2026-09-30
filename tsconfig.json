@@ -17,6 +17,9 @@
       "path": "packages/adapters/claude"
     },
     {
+      "path": "packages/adapters/codex"
+    },
+    {
       "path": "apps/cli"
     }
   ]

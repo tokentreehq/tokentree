@@ -3,3 +3,7 @@ packages:
   - packages/*
   - packages/adapters/*
   - plugins/*
+
+onlyBuiltDependencies:
+  - esbuild
+

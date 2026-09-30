@@ -22,3 +22,14 @@
 - Added Rust 1.98.1 pinning and rustfmt/test/Clippy gates to CI.
 - Claude plugin launcher now prefers the bundled Rust binary with a development-only Node fallback.
 - Added a loopback-only Rust OTLP/HTTP JSON receiver for official Claude `api_request` events, with bounded bodies, raw-body-event exclusion, and non-loopback rejection.
+- Ported pricing snapshot verification, rate resolution, and exact cost calculation to Rust (`crates/tokentree-core/src/pricing.rs` and `crates/tokentree-ledger/src/pricing.rs`).
+- Implemented Rust project detection (`crates/tokentree-core/src/project.rs`) with override, config validation (rejecting forbidden capabilities), git detection (safely avoiding home directory), manifest detection, and cwd fallback.
+- Implemented Rust conservative boundary classifier and secret-redacting label generator (`crates/tokentree-core/src/classifier.rs`).
+- Implemented Rust hook spool worker with crash-safe SQLite checkpointing (`crates/tokentree-ledger/src/spool.rs`).
+- Implemented Rust recursive project trees, structured queries, manual start/stop sessions, versioned corrections (attach, detach, note, rename, move), prototype migration, and parity subcommands in `apps/rust-cli`.
+- Implemented loopback-only interactive web dashboard (`tokentree dashboard`), self-contained static HTML report generator (`tokentree report --html`), and JSON/CSV exporters (`tokentree export`) with zero external CDNs, random session token auth, and strict CSP.
+- Added cross-platform release pipeline (`.github/workflows/release.yml`) for Linux, macOS, and Windows with SHA-256 checksums.
+- Enhanced `@tokentreehq/cli` npm launcher and Claude Code hook scripts to detect and execute the compiled native binary directly.
+- Authored full public-beta documentation suite: install, costs, classification, no-git detection, corrections, troubleshooting, privacy threat model, multi-agent bookkeeping, completeness, capture modes, public roadmap, contributing guide, and code of conduct.
+
+

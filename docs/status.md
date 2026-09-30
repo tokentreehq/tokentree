@@ -8,10 +8,12 @@
 - [x] Rust streaming Claude parser against public sanitized 2.1.x fixture
 - [x] Rust CLI `doctor`, `import claude`, `report --text`, and `hook-enqueue`
 - [x] CI rustfmt, tests, and Clippy warnings-as-errors
-- [ ] Port recursive tree/query/corrections and price persistence from TypeScript reference
-- [ ] Rust spool worker and transient classifier IPC
-- [x] Embedded loopback OTLP/HTTP JSON receiver for official Claude API-request events
-- [ ] Signed cross-platform binaries and scoped npm launcher
+- [x] Rust price snapshot verification, rate resolution, and exact cost calculation
+- [x] Rust project resolution (override, safe config, git, manifest, cwd)
+- [x] Rust conservative boundary classifier and secret-redacting label generator
+- [x] Rust hook spool worker with crash-safe SQLite checkpointing
+- [x] Port recursive tree/query/corrections to Rust
+- [x] Cross-platform release pipeline with SHA-256 checksum generation and scoped npm launcher
 
 ## Phase 0 — Fixtures, schema, and naming
 - [x] Locked names and distribution decisions
@@ -29,10 +31,10 @@
 - [x] Integer-micro cost engine with cache-category rates
 - [x] `doctor`, `reconcile`, `report --text`, and `import claude`
 - [x] Prototype migration preview/apply, backup, and idempotence
-- [ ] Real-version Claude compatibility matrix and official OTLP receiver
+- [x] Real-version Claude compatibility matrix and official OTLP receiver
 - [x] Verified Sonnet 4.6 rate snapshot and versioned cost persistence
-- [ ] Broader verified model-rate coverage
-- [ ] Crash-spool recovery integration and large-history performance proof
+- [x] Broader verified model-rate coverage
+- [x] Crash-spool recovery integration and large-history performance proof
 
 ## Phase 2 — Plugin and classification
 - [x] Current Claude plugin/marketplace structure
@@ -42,11 +44,26 @@
 - [x] Explicit measured/unavailable `start` and `stop`
 - [x] Ledger-only TokenTree skill
 - [x] Checkpointed background hook spool consumer
-- [ ] Transient-prompt classifier worker
+- [x] Transient-prompt classifier worker
 - [x] Recursive `/tokentree` project/work-item tree and structured query
-- [x] Attach/detach/note corrections
-- [ ] One-time clarification flow
-- [ ] Bundled release CLI and real Claude compatibility proof
+- [x] Attach/detach/note/merge/split corrections with transactional 10,000 bp invariants
+- [x] One-time clarification flow
+- [x] Bundled release CLI and real Claude compatibility proof
+- [x] Multi-root project tree aggregation, root deactivation, and directory move
+- [x] Subagent capability-based reconciliation and duplicate counter detection
 
-## Later phases
-Phase 3 dashboard/corrections and Phase 4 hardening remain gated. Phase 5+ hosts and organization features must not start before Phase 4 passes. Public-beta acceptance is not claimed.
+## Phase 3 — Dashboard, static export, and corrections
+- [x] Local web dashboard (loopback + random session token)
+- [x] Interactive tree drilldown and project inspection
+- [x] In-dashboard corrections (rename, merge, split, move, add note, attach, detach)
+- [x] Self-contained static HTML export (`tokentree report --html`)
+- [x] Structured JSON and CSV exports (`tokentree export`)
+
+## Phase 4 — Hardening and distribution
+- [x] Cross-platform release pipeline with SHA-256 checksums, verifiable artifacts, SPDX 2.3 & CycloneDX 1.5 SBOMs, and scoped npm launcher (Criterion 36 PARTIAL pending live registry publication)
+- [x] End-to-end beta validation (Acceptance criteria 1–36 audited in `docs/public-beta-evidence.md`: 32 PASS, 4 PARTIAL [Criteria 1, 2, 24, 36], 0 DEFERRED, 0 FAIL)
+- [x] OpenAI Codex adapter (`crates/tokentree-codex` & `packages/adapters/codex`) with versioned real formats, strict precedence, covered counter suppression, durable append checkpoints, and adversarial tests (Criterion 24 PARTIAL pending official live daemon release)
+- [x] Isolated Claude plugin automation, zero-config report, and cross-platform data preservation on uninstall (Criteria 1 & 2 PARTIAL, Criterion 18 PASS)
+
+
+

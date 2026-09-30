@@ -67,7 +67,7 @@ Default local-only; no telemetry or network. Do not persist prompts, completions
 - `--text` must never bind a port.
 
 ## Current phase
-Phase 2 in progress with a Rust-first engine migration. Rust core, ledger, Claude parser, loopback OTLP/HTTP JSON receiver, CLI doctor/import/report, and hook enqueue exist. Next slice: port recursive tree/query/corrections and pricing persistence to Rust, then package signed binaries. Phase 3 remains gated.
+Phase 4 hardening: Rust-first production engine with SHA-256 checksummed cross-platform release workflows, multi-root project aggregation, subagent capability reconciliation, and transactional corrections with 10,000 bp weight invariants. Public beta evidence audited across criteria 1–36.
 
 ## Adding an adapter
 Discover sessions; stream and normalize requests; declare capabilities including `subagent_tokens_already_in_parent`; add sanitized fixtures and golden tests; pass the compatibility matrix; only then claim support.

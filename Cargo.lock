@@ -962,25 +962,53 @@ name = "tokentree-cli"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "axum",
  "chrono",
  "clap",
  "dirs",
+ "hex",
+ "http-body-util",
+ "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "tokentree-claude",
+ "tokentree-codex",
  "tokentree-core",
  "tokentree-ledger",
  "tokentree-otel",
  "tokio",
+ "tower",
+]
+
+[[package]]
+name = "tokentree-codex"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "hex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokentree-core",
+ "tokentree-ledger",
+ "walkdir",
 ]
 
 [[package]]
 name = "tokentree-core"
 version = "0.2.0"
 dependencies = [
+ "anyhow",
+ "dirs",
  "hex",
  "serde",
+ "serde_json",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -988,7 +1016,10 @@ name = "tokentree-ledger"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "rusqlite",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokentree-core",
 ]
