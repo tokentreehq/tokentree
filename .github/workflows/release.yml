@@ -57,7 +57,7 @@ jobs:
         run: |
           target/${{ matrix.target }}/release/${{ matrix.binary_name }} --version
           target/${{ matrix.target }}/release/${{ matrix.binary_name }} doctor
-          target/${{ matrix.target }}/release/${{ matrix.binary_name }} import --codex fixtures/parsers/codex/app-server-v1.jsonl
+          target/${{ matrix.target }}/release/${{ matrix.binary_name }} import codex fixtures/parsers/codex/app-server-v1.jsonl
           target/${{ matrix.target }}/release/${{ matrix.binary_name }} report --text
           target/${{ matrix.target }}/release/${{ matrix.binary_name }} export --format json > export-test.json
           test -s export-test.json
@@ -68,7 +68,7 @@ jobs:
         run: |
           .\target\${{ matrix.target }}\release\${{ matrix.binary_name }} --version
           .\target\${{ matrix.target }}\release\${{ matrix.binary_name }} doctor
-          .\target\${{ matrix.target }}\release\${{ matrix.binary_name }} import --codex fixtures/parsers/codex/app-server-v1.jsonl
+          .\target\${{ matrix.target }}\release\${{ matrix.binary_name }} import codex fixtures/parsers/codex/app-server-v1.jsonl
           .\target\${{ matrix.target }}\release\${{ matrix.binary_name }} report --text
           .\target\${{ matrix.target }}\release\${{ matrix.binary_name }} export --format json > export-test.json
           if ((Get-Item export-test.json).Length -eq 0) { throw "export-test.json is empty" }
@@ -171,7 +171,7 @@ jobs:
           chmod +x extracted/tokentree
           extracted/tokentree --version
           extracted/tokentree doctor
-          extracted/tokentree import --codex fixtures/parsers/codex/app-server-v1.jsonl
+          extracted/tokentree import codex fixtures/parsers/codex/app-server-v1.jsonl
           extracted/tokentree report --text
           extracted/tokentree export --format json > export-test.json
           test -s export-test.json

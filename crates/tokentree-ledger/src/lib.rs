@@ -622,6 +622,18 @@ fn apply_migrations(connection: &Connection) -> Result<()> {
             |row| row.get(0),
         )?;
         if existing == Some(SCHEMA_VERSION) {
+            let _ = connection.execute(
+                "ALTER TABLE ingestion_checkpoints ADD COLUMN file_hash TEXT",
+                [],
+            );
+            let _ = connection.execute(
+                "ALTER TABLE ingestion_checkpoints ADD COLUMN parser_version TEXT",
+                [],
+            );
+            let _ = connection.execute(
+                "ALTER TABLE ingestion_checkpoints ADD COLUMN adapter_state_json TEXT",
+                [],
+            );
             return Ok(());
         }
         bail!("unsupported or incomplete schema version {existing:?}");
