@@ -257,42 +257,92 @@ pub fn parse_str(
                 .clone()
                 .or_else(|| default_model.clone());
 
-            let token_usage = TokenUsage {
-                input_tokens: turn.input_tokens,
-                cached_input_tokens: turn.cached_read_tokens,
-                cache_write_tokens: turn.cache_creation_tokens,
-                output_tokens: turn.output_tokens,
-                reasoning_tokens: turn.reasoning_tokens,
+            let is_failed_or_zero_calls = turn.model_calls == Some(0);
+            let has_missing_measurements =
+                turn.input_tokens.is_none() && turn.output_tokens.is_none();
+            let is_unmeasured = is_failed_or_zero_calls || has_missing_measurements;
+
+            let token_usage = if is_unmeasured {
+                TokenUsage {
+                    input_tokens: None,
+                    cached_input_tokens: None,
+                    cache_write_tokens: None,
+                    output_tokens: None,
+                    reasoning_tokens: None,
+                }
+            } else {
+                TokenUsage {
+                    input_tokens: turn.input_tokens,
+                    cached_input_tokens: turn.cached_read_tokens,
+                    cache_write_tokens: turn.cache_creation_tokens,
+                    output_tokens: turn.output_tokens,
+                    reasoning_tokens: turn.reasoning_tokens,
+                }
             };
 
-            // Check for category total sum discrepancy if totalTokens provided
-            if let Some(total) = turn.total_tokens {
-                let sum = turn.input_tokens.unwrap_or(0) + turn.output_tokens.unwrap_or(0);
-                if total != sum && turn.total_tokens != Some(0) {
-                    stats.anomalies += 1;
-                    anomalies.push(GrokAnomaly {
-                        anomaly_type: "token_sum_mismatch".to_string(),
-                        session_id: Some(session_id.clone()),
-                        turn_id: Some(turn_id_str.clone()),
-                        source_path: source_path_str.clone(),
-                        source_offset,
-                        details: serde_json::json!({
-                            "reported_total": total,
-                            "input_tokens": turn.input_tokens,
-                            "output_tokens": turn.output_tokens,
-                            "cached_read_tokens": turn.cached_read_tokens,
-                            "reasoning_tokens": turn.reasoning_tokens,
-                        }),
-                    });
+            // Check for category total sum discrepancy if totalTokens provided and measured
+            if !is_unmeasured {
+                if let Some(total) = turn.total_tokens {
+                    let sum = turn.input_tokens.unwrap_or(0) + turn.output_tokens.unwrap_or(0);
+                    if total != sum && turn.total_tokens != Some(0) {
+                        stats.anomalies += 1;
+                        anomalies.push(GrokAnomaly {
+                            anomaly_type: "token_sum_mismatch".to_string(),
+                            session_id: Some(session_id.clone()),
+                            turn_id: Some(turn_id_str.clone()),
+                            source_path: source_path_str.clone(),
+                            source_offset,
+                            details: serde_json::json!({
+                                "reported_total": total,
+                                "input_tokens": turn.input_tokens,
+                                "output_tokens": turn.output_tokens,
+                                "cached_read_tokens": turn.cached_read_tokens,
+                                "reasoning_tokens": turn.reasoning_tokens,
+                            }),
+                        });
+                    }
                 }
             }
 
-            let provider_cost_micros = turn.cost_usd_ticks.map(ticks_to_micros);
+            let (source, subtype) = if is_unmeasured {
+                stats.anomalies += 1;
+                anomalies.push(GrokAnomaly {
+                    anomaly_type: "missing_provider_measurements".to_string(),
+                    session_id: Some(session_id.clone()),
+                    turn_id: Some(turn_id_str.clone()),
+                    source_path: source_path_str.clone(),
+                    source_offset,
+                    details: serde_json::json!({
+                        "reason": if is_failed_or_zero_calls { "zero_model_calls" } else { "missing_measurements" },
+                        "model_calls": turn.model_calls,
+                        "turn_number": turn.turn_number,
+                    }),
+                });
+                (
+                    MeasurementSource::Unavailable,
+                    if is_failed_or_zero_calls {
+                        "grok_turn_failed".to_string()
+                    } else {
+                        "grok_turn_unmeasured".to_string()
+                    },
+                )
+            } else {
+                (
+                    MeasurementSource::ProviderFields,
+                    "grok_turn_usage".to_string(),
+                )
+            };
+
+            let provider_cost_micros = if is_unmeasured {
+                None
+            } else {
+                turn.cost_usd_ticks.map(ticks_to_micros)
+            };
 
             let obs = UsageObservation {
                 adapter: "grok".to_string(),
-                source: MeasurementSource::ProviderFields,
-                source_subtype: Some("grok_turn_usage".to_string()),
+                source,
+                source_subtype: Some(subtype),
                 source_event_id: Some(format!("grok:{}:turn_{}", session_id, turn.turn_number)),
                 provider_session_id: session_id.clone(),
                 request_id: Some(format!("grok:{}:turn_{}", session_id, turn.turn_number)),
@@ -327,20 +377,67 @@ pub fn parse_str(
                 .clone()
                 .or_else(|| default_model.clone());
 
-            let token_usage = TokenUsage {
-                input_tokens: session_metrics.input_tokens,
-                cached_input_tokens: session_metrics.cached_read_tokens,
-                cache_write_tokens: session_metrics.cache_creation_tokens,
-                output_tokens: session_metrics.output_tokens,
-                reasoning_tokens: session_metrics.reasoning_tokens,
+            let is_failed_or_zero_calls = session_metrics.model_calls == Some(0);
+            let has_missing_measurements =
+                session_metrics.input_tokens.is_none() && session_metrics.output_tokens.is_none();
+            let is_unmeasured = is_failed_or_zero_calls || has_missing_measurements;
+
+            let token_usage = if is_unmeasured {
+                TokenUsage {
+                    input_tokens: None,
+                    cached_input_tokens: None,
+                    cache_write_tokens: None,
+                    output_tokens: None,
+                    reasoning_tokens: None,
+                }
+            } else {
+                TokenUsage {
+                    input_tokens: session_metrics.input_tokens,
+                    cached_input_tokens: session_metrics.cached_read_tokens,
+                    cache_write_tokens: session_metrics.cache_creation_tokens,
+                    output_tokens: session_metrics.output_tokens,
+                    reasoning_tokens: session_metrics.reasoning_tokens,
+                }
             };
 
-            let provider_cost_micros = session_metrics.cost_usd_ticks.map(ticks_to_micros);
+            let (source, subtype) = if is_unmeasured {
+                stats.anomalies += 1;
+                anomalies.push(GrokAnomaly {
+                    anomaly_type: "missing_provider_measurements".to_string(),
+                    session_id: Some(session_id.clone()),
+                    turn_id: None,
+                    source_path: source_path_str.clone(),
+                    source_offset,
+                    details: serde_json::json!({
+                        "reason": if is_failed_or_zero_calls { "zero_model_calls" } else { "missing_measurements" },
+                        "model_calls": session_metrics.model_calls,
+                    }),
+                });
+                (
+                    MeasurementSource::Unavailable,
+                    if is_failed_or_zero_calls {
+                        "grok_session_failed".to_string()
+                    } else {
+                        "grok_session_unmeasured".to_string()
+                    },
+                )
+            } else {
+                (
+                    MeasurementSource::ProviderFields,
+                    "grok_session_usage".to_string(),
+                )
+            };
+
+            let provider_cost_micros = if is_unmeasured {
+                None
+            } else {
+                session_metrics.cost_usd_ticks.map(ticks_to_micros)
+            };
 
             let obs = UsageObservation {
                 adapter: "grok".to_string(),
-                source: MeasurementSource::ProviderFields,
-                source_subtype: Some("grok_session_usage".to_string()),
+                source,
+                source_subtype: Some(subtype),
                 source_event_id: Some(format!("grok:{}:session_summary", session_id)),
                 provider_session_id: session_id.clone(),
                 request_id: Some(format!("grok:{}:session_summary", session_id)),

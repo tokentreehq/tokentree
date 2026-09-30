@@ -11,7 +11,7 @@ export const HERMES_ADAPTER_VERSION = '0.2.0';
 export const HERMES_PARSER_VERSION = '0.2.0';
 
 export interface ParseAnomaly {
-  readonly type: 'malformed_record' | 'schema_mismatch';
+  readonly type: 'malformed_record' | 'schema_mismatch' | 'missing_provider_measurements';
   readonly sourcePath: string;
   readonly sourceOffset: number;
   readonly sourceValues: unknown;
@@ -44,9 +44,41 @@ function count(value: unknown): number | null {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
 
+export function decimalDollarsToMicros(s: string): number | null {
+  const trimmed = s.trim();
+  if (!trimmed) return null;
+  const parts = trimmed.split('.');
+  if (parts.length > 2) return null;
+  const wholeStr = parts[0];
+  const fracStr = parts[1] ?? '';
+  if (!wholeStr || !/^\d+$/.test(wholeStr) || (fracStr && !/^\d+$/.test(fracStr))) return null;
+  const whole = parseInt(wholeStr, 10);
+  if (isNaN(whole)) return null;
+  let frac = 0;
+  if (fracStr.length <= 6) {
+    frac = parseInt(fracStr.padEnd(6, '0'), 10);
+  } else {
+    const first6 = parseInt(fracStr.slice(0, 6), 10);
+    const seventhChar = fracStr[6];
+    const roundBit = seventhChar && parseInt(seventhChar, 10) >= 5 ? 1 : 0;
+    frac = first6 + roundBit;
+  }
+  return whole * 1_000_000 + frac;
+}
+
+export function valueToMicros(val: unknown): number | undefined {
+  if (typeof val === 'number') {
+    if (val < 0) return undefined;
+    return decimalDollarsToMicros(String(val)) ?? undefined;
+  }
+  if (typeof val === 'string') {
+    return decimalDollarsToMicros(val) ?? undefined;
+  }
+  return undefined;
+}
+
 export function usdToMicros(costUsd: number): number {
-  if (costUsd <= 0) return 0;
-  return Math.round(costUsd * 1_000_000);
+  return valueToMicros(costUsd) ?? 0;
 }
 
 export async function parseHermesSession(ref: SessionRef): Promise<ParseResult> {
@@ -102,24 +134,56 @@ export async function parseHermesSession(ref: SessionRef): Promise<ParseResult> 
 
   stats.parsed++;
 
-  const inputTokens = count(root.input_tokens) ?? (isFailed ? 0 : undefined);
-  const outputTokens = count(root.output_tokens) ?? (isFailed ? 0 : undefined);
-  const cacheReadTokens = count(root.cache_read_tokens) ?? (isFailed ? 0 : undefined);
-  const cacheWriteTokens = count(root.cache_write_tokens) ?? (isFailed ? 0 : undefined);
-  const reasoningTokens = count(root.reasoning_tokens) ?? (isFailed ? 0 : undefined);
+  const rawInput = count(root.input_tokens);
+  const rawOutput = count(root.output_tokens);
+  const rawCacheRead = count(root.cache_read_tokens);
+  const rawCacheWrite = count(root.cache_write_tokens);
+  const rawReasoning = count(root.reasoning_tokens);
 
-  let providerCostMicros: number | undefined;
-  if (typeof root.estimated_cost_usd === 'number' && root.estimated_cost_usd > 0) {
-    providerCostMicros = usdToMicros(root.estimated_cost_usd);
-  } else if (isFreeModel) {
-    providerCostMicros = 0;
+  const hasTokens = !isFailed && (
+    rawInput !== null ||
+    rawOutput !== null ||
+    rawCacheRead !== null ||
+    rawCacheWrite !== null ||
+    rawReasoning !== null
+  );
+
+  const isUnmeasured = isFailed || !hasTokens;
+
+  if (isUnmeasured) {
+    stats.anomalies++;
+    anomalies.push({
+      type: 'missing_provider_measurements',
+      sourcePath: ref.sourcePath,
+      sourceOffset: 0,
+      sourceValues: {
+        reason: isFailed ? 'failed_request' : 'missing_measurements',
+        apiCalls: count(root.api_calls),
+      },
+      sessionId,
+      turnId: 'turn_1',
+    });
   }
 
-  const subtype = isFailed ? 'hermes_failed_run' : 'hermes_oneshot_usage';
+  const parsedCostMicros = valueToMicros(root.estimated_cost_usd);
+
+  let providerCostMicros: number | undefined;
+  if (!isUnmeasured) {
+    if (parsedCostMicros !== undefined && parsedCostMicros > 0) {
+      providerCostMicros = parsedCostMicros;
+    } else if (isFreeModel) {
+      providerCostMicros = 0;
+    }
+  }
+
+  const source = isUnmeasured ? 'unavailable' : 'provider_fields';
+  const subtype = isUnmeasured
+    ? (isFailed ? 'hermes_failed_run' : 'hermes_unmeasured')
+    : 'hermes_oneshot_usage';
 
   const mainObs: UsageObservation = {
     adapter: 'hermes',
-    source: 'provider_fields',
+    source,
     sourceSubtype: subtype,
     sourceEventId: `hermes:${sessionId}:main`,
     providerSessionId: sessionId,
@@ -129,11 +193,11 @@ export async function parseHermesSession(ref: SessionRef): Promise<ParseResult> 
     observedAt,
     sourceTimestamp: observedAt,
     model: modelStr,
-    inputTokens: inputTokens ?? null,
-    outputTokens: outputTokens ?? null,
-    cachedInputTokens: cacheReadTokens ?? null,
-    cacheWriteTokens: cacheWriteTokens ?? null,
-    reasoningTokens: reasoningTokens ?? null,
+    inputTokens: isUnmeasured ? null : rawInput,
+    outputTokens: isUnmeasured ? null : rawOutput,
+    cachedInputTokens: isUnmeasured ? null : rawCacheRead,
+    cacheWriteTokens: isUnmeasured ? null : rawCacheWrite,
+    reasoningTokens: isUnmeasured ? null : rawReasoning,
     providerReportedCostMicros: providerCostMicros,
     sourcePath: ref.sourcePath,
     sourceOffset: 0,
@@ -157,16 +221,28 @@ export async function parseHermesSession(ref: SessionRef): Promise<ParseResult> 
       const taskWrite = count(task.cache_write_tokens);
       const taskReasoning = count(task.reasoning_tokens);
 
+      const taskHasTokens = (
+        taskInput !== null ||
+        taskOutput !== null ||
+        taskRead !== null ||
+        taskWrite !== null ||
+        taskReasoning !== null
+      );
+      const taskIsUnmeasured = !taskHasTokens;
+
+      const taskParsedCost = valueToMicros(task.estimated_cost_usd);
       let taskCostMicros: number | undefined;
-      if (typeof task.estimated_cost_usd === 'number' && task.estimated_cost_usd > 0) {
-        taskCostMicros = usdToMicros(task.estimated_cost_usd);
-      } else if (isFreeModel) {
-        taskCostMicros = 0;
+      if (!taskIsUnmeasured) {
+        if (taskParsedCost !== undefined && taskParsedCost > 0) {
+          taskCostMicros = taskParsedCost;
+        } else if (isFreeModel) {
+          taskCostMicros = 0;
+        }
       }
 
       const auxObs: UsageObservation = {
         adapter: 'hermes',
-        source: 'provider_fields',
+        source: taskIsUnmeasured ? 'unavailable' : 'provider_fields',
         sourceSubtype: `hermes_auxiliary_${taskName}`,
         sourceEventId: `hermes:${sessionId}:aux:${taskName}`,
         providerSessionId: sessionId,
@@ -177,11 +253,11 @@ export async function parseHermesSession(ref: SessionRef): Promise<ParseResult> 
         observedAt,
         sourceTimestamp: observedAt,
         model: modelStr,
-        inputTokens: taskInput ?? null,
-        outputTokens: taskOutput ?? null,
-        cachedInputTokens: taskRead ?? null,
-        cacheWriteTokens: taskWrite ?? null,
-        reasoningTokens: taskReasoning ?? null,
+        inputTokens: taskIsUnmeasured ? null : taskInput,
+        outputTokens: taskIsUnmeasured ? null : taskOutput,
+        cachedInputTokens: taskIsUnmeasured ? null : taskRead,
+        cacheWriteTokens: taskIsUnmeasured ? null : taskWrite,
+        reasoningTokens: taskIsUnmeasured ? null : taskReasoning,
         providerReportedCostMicros: taskCostMicros,
         sourcePath: ref.sourcePath,
         sourceOffset: 0,

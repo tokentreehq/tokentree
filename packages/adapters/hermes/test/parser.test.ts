@@ -40,15 +40,18 @@ describe('Hermes adapter parser', () => {
     expect(auxObs.parentAgentId).toBe('hermes:20260930_194647_5766b6');
   });
 
-  it('handles failed oneshot runs cleanly with zero tokens', async () => {
+  it('handles failed oneshot runs cleanly with unavailable tokens and anomaly', async () => {
     const fixture = resolve(root, 'fixtures/parsers/hermes/oneshot-failed.json');
     const result = await parseHermesSession({ sourcePath: fixture, adapter: 'hermes' });
 
     expect(result.stats.parsed).toBe(1);
+    expect(result.stats.anomalies).toBe(1);
+    expect(result.anomalies[0].type).toBe('missing_provider_measurements');
     expect(result.observations).toHaveLength(1);
+    expect(result.observations[0].source).toBe('unavailable');
     expect(result.observations[0].sourceSubtype).toBe('hermes_failed_run');
-    expect(result.observations[0].inputTokens).toBe(0);
-    expect(result.observations[0].outputTokens).toBe(0);
+    expect(result.observations[0].inputTokens).toBeNull();
+    expect(result.observations[0].outputTokens).toBeNull();
   });
 
   it('detects malformed json gracefully', async () => {

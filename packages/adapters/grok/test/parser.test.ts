@@ -45,8 +45,12 @@ describe('Grok adapter parser', () => {
     const result = await parseGrokSession({ sourcePath: fixture, adapter: 'grok' });
 
     expect(result.stats.parsed).toBe(1);
-    expect(result.observations[0].inputTokens).toBe(0);
-    expect(result.observations[0].outputTokens).toBe(0);
+    expect(result.stats.anomalies).toBe(1);
+    expect(result.anomalies[0].type).toBe('missing_provider_measurements');
+    expect(result.observations[0].source).toBe('unavailable');
+    expect(result.observations[0].sourceSubtype).toBe('grok_turn_failed');
+    expect(result.observations[0].inputTokens).toBeNull();
+    expect(result.observations[0].outputTokens).toBeNull();
   });
 
   it('detects malformed json safely', async () => {

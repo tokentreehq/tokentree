@@ -70,12 +70,20 @@ fn test_parse_zero_tokens_failed_run() {
 
     assert_eq!(res.stats.parsed, 1);
     assert_eq!(res.stats.malformed, 0);
+    assert_eq!(res.stats.anomalies, 1);
+    assert_eq!(
+        res.anomalies[0].anomaly_type,
+        "missing_provider_measurements"
+    );
     assert_eq!(res.observations.len(), 1);
 
     let obs = &res.observations[0];
-    assert_eq!(obs.usage.input_tokens, Some(0));
-    assert_eq!(obs.usage.output_tokens, Some(0));
-    assert_eq!(obs.usage.cached_input_tokens, Some(0));
+    assert_eq!(obs.source, tokentree_core::MeasurementSource::Unavailable);
+    assert_eq!(obs.source_subtype.as_deref(), Some("grok_turn_failed"));
+    assert_eq!(obs.usage.input_tokens, None);
+    assert_eq!(obs.usage.output_tokens, None);
+    assert_eq!(obs.usage.cached_input_tokens, None);
+    assert_eq!(obs.provider_reported_cost_micros, None);
 }
 
 #[test]

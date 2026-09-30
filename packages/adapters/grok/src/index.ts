@@ -11,7 +11,7 @@ export const GROK_ADAPTER_VERSION = '0.2.0';
 export const GROK_PARSER_VERSION = '0.2.0';
 
 export interface ParseAnomaly {
-  readonly type: 'malformed_record' | 'schema_mismatch' | 'token_sum_mismatch';
+  readonly type: 'malformed_record' | 'schema_mismatch' | 'token_sum_mismatch' | 'missing_provider_measurements';
   readonly sourcePath: string;
   readonly sourceOffset: number;
   readonly sourceValues: unknown;
@@ -120,8 +120,13 @@ export async function parseGrokSession(ref: SessionRef): Promise<ParseResult> {
       const reasoningTokens = count(turn.reasoningTokens);
       const totalTokens = count(turn.totalTokens);
       const costTicks = count(turn.costUsdTicks);
+      const modelCalls = count(turn.modelCalls);
 
-      if (totalTokens !== null && totalTokens > 0 && inputTokens !== null && outputTokens !== null) {
+      const isFailedOrZeroCalls = modelCalls === 0;
+      const hasMissingMeasurements = inputTokens === null && outputTokens === null;
+      const isUnmeasured = isFailedOrZeroCalls || hasMissingMeasurements;
+
+      if (!isUnmeasured && totalTokens !== null && totalTokens > 0 && inputTokens !== null && outputTokens !== null) {
         if (totalTokens !== inputTokens + outputTokens) {
           stats.anomalies++;
           anomalies.push({
@@ -135,12 +140,31 @@ export async function parseGrokSession(ref: SessionRef): Promise<ParseResult> {
         }
       }
 
-      const costMicros = costTicks !== null ? ticksToMicros(costTicks) : undefined;
+      if (isUnmeasured) {
+        stats.anomalies++;
+        anomalies.push({
+          type: 'missing_provider_measurements',
+          sourcePath: ref.sourcePath,
+          sourceOffset: 0,
+          sourceValues: {
+            reason: isFailedOrZeroCalls ? 'zero_model_calls' : 'missing_measurements',
+            modelCalls,
+          },
+          sessionId,
+          turnId,
+        });
+      }
+
+      const costMicros = !isUnmeasured && costTicks !== null ? ticksToMicros(costTicks) : undefined;
+      const source = isUnmeasured ? 'unavailable' : 'provider_fields';
+      const sourceSubtype = isUnmeasured
+        ? (isFailedOrZeroCalls ? 'grok_turn_failed' : 'grok_turn_unmeasured')
+        : 'grok_turn_usage';
 
       const obs: UsageObservation = {
         adapter: 'grok',
-        source: 'provider_fields',
-        sourceSubtype: 'grok_turn_usage',
+        source,
+        sourceSubtype,
         sourceEventId: `grok:${sessionId}:${turnId}`,
         providerSessionId: sessionId,
         requestId: `grok:${sessionId}:${turnId}`,
@@ -148,11 +172,11 @@ export async function parseGrokSession(ref: SessionRef): Promise<ParseResult> {
         observedAt: endedAt,
         sourceTimestamp: endedAt,
         model: turnModel,
-        inputTokens: inputTokens ?? null,
-        outputTokens: outputTokens ?? null,
-        cachedInputTokens: cachedReadTokens ?? null,
-        cacheWriteTokens: cacheCreationTokens ?? null,
-        reasoningTokens: reasoningTokens ?? null,
+        inputTokens: isUnmeasured ? null : inputTokens,
+        outputTokens: isUnmeasured ? null : outputTokens,
+        cachedInputTokens: isUnmeasured ? null : cachedReadTokens,
+        cacheWriteTokens: isUnmeasured ? null : cacheCreationTokens,
+        reasoningTokens: isUnmeasured ? null : reasoningTokens,
         providerReportedCostMicros: costMicros,
         sourcePath: ref.sourcePath,
         sourceOffset: 0,
@@ -174,23 +198,47 @@ export async function parseGrokSession(ref: SessionRef): Promise<ParseResult> {
     const cacheCreationTokens = count(sessionObj.cacheCreationTokens);
     const reasoningTokens = count(sessionObj.reasoningTokens);
     const costTicks = count(sessionObj.costUsdTicks);
-    const costMicros = costTicks !== null ? ticksToMicros(costTicks) : undefined;
+    const modelCalls = count(sessionObj.modelCalls);
+
+    const isFailedOrZeroCalls = modelCalls === 0;
+    const hasMissingMeasurements = inputTokens === null && outputTokens === null;
+    const isUnmeasured = isFailedOrZeroCalls || hasMissingMeasurements;
+
+    if (isUnmeasured) {
+      stats.anomalies++;
+      anomalies.push({
+        type: 'missing_provider_measurements',
+        sourcePath: ref.sourcePath,
+        sourceOffset: 0,
+        sourceValues: {
+          reason: isFailedOrZeroCalls ? 'zero_model_calls' : 'missing_measurements',
+          modelCalls,
+        },
+        sessionId,
+      });
+    }
+
+    const costMicros = !isUnmeasured && costTicks !== null ? ticksToMicros(costTicks) : undefined;
+    const source = isUnmeasured ? 'unavailable' : 'provider_fields';
+    const sourceSubtype = isUnmeasured
+      ? (isFailedOrZeroCalls ? 'grok_session_failed' : 'grok_session_unmeasured')
+      : 'grok_session_usage';
 
     const obs: UsageObservation = {
       adapter: 'grok',
-      source: 'provider_fields',
-      sourceSubtype: 'grok_session_usage',
+      source,
+      sourceSubtype,
       sourceEventId: `grok:${sessionId}:session_summary`,
       providerSessionId: sessionId,
       requestId: `grok:${sessionId}:session_summary`,
       observedAt: updatedAt,
       sourceTimestamp: updatedAt,
       model: primaryModel,
-      inputTokens: inputTokens ?? null,
-      outputTokens: outputTokens ?? null,
-      cachedInputTokens: cachedReadTokens ?? null,
-      cacheWriteTokens: cacheCreationTokens ?? null,
-      reasoningTokens: reasoningTokens ?? null,
+      inputTokens: isUnmeasured ? null : inputTokens,
+      outputTokens: isUnmeasured ? null : outputTokens,
+      cachedInputTokens: isUnmeasured ? null : cachedReadTokens,
+      cacheWriteTokens: isUnmeasured ? null : cacheCreationTokens,
+      reasoningTokens: isUnmeasured ? null : reasoningTokens,
       providerReportedCostMicros: costMicros,
       sourcePath: ref.sourcePath,
       sourceOffset: 0,

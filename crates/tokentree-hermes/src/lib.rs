@@ -56,6 +56,16 @@ pub struct HermesImportResult {
     pub end_offset: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HermesCostClassification {
+    /// Free model has authoritative zero cost
+    AuthoritativeZero,
+    /// Provider reported positive cost, converted exactly to micros
+    AuthoritativeProvider(u64),
+    /// Provider cost is unavailable; TokenTree catalog pricing will compute fallback cost
+    UnavailableProviderCost,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct HermesAuxiliaryTask {
@@ -65,7 +75,7 @@ pub struct HermesAuxiliaryTask {
     pub cache_read_tokens: Option<u64>,
     pub cache_write_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
-    pub estimated_cost_usd: Option<f64>,
+    pub estimated_cost_usd: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,7 +87,7 @@ pub struct HermesAuxiliaryReport {
     pub cache_read_tokens: Option<u64>,
     pub cache_write_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
-    pub estimated_cost_usd: Option<f64>,
+    pub estimated_cost_usd: Option<Value>,
     pub total_tokens: Option<u64>,
     pub by_task: Option<HashMap<String, HermesAuxiliaryTask>>,
 }
@@ -85,7 +95,7 @@ pub struct HermesAuxiliaryReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct HermesUsageFile {
-    pub estimated_cost_usd: Option<f64>,
+    pub estimated_cost_usd: Option<Value>,
     pub cost_status: Option<String>,
     pub cost_source: Option<String>,
     pub input_tokens: Option<u64>,
@@ -133,12 +143,56 @@ pub fn discover_sessions(root: &Path) -> Vec<PathBuf> {
     sessions
 }
 
-#[must_use]
-pub fn usd_to_micros(cost_usd: f64) -> u64 {
-    if cost_usd <= 0.0 {
-        return 0;
+/// Convert exact decimal string representation of USD dollars to integer microdollars ($10^-6 USD).
+/// Completely avoids IEEE-754 floating-point drift.
+pub fn decimal_dollars_to_micros(val_str: &str) -> Result<u64, String> {
+    let s = val_str.trim();
+    if s.is_empty() {
+        return Err("empty cost string".to_string());
     }
-    (cost_usd * 1_000_000.0).round() as u64
+    let (whole_str, frac_str) = match s.split_once('.') {
+        Some((w, f)) => (w, f),
+        None => (s, ""),
+    };
+    if whole_str.is_empty() || !whole_str.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("invalid whole dollars: {whole_str}"));
+    }
+    if !frac_str.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("invalid fractional dollars: {frac_str}"));
+    }
+    let whole: u64 = whole_str
+        .parse()
+        .map_err(|e| format!("whole dollar parse error: {e}"))?;
+
+    let frac_val: u64 = if frac_str.is_empty() {
+        0
+    } else if frac_str.len() <= 6 {
+        let padded = format!("{frac_str:0<6}");
+        padded.parse().map_err(|e| format!("{e}"))?
+    } else {
+        // Round half up on 7th decimal digit
+        let first_6: u64 = frac_str[..6].parse().map_err(|e| format!("{e}"))?;
+        let next_digit = frac_str.as_bytes()[6];
+        if next_digit >= b'5' {
+            first_6 + 1
+        } else {
+            first_6
+        }
+    };
+
+    whole
+        .checked_mul(1_000_000)
+        .and_then(|w| w.checked_add(frac_val))
+        .ok_or_else(|| "cost overflow".to_string())
+}
+
+#[must_use]
+pub fn value_to_micros(val: Option<&Value>) -> Option<u64> {
+    match val {
+        Some(Value::Number(num)) => decimal_dollars_to_micros(&num.to_string()).ok(),
+        Some(Value::String(s)) => decimal_dollars_to_micros(s).ok(),
+        _ => None,
+    }
 }
 
 pub fn parse_json_usage_str(
@@ -224,26 +278,54 @@ pub fn parse_json_usage_str(
 
     // Main task observation
     stats.parsed += 1;
-    let main_tokens = TokenUsage {
-        input_tokens: usage_file
-            .input_tokens
-            .or(if is_failed { Some(0) } else { None }),
-        cached_input_tokens: usage_file.cache_read_tokens.or(if is_failed {
-            Some(0)
-        } else {
-            None
-        }),
-        cache_write_tokens: usage_file.cache_write_tokens.or(if is_failed {
-            Some(0)
-        } else {
-            None
-        }),
-        output_tokens: usage_file
-            .output_tokens
-            .or(if is_failed { Some(0) } else { None }),
-        reasoning_tokens: usage_file
-            .reasoning_tokens
-            .or(if is_failed { Some(0) } else { None }),
+    let main_tokens = if is_failed {
+        TokenUsage {
+            input_tokens: None,
+            cached_input_tokens: None,
+            cache_write_tokens: None,
+            output_tokens: None,
+            reasoning_tokens: None,
+        }
+    } else {
+        TokenUsage {
+            input_tokens: usage_file.input_tokens,
+            cached_input_tokens: usage_file.cache_read_tokens,
+            cache_write_tokens: usage_file.cache_write_tokens,
+            output_tokens: usage_file.output_tokens,
+            reasoning_tokens: usage_file.reasoning_tokens,
+        }
+    };
+
+    let is_unmeasured = is_failed || !main_tokens.is_measured();
+
+    let (source, subtype) = if is_unmeasured {
+        stats.anomalies += 1;
+        anomalies.push(HermesAnomaly {
+            anomaly_type: "missing_provider_measurements".to_string(),
+            session_id: Some(session_id.clone()),
+            turn_id: Some("turn_1".to_string()),
+            source_path: source_path_str.clone(),
+            source_offset,
+            details: serde_json::json!({
+                "reason": if is_failed { "failed_request" } else { "missing_measurements" },
+                "api_calls": usage_file.api_calls,
+                "completed": usage_file.completed,
+                "turn_exit_reason": usage_file.turn_exit_reason,
+            }),
+        });
+        (
+            MeasurementSource::Unavailable,
+            if is_failed {
+                "hermes_failed_run".to_string()
+            } else {
+                "hermes_unmeasured".to_string()
+            },
+        )
+    } else {
+        (
+            MeasurementSource::ProviderFields,
+            "hermes_oneshot_usage".to_string(),
+        )
     };
 
     let model_str = usage_file.model.clone();
@@ -251,22 +333,26 @@ pub fn parse_json_usage_str(
         .as_ref()
         .is_some_and(|m| m.contains(":free") || m.contains("free"));
 
-    let provider_cost_micros = match usage_file.estimated_cost_usd {
-        Some(usd) if usd > 0.0 => Some(usd_to_micros(usd)),
-        Some(_) if is_free_model => Some(0),
-        _ => None,
-    };
+    let parsed_cost_micros = value_to_micros(usage_file.estimated_cost_usd.as_ref());
 
-    let subtype = if is_failed {
-        "hermes_failed_run"
+    let (_cost_classification, provider_cost_micros) = if is_unmeasured {
+        (HermesCostClassification::UnavailableProviderCost, None)
     } else {
-        "hermes_oneshot_usage"
+        match parsed_cost_micros {
+            Some(micros) if micros > 0 => (
+                HermesCostClassification::AuthoritativeProvider(micros),
+                Some(micros),
+            ),
+            Some(0) if is_free_model => (HermesCostClassification::AuthoritativeZero, Some(0)),
+            _ if is_free_model => (HermesCostClassification::AuthoritativeZero, Some(0)),
+            _ => (HermesCostClassification::UnavailableProviderCost, None),
+        }
     };
 
     let main_obs = UsageObservation {
         adapter: "hermes".to_string(),
-        source: MeasurementSource::ProviderFields,
-        source_subtype: Some(subtype.to_string()),
+        source,
+        source_subtype: Some(subtype),
         source_event_id: Some(format!("hermes:{}:main", session_id)),
         provider_session_id: session_id.clone(),
         request_id: Some(format!("hermes:{}:main", session_id)),
@@ -299,15 +385,23 @@ pub fn parse_json_usage_str(
                     output_tokens: task_data.output_tokens,
                     reasoning_tokens: task_data.reasoning_tokens,
                 };
-                let task_cost_micros = match task_data.estimated_cost_usd {
-                    Some(usd) if usd > 0.0 => Some(usd_to_micros(usd)),
-                    Some(_) if is_free_model => Some(0),
-                    _ => None,
+                let task_is_unmeasured = !task_tokens.is_measured();
+                let task_parsed_cost = value_to_micros(task_data.estimated_cost_usd.as_ref());
+                let (task_source, task_cost_micros) = if task_is_unmeasured {
+                    (MeasurementSource::Unavailable, None)
+                } else {
+                    let cost = match task_parsed_cost {
+                        Some(micros) if micros > 0 => Some(micros),
+                        Some(0) if is_free_model => Some(0),
+                        _ if is_free_model => Some(0),
+                        _ => None,
+                    };
+                    (MeasurementSource::ProviderFields, cost)
                 };
 
                 let aux_obs = UsageObservation {
                     adapter: "hermes".to_string(),
-                    source: MeasurementSource::ProviderFields,
+                    source: task_source,
                     source_subtype: Some(format!("hermes_auxiliary_{}", task_name)),
                     source_event_id: Some(format!("hermes:{}:aux:{}", session_id, task_name)),
                     provider_session_id: session_id.clone(),
@@ -343,8 +437,11 @@ pub fn parse_json_usage_str(
 pub fn parse_hermes_state_db(db_path: &Path, since_timestamp: Option<f64>) -> Result<ParseResult> {
     let conn = Connection::open_with_flags(
         db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI,
     )?;
+    conn.execute_batch("PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;")?;
 
     let mut observations = Vec::new();
     let anomalies = Vec::new();
@@ -372,22 +469,22 @@ pub fn parse_hermes_state_db(db_path: &Path, since_timestamp: Option<f64>) -> Re
     let mut stmt = conn.prepare(query)?;
     let rows = stmt.query_map([], |row| {
         Ok((
-            row.get::<_, String>(0)?,          // session_id
-            row.get::<_, String>(1)?,          // model
-            row.get::<_, String>(2)?,          // billing_provider
-            row.get::<_, String>(3)?,          // task
-            row.get::<_, i64>(4)?,             // api_call_count
-            row.get::<_, i64>(5)?,             // input_tokens
-            row.get::<_, i64>(6)?,             // output_tokens
-            row.get::<_, i64>(7)?,             // cache_read_tokens
-            row.get::<_, i64>(8)?,             // cache_write_tokens
-            row.get::<_, i64>(9)?,             // reasoning_tokens
-            row.get::<_, f64>(10)?,            // estimated_cost_usd
-            row.get::<_, f64>(11)?,            // actual_cost_usd
-            row.get::<_, Option<String>>(12)?, // cost_status
-            row.get::<_, Option<String>>(13)?, // cost_source
-            row.get::<_, Option<f64>>(14)?,    // first_seen
-            row.get::<_, Option<f64>>(15)?,    // last_seen
+            row.get::<_, String>(0)?,                          // session_id
+            row.get::<_, String>(1)?,                          // model
+            row.get::<_, String>(2)?,                          // billing_provider
+            row.get::<_, String>(3)?,                          // task
+            row.get::<_, i64>(4)?,                             // api_call_count
+            row.get::<_, i64>(5)?,                             // input_tokens
+            row.get::<_, i64>(6)?,                             // output_tokens
+            row.get::<_, i64>(7)?,                             // cache_read_tokens
+            row.get::<_, i64>(8)?,                             // cache_write_tokens
+            row.get::<_, i64>(9)?,                             // reasoning_tokens
+            row.get::<_, Option<rusqlite::types::Value>>(10)?, // estimated_cost_usd
+            row.get::<_, Option<rusqlite::types::Value>>(11)?, // actual_cost_usd
+            row.get::<_, Option<String>>(12)?,                 // cost_status
+            row.get::<_, Option<String>>(13)?,                 // cost_source
+            row.get::<_, Option<f64>>(14)?,                    // first_seen
+            row.get::<_, Option<f64>>(15)?,                    // last_seen
         ))
     })?;
 
@@ -430,14 +527,36 @@ pub fn parse_hermes_state_db(db_path: &Path, since_timestamp: Option<f64>) -> Re
         stats.parsed += 1;
 
         let is_free_model = model.contains(":free") || model.contains("free");
-        let cost_usd = if act_cost > 0.0 { act_cost } else { est_cost };
 
-        let provider_cost_micros = if cost_usd > 0.0 {
-            Some(usd_to_micros(cost_usd))
-        } else if is_free_model {
-            Some(0)
-        } else {
-            None
+        let est_micros = match est_cost.as_ref() {
+            Some(rusqlite::types::Value::Text(s)) => decimal_dollars_to_micros(s).ok(),
+            Some(rusqlite::types::Value::Integer(i)) if *i >= 0 => {
+                (*i as u64).checked_mul(1_000_000)
+            }
+            Some(rusqlite::types::Value::Real(f)) if *f >= 0.0 => {
+                let s = format!("{f:.6}");
+                decimal_dollars_to_micros(&s).ok()
+            }
+            _ => None,
+        };
+        let act_micros = match act_cost.as_ref() {
+            Some(rusqlite::types::Value::Text(s)) => decimal_dollars_to_micros(s).ok(),
+            Some(rusqlite::types::Value::Integer(i)) if *i >= 0 => {
+                (*i as u64).checked_mul(1_000_000)
+            }
+            Some(rusqlite::types::Value::Real(f)) if *f >= 0.0 => {
+                let s = format!("{f:.6}");
+                decimal_dollars_to_micros(&s).ok()
+            }
+            _ => None,
+        };
+        let cost_micros = act_micros.or(est_micros);
+
+        let provider_cost_micros = match cost_micros {
+            Some(micros) if micros > 0 => Some(micros),
+            Some(0) if is_free_model => Some(0),
+            _ if is_free_model => Some(0),
+            _ => None,
         };
 
         let parent_session_id = parent_map.get(&session_id).cloned();
@@ -458,9 +577,49 @@ pub fn parse_hermes_state_db(db_path: &Path, since_timestamp: Option<f64>) -> Re
             format!("task_{}", task)
         };
 
+        let has_tokens = input_tokens > 0
+            || output_tokens > 0
+            || cache_read > 0
+            || cache_write > 0
+            || reasoning > 0;
+
+        let usage = TokenUsage {
+            input_tokens: if input_tokens > 0 {
+                Some(input_tokens as u64)
+            } else {
+                None
+            },
+            cached_input_tokens: if cache_read > 0 {
+                Some(cache_read as u64)
+            } else {
+                None
+            },
+            cache_write_tokens: if cache_write > 0 {
+                Some(cache_write as u64)
+            } else {
+                None
+            },
+            output_tokens: if output_tokens > 0 {
+                Some(output_tokens as u64)
+            } else {
+                None
+            },
+            reasoning_tokens: if reasoning > 0 {
+                Some(reasoning as u64)
+            } else {
+                None
+            },
+        };
+
+        let (source, obs_cost) = if !has_tokens {
+            (MeasurementSource::Unavailable, None)
+        } else {
+            (MeasurementSource::ProviderFields, provider_cost_micros)
+        };
+
         let obs = UsageObservation {
             adapter: "hermes".to_string(),
-            source: MeasurementSource::ProviderFields,
+            source,
             source_subtype: Some(if provider.is_empty() {
                 "hermes_session_model_usage".to_string()
             } else {
@@ -477,14 +636,8 @@ pub fn parse_hermes_state_db(db_path: &Path, since_timestamp: Option<f64>) -> Re
             model: Some(model),
             service_tier: None,
             region: None,
-            usage: TokenUsage {
-                input_tokens: Some(input_tokens.max(0) as u64),
-                cached_input_tokens: Some(cache_read.max(0) as u64),
-                cache_write_tokens: Some(cache_write.max(0) as u64),
-                output_tokens: Some(output_tokens.max(0) as u64),
-                reasoning_tokens: Some(reasoning.max(0) as u64),
-            },
-            provider_reported_cost_micros: provider_cost_micros,
+            usage,
+            provider_reported_cost_micros: obs_cost,
             source_path: source_path_str.clone(),
             source_offset: (row_ts * 1000.0) as u64,
             adapter_version: ADAPTER_VERSION.to_string(),
