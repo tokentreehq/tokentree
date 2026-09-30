@@ -2,9 +2,9 @@
 import { readFileSync, existsSync } from 'node:fs';
 
 const forbiddenPatterns = [
-  /sk-ant-[a-zA-Z0-9_\-]{20,}/,
-  /sk-[a-zA-Z0-9_\-]{20,}/,
-  /Bearer\s+[a-zA-Z0-9_.\-]{20,}/i,
+  /sk-ant-[a-zA-Z0-9_-]{20,}/,
+  /sk-[a-zA-Z0-9_-]{20,}/,
+  /Bearer\s+[a-zA-Z0-9_.-]{20,}/i,
   /x-api-key/i,
   /authorization:\s*bearer/i,
 ];

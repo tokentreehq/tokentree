@@ -4,7 +4,6 @@ import { join } from 'node:path';
 import {
   type DiscoverOptions,
   type SessionRef,
-  type TokenUsage,
   type UsageObservation,
 } from '@tokentreehq/core';
 
@@ -205,7 +204,10 @@ export async function parseGrokSession(ref: SessionRef): Promise<ParseResult> {
   return { observations, anomalies, stats };
 }
 
-export function discoverGrokSessions(root: string, _options: DiscoverOptions = {}): SessionRef[] {
+export function discoverGrokSessions(root: string, options: DiscoverOptions = {}): SessionRef[] {
+  if (options.since) {
+    // mtime filtering is deferred to checkpoint-aware ingest
+  }
   const sessions: SessionRef[] = [];
 
   function scan(dir: string) {

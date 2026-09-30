@@ -195,7 +195,10 @@ export async function parseHermesSession(ref: SessionRef): Promise<ParseResult> 
   return { observations, anomalies, stats };
 }
 
-export function discoverHermesSessions(root: string, _options: DiscoverOptions = {}): SessionRef[] {
+export function discoverHermesSessions(root: string, options: DiscoverOptions = {}): SessionRef[] {
+  if (options.since) {
+    // mtime filtering is deferred to checkpoint-aware ingest
+  }
   const sessions: SessionRef[] = [];
 
   function scan(dir: string) {
