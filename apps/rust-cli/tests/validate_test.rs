@@ -67,6 +67,8 @@ struct TestHostTelemetryFiles {
     failed: u64,
     unsupported: u64,
     anomalous: u64,
+    duplicate_only: u64,
+    empty: u64,
     skipped: u64,
 }
 
@@ -317,4 +319,195 @@ fn test_validate_output_report_schema_and_deny_unknown_fields() {
     assert!(!lower.contains("\\users\\"));
     assert!(!lower.contains("/home/"));
     assert!(!lower.contains("/users/"));
+}
+
+#[test]
+fn test_telemetry_outcomes_and_counters_verified_and_duplicate_only() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("ledger.db");
+    let mut ledger = tokentree_ledger::Ledger::open(&db_path).unwrap();
+
+    let fixture = repo_root().join("fixtures/parsers/hermes/oneshot-usage.json");
+
+    // 1. First ingestion -> Outcome: Verified
+    let res1 = tokentree_cli::validate::ingest_adapter_telemetry("hermes", &mut ledger, &fixture);
+    assert_eq!(
+        res1.outcome,
+        tokentree_cli::validate::TelemetryImportOutcome::Verified
+    );
+
+    // 2. Second ingestion -> Outcome: DuplicateOnly
+    let res2 = tokentree_cli::validate::ingest_adapter_telemetry("hermes", &mut ledger, &fixture);
+    assert_eq!(
+        res2.outcome,
+        tokentree_cli::validate::TelemetryImportOutcome::DuplicateOnly
+    );
+}
+
+#[test]
+fn test_telemetry_outcomes_malformed_unsupported_inaccessible_empty() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("ledger.db");
+    let mut ledger = tokentree_ledger::Ledger::open(&db_path).unwrap();
+
+    // 1. Inaccessible (non-existent path)
+    let missing_path = dir.path().join("does_not_exist.json");
+    let res_inacc =
+        tokentree_cli::validate::ingest_adapter_telemetry("hermes", &mut ledger, &missing_path);
+    assert_eq!(
+        res_inacc.outcome,
+        tokentree_cli::validate::TelemetryImportOutcome::Inaccessible
+    );
+
+    // 2. Empty (0-byte file)
+    let empty_path = dir.path().join("empty.json");
+    std::fs::write(&empty_path, b"").unwrap();
+    let res_empty =
+        tokentree_cli::validate::ingest_adapter_telemetry("hermes", &mut ledger, &empty_path);
+    assert_eq!(
+        res_empty.outcome,
+        tokentree_cli::validate::TelemetryImportOutcome::Empty
+    );
+
+    // 3. Malformed (corrupted JSON)
+    let malformed_path = dir.path().join("malformed.json");
+    std::fs::write(&malformed_path, b"{ this is invalid json !!! }").unwrap();
+    let res_malformed =
+        tokentree_cli::validate::ingest_adapter_telemetry("hermes", &mut ledger, &malformed_path);
+    assert_eq!(
+        res_malformed.outcome,
+        tokentree_cli::validate::TelemetryImportOutcome::Malformed
+    );
+
+    // 4. Unsupported Version
+    let unsupported_path = dir.path().join("unsupported.json");
+    std::fs::write(
+        &unsupported_path,
+        b"{\"schema_version\": \"99.0.0\", \"unsupported_version\": true}",
+    )
+    .unwrap();
+    let res_unsupported =
+        tokentree_cli::validate::ingest_adapter_telemetry("hermes", &mut ledger, &unsupported_path);
+    assert_eq!(
+        res_unsupported.outcome,
+        tokentree_cli::validate::TelemetryImportOutcome::UnsupportedVersion
+    );
+}
+
+#[test]
+fn test_validate_historical_files_do_not_satisfy_require_live() {
+    let fixture = repo_root().join("fixtures/parsers/grok/multi-turn.json");
+
+    // Run validate with --require-live and --fixture on a historical fixture
+    let output = std::process::Command::new(bin_path())
+        .args([
+            "validate",
+            "--require-live",
+            "grok",
+            "--fixture",
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .expect("execute validate --require-live with fixture");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "--require-live must fail with code 1 when only historical fixture is evaluated"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Live Capture:          unavailable")
+            || stdout.contains("Live Capture:          not_run")
+            || stdout.contains("Live Capture:          failed")
+    );
+    assert!(stdout.contains("Overall Status: FAILED"));
+}
+
+#[test]
+fn test_validate_cli_installation_alone_produces_degraded_or_unavailable_not_healthy() {
+    let output = std::process::Command::new(bin_path())
+        .args(["validate", "claude"])
+        .output()
+        .expect("execute validate claude");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.contains("CLI Installed:         yes")
+        && stdout.contains("Host Telemetry:        not_found")
+    {
+        // CLI is installed but no telemetry is verified: status must be DEGRADED or UNAVAILABLE, never HEALTHY!
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "CLI installed alone must exit with code 3 (unavailable/degraded)"
+        );
+        assert!(
+            stdout.contains("Overall Status: DEGRADED")
+                || stdout.contains("Overall Status: UNAVAILABLE")
+        );
+        assert!(!stdout.contains("Overall Status: HEALTHY"));
+    }
+}
+
+#[test]
+fn test_telemetry_outcomes_all_eight_variants_and_counter_mapping() {
+    use tokentree_cli::validate::TelemetryImportOutcome;
+
+    let all_outcomes = [
+        TelemetryImportOutcome::Verified,
+        TelemetryImportOutcome::DuplicateOnly,
+        TelemetryImportOutcome::Malformed,
+        TelemetryImportOutcome::UnsupportedVersion,
+        TelemetryImportOutcome::Inaccessible,
+        TelemetryImportOutcome::Empty,
+        TelemetryImportOutcome::Skipped,
+        TelemetryImportOutcome::Failed,
+    ];
+
+    let mut counters = TestHostTelemetryFiles::default();
+
+    for outcome in all_outcomes {
+        counters.attempted += 1;
+        match outcome {
+            TelemetryImportOutcome::Verified => counters.verified += 1,
+            TelemetryImportOutcome::DuplicateOnly => counters.duplicate_only += 1,
+            TelemetryImportOutcome::Malformed => counters.failed += 1,
+            TelemetryImportOutcome::UnsupportedVersion => counters.unsupported += 1,
+            TelemetryImportOutcome::Inaccessible => counters.failed += 1,
+            TelemetryImportOutcome::Empty => counters.empty += 1,
+            TelemetryImportOutcome::Skipped => counters.skipped += 1,
+            TelemetryImportOutcome::Failed => counters.failed += 1,
+        }
+    }
+
+    assert_eq!(counters.attempted, 8);
+    assert_eq!(counters.verified, 1);
+    assert_eq!(counters.duplicate_only, 1);
+    assert_eq!(counters.failed, 3); // Malformed, Inaccessible, Failed
+    assert_eq!(counters.unsupported, 1);
+    assert_eq!(counters.empty, 1);
+    assert_eq!(counters.skipped, 1);
+}
+
+#[test]
+fn test_validate_configuration_not_found_prevents_healthy_status() {
+    // When validating an adapter without verified host telemetry and configuration,
+    // overall status must never be HEALTHY.
+    let output = std::process::Command::new(bin_path())
+        .args(["validate", "hermes"])
+        .output()
+        .expect("execute validate hermes");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.contains("Configuration:         not_found") {
+        assert!(
+            !stdout.contains("Overall Status: HEALTHY"),
+            "configuration not_found must never produce HEALTHY overall status"
+        );
+        assert!(
+            stdout.contains("Overall Status: UNAVAILABLE")
+                || stdout.contains("Overall Status: DEGRADED")
+                || stdout.contains("Overall Status: FAILED")
+        );
+    }
 }

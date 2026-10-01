@@ -167,13 +167,13 @@ fn load_single_project_tree(connection: &Connection, project: &ProjectRow) -> Re
                     ELSE CAST(ROUND(ue.reasoning_tokens * a.weight_basis_points / 10000.0) AS INTEGER)
                 END), 0) reasoning,
                 coalesce(sum(CASE
-                    WHEN ue.id IS NULL OR ue.source_kind IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter') THEN 0
+                    WHEN ue.id IS NULL OR ue.source_kind IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter', 'hermes_snapshot_delta', 'snapshot_delta') THEN 0
                     WHEN {is_covered} THEN 0
                     WHEN ?2 = 'AlreadyInParent' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN 0
                     ELSE 1
                 END), 0) requests,
                 coalesce(sum(CASE
-                    WHEN ue.id IS NULL OR ue.source_kind IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter') THEN 0
+                    WHEN ue.id IS NULL OR ue.source_kind IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter', 'hermes_snapshot_delta', 'snapshot_delta') THEN 0
                     WHEN {is_covered} THEN 0
                     WHEN ?2 = 'AlreadyInParent' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN 0
                     WHEN ?2 = 'Unknown' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN 0
@@ -181,7 +181,7 @@ fn load_single_project_tree(connection: &Connection, project: &ProjectRow) -> Re
                     ELSE 0
                 END), 0) measured,
                 coalesce(sum(CASE
-                    WHEN ue.id IS NULL OR ue.source_kind IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter') THEN 0
+                    WHEN ue.id IS NULL OR ue.source_kind IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter', 'hermes_snapshot_delta', 'snapshot_delta') THEN 0
                     WHEN {is_covered} THEN 0
                     WHEN ?2 = 'AlreadyInParent' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN 0
                     WHEN ?2 = 'Unknown' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN 1

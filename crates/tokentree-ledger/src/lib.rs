@@ -181,7 +181,11 @@ pub fn reconcile(connection: &Connection) -> Result<ReconcileResult> {
     let sessions: i64 =
         connection.query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))?;
     let duplicate_requests: i64 = connection.query_row(
-        "SELECT count(*) FROM (SELECT request_id FROM usage_events WHERE request_id IS NOT NULL GROUP BY request_id HAVING count(*) > 1)",
+        "SELECT count(*) FROM (
+            SELECT request_id FROM usage_events
+            WHERE request_id IS NOT NULL AND source_kind NOT IN ('hermes_snapshot_delta', 'snapshot_delta')
+            GROUP BY request_id HAVING count(*) > 1
+        )",
         [],
         |row| row.get(0),
     )?;
@@ -201,7 +205,7 @@ pub fn reconcile(connection: &Connection) -> Result<ReconcileResult> {
             JOIN usage_events e2 ON e1.session_id = e2.session_id
                 AND ((e1.turn_id IS NOT NULL AND e1.turn_id = e2.turn_id) OR (e1.request_id IS NOT NULL AND e1.request_id = e2.request_id))
             WHERE e1.source_kind IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter')
-              AND e2.source_kind NOT IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter')
+              AND e2.source_kind NOT IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter', 'hermes_snapshot_delta', 'snapshot_delta')
         )",
         [],
         |row| row.get(0),
@@ -512,9 +516,9 @@ pub fn aggregate_usage_with_policy(connection: &Connection) -> Result<AggregateU
             // Child/subagent events already represented in parent totals:
             // exclude child events so parent totals are not added again.
             let query = format!(
-                "SELECT count(*),
-                 coalesce(sum(CASE WHEN input_tokens IS NOT NULL OR cached_input_tokens IS NOT NULL OR cache_write_tokens IS NOT NULL OR output_tokens IS NOT NULL OR reasoning_tokens IS NOT NULL THEN 1 ELSE 0 END),0),
-                 coalesce(sum(CASE WHEN input_tokens IS NULL AND cached_input_tokens IS NULL AND cache_write_tokens IS NULL AND output_tokens IS NULL AND reasoning_tokens IS NULL THEN 1 ELSE 0 END),0),
+                "SELECT coalesce(sum(CASE WHEN ue.source_kind IN ('hermes_snapshot_delta', 'snapshot_delta') THEN 0 ELSE 1 END), 0),
+                 coalesce(sum(CASE WHEN ue.source_kind IN ('hermes_snapshot_delta', 'snapshot_delta') THEN 0 WHEN input_tokens IS NOT NULL OR cached_input_tokens IS NOT NULL OR cache_write_tokens IS NOT NULL OR output_tokens IS NOT NULL OR reasoning_tokens IS NOT NULL THEN 1 ELSE 0 END),0),
+                 coalesce(sum(CASE WHEN ue.source_kind IN ('hermes_snapshot_delta', 'snapshot_delta') THEN 0 WHEN input_tokens IS NULL AND cached_input_tokens IS NULL AND cache_write_tokens IS NULL AND output_tokens IS NULL AND reasoning_tokens IS NULL THEN 1 ELSE 0 END),0),
                  coalesce(sum(input_tokens),0),coalesce(sum(cached_input_tokens),0),coalesce(sum(cache_write_tokens),0),coalesce(sum(output_tokens),0),coalesce(sum(reasoning_tokens),0)
                  FROM usage_events ue
                  WHERE ue.source_kind NOT IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter')
@@ -541,9 +545,9 @@ pub fn aggregate_usage_with_policy(connection: &Connection) -> Result<AggregateU
         SubagentPolicy::Independent => {
             // Independent child request events roll up exactly once.
             let query = format!(
-                "SELECT count(*),
-                 coalesce(sum(CASE WHEN input_tokens IS NOT NULL OR cached_input_tokens IS NOT NULL OR cache_write_tokens IS NOT NULL OR output_tokens IS NOT NULL OR reasoning_tokens IS NOT NULL THEN 1 ELSE 0 END),0),
-                 coalesce(sum(CASE WHEN input_tokens IS NULL AND cached_input_tokens IS NULL AND cache_write_tokens IS NULL AND output_tokens IS NULL AND reasoning_tokens IS NULL THEN 1 ELSE 0 END),0),
+                "SELECT coalesce(sum(CASE WHEN ue.source_kind IN ('hermes_snapshot_delta', 'snapshot_delta') THEN 0 ELSE 1 END), 0),
+                 coalesce(sum(CASE WHEN ue.source_kind IN ('hermes_snapshot_delta', 'snapshot_delta') THEN 0 WHEN input_tokens IS NOT NULL OR cached_input_tokens IS NOT NULL OR cache_write_tokens IS NOT NULL OR output_tokens IS NOT NULL OR reasoning_tokens IS NOT NULL THEN 1 ELSE 0 END),0),
+                 coalesce(sum(CASE WHEN ue.source_kind IN ('hermes_snapshot_delta', 'snapshot_delta') THEN 0 WHEN input_tokens IS NULL AND cached_input_tokens IS NULL AND cache_write_tokens IS NULL AND output_tokens IS NULL AND reasoning_tokens IS NULL THEN 1 ELSE 0 END),0),
                  coalesce(sum(input_tokens),0),coalesce(sum(cached_input_tokens),0),coalesce(sum(cache_write_tokens),0),coalesce(sum(output_tokens),0),coalesce(sum(reasoning_tokens),0)
                  FROM usage_events ue
                  WHERE ue.source_kind NOT IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter')
@@ -571,12 +575,14 @@ pub fn aggregate_usage_with_policy(connection: &Connection) -> Result<AggregateU
             // Parent events are measured normally.
             // Child request events are unverified, counted in requests and unavailable, tokens not added to measured totals.
             let query = format!(
-                "SELECT count(*),
+                "SELECT coalesce(sum(CASE WHEN ue.source_kind IN ('hermes_snapshot_delta', 'snapshot_delta') THEN 0 ELSE 1 END), 0),
                  coalesce(sum(CASE
+                     WHEN ue.source_kind IN ('hermes_snapshot_delta', 'snapshot_delta') THEN 0
                      WHEN {is_subagent} THEN 0
                      WHEN input_tokens IS NOT NULL OR cached_input_tokens IS NOT NULL OR cache_write_tokens IS NOT NULL OR output_tokens IS NOT NULL OR reasoning_tokens IS NOT NULL THEN 1
                      ELSE 0 END), 0),
                  coalesce(sum(CASE
+                     WHEN ue.source_kind IN ('hermes_snapshot_delta', 'snapshot_delta') THEN 0
                      WHEN {is_subagent} THEN 1
                      WHEN input_tokens IS NULL AND cached_input_tokens IS NULL AND cache_write_tokens IS NULL AND output_tokens IS NULL AND reasoning_tokens IS NULL THEN 1
                      ELSE 0 END), 0),

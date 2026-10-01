@@ -215,10 +215,10 @@ fn test_hermes_state_db_read_only_snapshot_safe_and_idempotent_growth() {
     assert_eq!(res1.inserted, 2);
     assert_eq!(res1.duplicates, 0);
 
-    // 2. Immediate re-import without DB changes: 0 inserted, 0 duplicates
+    // 2. Immediate re-import without DB changes: 0 inserted, 2 rows recognized as duplicates via row checkpoints
     let res2 = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
     assert_eq!(res2.inserted, 0);
-    assert_eq!(res2.duplicates, 0);
+    assert_eq!(res2.duplicates, 2);
 
     // 3. Hermes appends 2 new rows while running (database grows)
     {
@@ -238,10 +238,10 @@ fn test_hermes_state_db_read_only_snapshot_safe_and_idempotent_growth() {
     assert_eq!(res3.inserted, 2);
     assert_eq!(res3.duplicates, 2);
 
-    // 5. Fourth import without changes: 0 inserted
+    // 5. Fourth import without changes: 0 inserted, all 4 rows recognized as duplicates
     let res4 = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
     assert_eq!(res4.inserted, 0);
-    assert_eq!(res4.duplicates, 0);
+    assert_eq!(res4.duplicates, 4);
 
     // 6. Verify ledger total usage events is exactly 4
     let total_evts: i64 = ledger
@@ -576,6 +576,321 @@ fn test_hermes_state_db_replacement_and_truncation() {
         )
         .unwrap();
     assert_eq!(total_evts, 2);
+}
+
+#[test]
+fn test_hermes_wal_mode_commits_ingested_when_db_file_unchanged_and_zero_mutation() {
+    use sha2::{Digest, Sha256};
+    let dir = tempdir().unwrap();
+    let state_db_path = dir.path().join("hermes_wal.db");
+
+    // Initialize in WAL mode
+    {
+        let conn = rusqlite::Connection::open(&state_db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT);
+             CREATE TABLE session_model_usage (
+                 session_id TEXT NOT NULL, model TEXT NOT NULL, billing_provider TEXT DEFAULT '',
+                 task TEXT DEFAULT '', api_call_count INTEGER DEFAULT 1, input_tokens INTEGER DEFAULT 0,
+                 output_tokens INTEGER DEFAULT 0, cache_read_tokens INTEGER DEFAULT 0,
+                 cache_write_tokens INTEGER DEFAULT 0, reasoning_tokens INTEGER DEFAULT 0,
+                 estimated_cost_usd REAL, actual_cost_usd REAL, cost_status TEXT, cost_source TEXT,
+                 first_seen REAL, last_seen REAL, PRIMARY KEY (session_id, model, task)
+             );
+             INSERT INTO sessions VALUES ('ses_wal_1', NULL);
+             INSERT INTO session_model_usage (session_id, model, task, input_tokens, output_tokens, estimated_cost_usd, first_seen, last_seen)
+             VALUES ('ses_wal_1', 'liquid/lfm-2.5-2.6b:free', '', 100, 10, 0.0, 10.0, 10.0);
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        ).unwrap();
+    }
+
+    let ledger_path = dir.path().join("ledger.db");
+    let mut ledger = Ledger::open(&ledger_path).unwrap();
+
+    let res1 = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
+    assert_eq!(res1.inserted, 1);
+
+    // Open writer connection with wal_autocheckpoint = 0 and keep it alive,
+    // exactly simulating an active running Hermes agent process committing to WAL
+    let writer_conn = rusqlite::Connection::open(&state_db_path).unwrap();
+    writer_conn
+        .execute_batch("PRAGMA wal_autocheckpoint = 0;")
+        .unwrap();
+
+    let db_bytes_before = std::fs::read(&state_db_path).unwrap();
+    let db_hash_before = hex::encode(Sha256::digest(&db_bytes_before));
+
+    // Commit a new row into SQLite that goes into the WAL file
+    writer_conn.execute_batch(
+        "INSERT INTO sessions VALUES ('ses_wal_2', NULL);
+         INSERT INTO session_model_usage (session_id, model, task, input_tokens, output_tokens, estimated_cost_usd, first_seen, last_seen)
+         VALUES ('ses_wal_2', 'openai/gpt-4o', '', 250, 25, 0.002, 20.0, 20.0);",
+    ).unwrap();
+
+    // Verify main DB file bytes remain unchanged (commit resides in WAL)
+    let db_bytes_during = std::fs::read(&state_db_path).unwrap();
+    let db_hash_during = hex::encode(Sha256::digest(&db_bytes_during));
+    assert_eq!(
+        db_hash_before, db_hash_during,
+        "state.db file hash must be identical because commit is in WAL"
+    );
+
+    let wal_path = dir.path().join("hermes_wal.db-wal");
+    assert!(wal_path.exists(), "WAL file must exist");
+    let wal_bytes_before = std::fs::read(&wal_path).unwrap();
+    let wal_hash_before = hex::encode(Sha256::digest(&wal_bytes_before));
+
+    // Ingest with TokenTree
+    let res2 = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
+    assert_eq!(
+        res2.inserted, 1,
+        "TokenTree must ingest WAL commit even though state.db main file was unchanged"
+    );
+    assert_eq!(
+        res2.duplicates, 1,
+        "Initial row must be recognized as duplicate"
+    );
+
+    // Verify neither state.db nor state.db-wal was mutated by TokenTree
+    let db_bytes_after = std::fs::read(&state_db_path).unwrap();
+    let db_hash_after = hex::encode(Sha256::digest(&db_bytes_after));
+    assert_eq!(
+        db_hash_during, db_hash_after,
+        "state.db must not be mutated"
+    );
+
+    let wal_bytes_after = std::fs::read(&wal_path).unwrap();
+    let wal_hash_after = hex::encode(Sha256::digest(&wal_bytes_after));
+    assert_eq!(
+        wal_hash_before, wal_hash_after,
+        "state.db-wal must not be mutated"
+    );
+}
+
+#[test]
+fn test_hermes_snapshot_delta_category_redistribution_and_token_regression_anomaly() {
+    let dir = tempdir().unwrap();
+    let state_db_path = dir.path().join("hermes_regression.db");
+
+    // 1. Initial state: 80 input tokens, 20 output tokens (total = 100)
+    {
+        let conn = rusqlite::Connection::open(&state_db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT);
+             CREATE TABLE session_model_usage (
+                 session_id TEXT NOT NULL, model TEXT NOT NULL, billing_provider TEXT DEFAULT '',
+                 task TEXT DEFAULT '', api_call_count INTEGER DEFAULT 1, input_tokens INTEGER DEFAULT 0,
+                 output_tokens INTEGER DEFAULT 0, cache_read_tokens INTEGER DEFAULT 0,
+                 cache_write_tokens INTEGER DEFAULT 0, reasoning_tokens INTEGER DEFAULT 0,
+                 estimated_cost_usd REAL, actual_cost_usd REAL, cost_status TEXT, cost_source TEXT,
+                 first_seen REAL, last_seen REAL, PRIMARY KEY (session_id, model, task)
+             );
+             INSERT INTO sessions VALUES ('ses_redist', NULL);
+             INSERT INTO session_model_usage (session_id, model, task, input_tokens, output_tokens, estimated_cost_usd, first_seen, last_seen)
+             VALUES ('ses_redist', 'liquid/lfm-2.5-2.6b:free', '', 80, 20, 0.0, 10.0, 10.0);",
+        ).unwrap();
+    }
+
+    let ledger_path = dir.path().join("ledger.db");
+    let mut ledger = Ledger::open(&ledger_path).unwrap();
+
+    let res1 = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
+    assert_eq!(res1.inserted, 1);
+    assert_eq!(res1.anomalies, 0);
+
+    // 2. Category redistribution: total remains 100, but input regresses 80 -> 70 while output increases 20 -> 30
+    {
+        let conn = rusqlite::Connection::open(&state_db_path).unwrap();
+        conn.execute(
+            "UPDATE session_model_usage SET input_tokens = 70, output_tokens = 30 WHERE session_id = 'ses_redist'",
+            [],
+        ).unwrap();
+    }
+
+    let res2 = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
+    assert_eq!(
+        res2.inserted, 0,
+        "must not emit delta when category regresses"
+    );
+    assert_eq!(
+        res2.anomalies, 1,
+        "must record token_category_regression anomaly"
+    );
+
+    let anom_type: String = ledger
+        .connection()
+        .query_row(
+            "SELECT type FROM measurement_anomalies WHERE type = 'token_category_regression' LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(anom_type, "token_category_regression");
+
+    // 3. Token reset regression: input drops from 80 to 20
+    {
+        let conn = rusqlite::Connection::open(&state_db_path).unwrap();
+        conn.execute(
+            "UPDATE session_model_usage SET input_tokens = 20, output_tokens = 10 WHERE session_id = 'ses_redist'",
+            [],
+        ).unwrap();
+    }
+
+    let res3 = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
+    assert_eq!(res3.inserted, 0, "reset must not emit delta or clamp");
+    assert_eq!(res3.anomalies, 1);
+}
+
+#[test]
+fn test_hermes_snapshot_delta_cost_growth_and_cost_regression_anomaly() {
+    let dir = tempdir().unwrap();
+    let state_db_path = dir.path().join("hermes_cost.db");
+
+    // 1. Initial row with cost $0.010 = 10,000 micros
+    {
+        let conn = rusqlite::Connection::open(&state_db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT);
+             CREATE TABLE session_model_usage (
+                 session_id TEXT NOT NULL, model TEXT NOT NULL, billing_provider TEXT DEFAULT '',
+                 task TEXT DEFAULT '', api_call_count INTEGER DEFAULT 1, input_tokens INTEGER DEFAULT 0,
+                 output_tokens INTEGER DEFAULT 0, cache_read_tokens INTEGER DEFAULT 0,
+                 cache_write_tokens INTEGER DEFAULT 0, reasoning_tokens INTEGER DEFAULT 0,
+                 estimated_cost_usd REAL, actual_cost_usd REAL, cost_status TEXT, cost_source TEXT,
+                 first_seen REAL, last_seen REAL, PRIMARY KEY (session_id, model, task)
+             );
+             INSERT INTO sessions VALUES ('ses_cost', NULL);
+             INSERT INTO session_model_usage (session_id, model, task, input_tokens, output_tokens, actual_cost_usd, first_seen, last_seen)
+             VALUES ('ses_cost', 'openai/gpt-4o', '', 1000, 100, 0.010, 10.0, 10.0);",
+        ).unwrap();
+    }
+
+    let ledger_path = dir.path().join("ledger.db");
+    let mut ledger = Ledger::open(&ledger_path).unwrap();
+
+    let res1 = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
+    assert_eq!(res1.inserted, 1);
+
+    // 2. Growth: tokens grow by 500 in, 50 out; cost increases to $0.016 (16,000 micros)
+    {
+        let conn = rusqlite::Connection::open(&state_db_path).unwrap();
+        conn.execute(
+            "UPDATE session_model_usage SET input_tokens = 1500, output_tokens = 150, actual_cost_usd = 0.016 WHERE session_id = 'ses_cost'",
+            [],
+        ).unwrap();
+    }
+
+    let res2 = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
+    assert_eq!(res2.inserted, 1, "delta must be emitted");
+
+    // Verify delta cost is 6,000 micros (delta only), NOT 16,000 micros
+    let delta_cost: Option<i64> = ledger
+        .connection()
+        .query_row(
+            "SELECT provider_reported_cost_micros FROM usage_events WHERE source_kind = 'hermes_snapshot_delta'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        delta_cost,
+        Some(6000),
+        "delta cost must be exactly the difference (6,000 micros), never cloned"
+    );
+
+    // 3. Cost regression: cost unexpectedly drops to $0.005 (5,000 micros < 16,000 micros)
+    {
+        let conn = rusqlite::Connection::open(&state_db_path).unwrap();
+        conn.execute(
+            "UPDATE session_model_usage SET actual_cost_usd = 0.005 WHERE session_id = 'ses_cost'",
+            [],
+        )
+        .unwrap();
+    }
+
+    let res3 = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
+    assert_eq!(res3.inserted, 0, "cost regression must not emit delta");
+    assert_eq!(
+        res3.anomalies, 1,
+        "must record provider_cost_regression anomaly"
+    );
+
+    let anom_type: String = ledger
+        .connection()
+        .query_row(
+            "SELECT type FROM measurement_anomalies WHERE type = 'provider_cost_regression' LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(anom_type, "provider_cost_regression");
+}
+
+#[test]
+fn test_hermes_restart_preserves_row_checkpoints_and_reconciliation() {
+    let dir = tempdir().unwrap();
+    let state_db_path = dir.path().join("hermes_restart.db");
+
+    {
+        let conn = rusqlite::Connection::open(&state_db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT);
+             CREATE TABLE session_model_usage (
+                 session_id TEXT NOT NULL, model TEXT NOT NULL, billing_provider TEXT DEFAULT '',
+                 task TEXT DEFAULT '', api_call_count INTEGER DEFAULT 1, input_tokens INTEGER DEFAULT 0,
+                 output_tokens INTEGER DEFAULT 0, cache_read_tokens INTEGER DEFAULT 0,
+                 cache_write_tokens INTEGER DEFAULT 0, reasoning_tokens INTEGER DEFAULT 0,
+                 estimated_cost_usd REAL, actual_cost_usd REAL, cost_status TEXT, cost_source TEXT,
+                 first_seen REAL, last_seen REAL, PRIMARY KEY (session_id, model, task)
+             );
+             INSERT INTO sessions VALUES ('ses_restart', NULL);
+             INSERT INTO session_model_usage (session_id, model, task, input_tokens, output_tokens, estimated_cost_usd, first_seen, last_seen)
+             VALUES ('ses_restart', 'openai/gpt-4o', '', 1000, 100, 0.010, 10.0, 10.0);",
+        ).unwrap();
+    }
+
+    let ledger_path = dir.path().join("ledger.db");
+    {
+        let mut ledger = Ledger::open(&ledger_path).unwrap();
+        let res1 = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
+        assert_eq!(res1.inserted, 1);
+    } // Ledger closes
+
+    // Source row updates while ledger was offline
+    {
+        let conn = rusqlite::Connection::open(&state_db_path).unwrap();
+        conn.execute(
+            "UPDATE session_model_usage SET input_tokens = 1400, output_tokens = 140 WHERE session_id = 'ses_restart'",
+            [],
+        ).unwrap();
+    }
+
+    // Ledger reopens (simulating process restart)
+    {
+        let mut ledger = Ledger::open(&ledger_path).unwrap();
+        let res2 = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
+        assert_eq!(
+            res2.inserted, 1,
+            "restarted ledger must use persisted row checkpoints to emit delta"
+        );
+
+        // Verify total tokens: 1000 + 100 + 400 + 40 = 1540
+        let total_tokens: i64 = ledger
+            .connection()
+            .query_row(
+                "SELECT sum(coalesce(input_tokens, 0) + coalesce(output_tokens, 0)) FROM usage_events WHERE adapter = 'hermes'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(total_tokens, 1540);
+
+        // Verify reconciliation: requests count as 1, 0 duplicate requests
+        let recon = ledger.reconcile().unwrap();
+        assert_eq!(recon.duplicate_request_ids, 0);
+        assert_eq!(recon.duplicate_subagent_counters, 0);
+    }
 }
 
 fn parse_session_file(path: &Path) -> anyhow::Result<ParseResult> {

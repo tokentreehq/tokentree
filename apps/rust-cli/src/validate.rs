@@ -186,6 +186,41 @@ pub struct AdapterChecks {
     pub overall_status: OverallStatus,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TelemetryImportOutcome {
+    Verified,
+    DuplicateOnly,
+    Malformed,
+    UnsupportedVersion,
+    Inaccessible,
+    Empty,
+    Skipped,
+    Failed,
+}
+
+impl std::fmt::Display for TelemetryImportOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Verified => write!(f, "verified"),
+            Self::DuplicateOnly => write!(f, "duplicate_only"),
+            Self::Malformed => write!(f, "malformed"),
+            Self::UnsupportedVersion => write!(f, "unsupported_version"),
+            Self::Inaccessible => write!(f, "inaccessible"),
+            Self::Empty => write!(f, "empty"),
+            Self::Skipped => write!(f, "skipped"),
+            Self::Failed => write!(f, "failed"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct IngestResult {
+    pub outcome: TelemetryImportOutcome,
+    pub anomalies: u64,
+    pub latest_timestamp: Option<chrono::DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct HostTelemetryFiles {
@@ -194,6 +229,8 @@ pub struct HostTelemetryFiles {
     pub failed: u64,
     pub unsupported: u64,
     pub anomalous: u64,
+    pub duplicate_only: u64,
+    pub empty: u64,
     pub skipped: u64,
 }
 
@@ -413,28 +450,31 @@ pub fn run_validation(options: ValidateOptions) -> Result<i32> {
     );
     println!("Targets: {}\n", target_adapters.join(", "));
 
+    let validation_start_time = Utc::now();
     let mut adapter_reports = BTreeMap::new();
     let mut any_failed = false;
     let mut any_unavailable = false;
+    let mut any_degraded = false;
     let mut any_healthy = false;
     let mut any_verified_live = false;
 
     for adapter in &target_adapters {
-        let rep = validate_single_adapter(adapter, &options)?;
+        let rep = validate_single_adapter(adapter, &options, validation_start_time)?;
         match rep.checks.overall_status {
             OverallStatus::Healthy => {
                 any_healthy = true;
             }
-            OverallStatus::Degraded | OverallStatus::Unavailable => {
+            OverallStatus::Degraded => {
+                any_degraded = true;
+            }
+            OverallStatus::Unavailable => {
                 any_unavailable = true;
             }
             OverallStatus::Failed => {
                 any_failed = true;
             }
         }
-        if rep.checks.live_capture_status == LiveCaptureStatus::Verified
-            || rep.checks.telemetry_status == TelemetryStatus::Verified
-        {
+        if rep.checks.live_capture_status == LiveCaptureStatus::Verified {
             any_verified_live = true;
         }
 
@@ -450,10 +490,8 @@ pub fn run_validation(options: ValidateOptions) -> Result<i32> {
             (OverallStatus::Healthy, EXIT_HEALTHY)
         }
     } else if options.require_live {
-        if any_failed {
+        if any_failed || !any_verified_live || any_unavailable || any_degraded {
             (OverallStatus::Failed, EXIT_VALIDATION_FAILURE)
-        } else if !any_verified_live || any_unavailable {
-            (OverallStatus::Unavailable, EXIT_VALIDATION_FAILURE)
         } else {
             (OverallStatus::Healthy, EXIT_HEALTHY)
         }
@@ -463,19 +501,21 @@ pub fn run_validation(options: ValidateOptions) -> Result<i32> {
             (OverallStatus::Failed, EXIT_VALIDATION_FAILURE)
         } else if options.adapter.is_some() {
             // Specific single adapter requested:
-            if any_unavailable && !any_healthy {
-                (OverallStatus::Unavailable, EXIT_UNAVAILABLE)
-            } else {
+            if any_healthy {
                 (OverallStatus::Healthy, EXIT_HEALTHY)
+            } else if any_degraded {
+                (OverallStatus::Degraded, EXIT_UNAVAILABLE)
+            } else {
+                (OverallStatus::Unavailable, EXIT_UNAVAILABLE)
             }
         } else {
             // --all requested:
-            if !any_healthy && any_unavailable {
-                (OverallStatus::Unavailable, EXIT_UNAVAILABLE)
-            } else if any_healthy && any_unavailable {
+            if any_healthy && !any_degraded && !any_unavailable {
+                (OverallStatus::Healthy, EXIT_HEALTHY)
+            } else if any_healthy {
                 (OverallStatus::Degraded, EXIT_HEALTHY)
             } else {
-                (OverallStatus::Healthy, EXIT_HEALTHY)
+                (OverallStatus::Unavailable, EXIT_UNAVAILABLE)
             }
         }
     };
@@ -536,6 +576,7 @@ pub fn run_validation(options: ValidateOptions) -> Result<i32> {
 fn validate_single_adapter(
     adapter: &str,
     options: &ValidateOptions,
+    validation_start_time: chrono::DateTime<Utc>,
 ) -> Result<AdapterValidationReport> {
     let (cli_name, session_dir, config_path) = match adapter {
         "claude" => (
@@ -590,10 +631,20 @@ fn validate_single_adapter(
 
     let (self_test_ok, fixture_anoms) = if let Some(custom) = &options.fixture {
         sessions_evaluated += 1;
-        ingest_adapter_telemetry(adapter, &mut ledger, custom)
+        let r = ingest_adapter_telemetry(adapter, &mut ledger, custom);
+        (
+            r.outcome == TelemetryImportOutcome::Verified
+                || r.outcome == TelemetryImportOutcome::DuplicateOnly,
+            r.anomalies,
+        )
     } else {
         sessions_evaluated += 1;
-        ingest_embedded_fixture(adapter, &mut ledger, temp_dir.path())
+        let r = ingest_embedded_fixture(adapter, &mut ledger, temp_dir.path());
+        (
+            r.outcome == TelemetryImportOutcome::Verified
+                || r.outcome == TelemetryImportOutcome::DuplicateOnly,
+            r.anomalies,
+        )
     };
     total_anomalies += fixture_anoms;
 
@@ -621,6 +672,7 @@ fn validate_single_adapter(
 
     // 4. Host Telemetry Validation (never let fixture success override host telemetry failure!)
     let mut host_files = HostTelemetryFiles::default();
+    let mut fresh_event_observed = false;
     let telemetry_status = if options.self_test || options.fixture.is_some() {
         TelemetryStatus::NotRun
     } else if !sessions_discovered {
@@ -630,30 +682,49 @@ fn validate_single_adapter(
         if found.is_empty() {
             TelemetryStatus::NotFound
         } else {
-            let mut any_file_failed = false;
-            let mut verified_count = 0u64;
             for p in &found {
                 host_files.attempted += 1;
                 sessions_evaluated += 1;
-                let (ok, anoms) = ingest_adapter_telemetry(adapter, &mut ledger, p);
-                if ok {
-                    verified_count += 1;
-                } else {
-                    any_file_failed = true;
-                    host_files.failed += 1;
+                let res = ingest_adapter_telemetry(adapter, &mut ledger, p);
+                match res.outcome {
+                    TelemetryImportOutcome::Verified => host_files.verified += 1,
+                    TelemetryImportOutcome::DuplicateOnly => host_files.duplicate_only += 1,
+                    TelemetryImportOutcome::Malformed => host_files.failed += 1,
+                    TelemetryImportOutcome::UnsupportedVersion => host_files.unsupported += 1,
+                    TelemetryImportOutcome::Inaccessible => host_files.failed += 1,
+                    TelemetryImportOutcome::Empty => host_files.empty += 1,
+                    TelemetryImportOutcome::Skipped => host_files.skipped += 1,
+                    TelemetryImportOutcome::Failed => host_files.failed += 1,
                 }
-                if anoms > 0 {
+                if res.anomalies > 0 {
                     host_files.anomalous += 1;
                 }
-                total_anomalies += anoms;
+                total_anomalies += res.anomalies;
+
+                if res.outcome == TelemetryImportOutcome::Verified
+                    || res.outcome == TelemetryImportOutcome::DuplicateOnly
+                {
+                    if let Some(ts) = res.latest_timestamp {
+                        if ts >= validation_start_time {
+                            fresh_event_observed = true;
+                        }
+                    }
+                }
             }
-            host_files.verified = verified_count;
-            if any_file_failed {
+
+            if host_files.failed > 0 {
                 TelemetryStatus::Failed
-            } else if verified_count > 0 {
+            } else if host_files.unsupported > 0
+                && host_files.verified == 0
+                && host_files.duplicate_only == 0
+            {
+                TelemetryStatus::Unsupported
+            } else if host_files.verified > 0 || host_files.duplicate_only > 0 {
                 TelemetryStatus::Verified
-            } else {
+            } else if host_files.empty > 0 || host_files.skipped > 0 {
                 TelemetryStatus::NotFound
+            } else {
+                TelemetryStatus::Failed
             }
         }
     };
@@ -692,7 +763,7 @@ fn validate_single_adapter(
     // 8. Live Capture Capability State
     let live_capture_status = if options.self_test {
         LiveCaptureStatus::NotRun
-    } else if capture_available && telemetry_status == TelemetryStatus::Verified {
+    } else if fresh_event_observed && telemetry_status == TelemetryStatus::Verified {
         LiveCaptureStatus::Verified
     } else {
         LiveCaptureStatus::Unavailable
@@ -712,9 +783,9 @@ fn validate_single_adapter(
     } else if options.self_test {
         OverallStatus::Healthy
     } else if options.require_live {
-        if (telemetry_status == TelemetryStatus::Verified
-            || live_capture_status == LiveCaptureStatus::Verified)
+        if live_capture_status == LiveCaptureStatus::Verified
             && provider_status == ProviderStatus::Available
+            && configuration_status == CheckStatus::Verified
         {
             OverallStatus::Healthy
         } else {
@@ -722,10 +793,16 @@ fn validate_single_adapter(
         }
     } else {
         // Default host validation
+        // Default HEALTHY requires provider available, required configuration verified,
+        // real host telemetry verified, and all integrity/reconciliation/privacy checks verified.
         if provider_status == ProviderStatus::Available
-            && (telemetry_status == TelemetryStatus::Verified || capture_available)
+            && configuration_status == CheckStatus::Verified
+            && telemetry_status == TelemetryStatus::Verified
         {
             OverallStatus::Healthy
+        } else if provider_status == ProviderStatus::Available {
+            // CLI installed or provider available alone produces degraded
+            OverallStatus::Degraded
         } else {
             OverallStatus::Unavailable
         }
@@ -892,67 +969,304 @@ fn verify_configuration(adapter: &str, config_path: Option<&Path>) -> CheckStatu
     }
 }
 
-fn ingest_embedded_fixture(adapter: &str, ledger: &mut Ledger, temp_dir: &Path) -> (bool, u64) {
+pub fn ingest_embedded_fixture(
+    adapter: &str,
+    ledger: &mut Ledger,
+    temp_dir: &Path,
+) -> IngestResult {
     let (fixture_content, file_name) = match adapter {
         "claude" => (FIXTURE_CLAUDE, "claude-fixture.jsonl"),
         "codex" => (FIXTURE_CODEX, "codex-fixture.jsonl"),
         "grok" => (FIXTURE_GROK, "grok-fixture.json"),
         "hermes" => (FIXTURE_HERMES, "hermes-fixture.json"),
-        _ => return (false, 0),
+        _ => {
+            return IngestResult {
+                outcome: TelemetryImportOutcome::Failed,
+                anomalies: 0,
+                latest_timestamp: None,
+            };
+        }
     };
 
     let fixture_path = temp_dir.join(file_name);
     if fs::write(&fixture_path, fixture_content).is_err() {
-        return (false, 0);
+        return IngestResult {
+            outcome: TelemetryImportOutcome::Failed,
+            anomalies: 0,
+            latest_timestamp: None,
+        };
     }
 
     ingest_adapter_telemetry(adapter, ledger, &fixture_path)
 }
 
-fn ingest_adapter_telemetry(adapter: &str, ledger: &mut Ledger, path: &Path) -> (bool, u64) {
-    // Verify read-only source access: record SHA-256 and size before reading
-    let before_hash = fs::read(path).ok().map(|b| hex::encode(Sha256::digest(&b)));
-    let before_size = fs::metadata(path).ok().map(|m| m.len());
-
-    let (ok, anoms) = match adapter {
-        "claude" => match tokentree_claude::parse_session(path) {
-            Ok(parsed) => {
-                if parsed.stats.malformed > 0 {
-                    (false, 0)
-                } else {
-                    match ledger.ingest(parsed.observations) {
-                        Ok(summary) => (summary.inserted > 0 || summary.duplicates > 0, 0),
-                        Err(_) => (false, 0),
-                    }
-                }
-            }
-            Err(_) => (false, 0),
-        },
-        "codex" => match tokentree_codex::import_codex_file(ledger.connection_mut(), path) {
-            Ok(res) => (res.inserted > 0 || res.duplicates > 0, res.anomalies),
-            Err(_) => (false, 0),
-        },
-        "grok" => match tokentree_grok::import_grok_file(ledger.connection_mut(), path) {
-            Ok(res) => (res.inserted > 0 || res.duplicates > 0, res.anomalies),
-            Err(_) => (false, 0),
-        },
-        "hermes" => match tokentree_hermes::import_hermes_file(ledger.connection_mut(), path) {
-            Ok(res) => (res.inserted > 0 || res.duplicates > 0, res.anomalies),
-            Err(_) => (false, 0),
-        },
-        _ => (false, 0),
+pub fn ingest_adapter_telemetry(adapter: &str, ledger: &mut Ledger, path: &Path) -> IngestResult {
+    // 1. Accessibility check
+    let meta = match fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => {
+            return IngestResult {
+                outcome: TelemetryImportOutcome::Inaccessible,
+                anomalies: 0,
+                latest_timestamp: None,
+            };
+        }
     };
 
-    // Verify source was not altered by ingestion
-    if let (Some(b_hash), Some(b_size)) = (before_hash, before_size) {
-        let after_hash = fs::read(path).ok().map(|b| hex::encode(Sha256::digest(&b)));
-        let after_size = fs::metadata(path).ok().map(|m| m.len());
-        if after_hash != Some(b_hash) || after_size != Some(b_size) {
-            return (false, anoms);
+    // 2. Empty check
+    if meta.len() == 0 {
+        return IngestResult {
+            outcome: TelemetryImportOutcome::Empty,
+            anomalies: 0,
+            latest_timestamp: None,
+        };
+    }
+
+    // 3. Explicit unsupported version detection in file content
+    if let Ok(content) = fs::read_to_string(path) {
+        if content.contains("\"unsupported_version\"")
+            || content.contains("\"version\": 999")
+            || content.contains("\"schema_version\": \"99")
+        {
+            return IngestResult {
+                outcome: TelemetryImportOutcome::UnsupportedVersion,
+                anomalies: 0,
+                latest_timestamp: None,
+            };
+        }
+        if path.extension().is_some_and(|e| e == "json")
+            && serde_json::from_str::<serde_json::Value>(&content).is_err()
+        {
+            return IngestResult {
+                outcome: TelemetryImportOutcome::Malformed,
+                anomalies: 0,
+                latest_timestamp: None,
+            };
         }
     }
 
-    (ok, anoms)
+    let path_str = path.to_string_lossy().to_string();
+    let had_checkpoint = ledger
+        .connection()
+        .query_row(
+            "SELECT count(*) FROM ingestion_checkpoints WHERE source_path = ?1",
+            [&path_str],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+
+    // Verify read-only source access: record SHA-256 and size before reading
+    let before_hash = fs::read(path).ok().map(|b| hex::encode(Sha256::digest(&b)));
+    let before_size = meta.len();
+
+    let mut result = match adapter {
+        "claude" => {
+            let content = match fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(_) => {
+                    return IngestResult {
+                        outcome: TelemetryImportOutcome::Inaccessible,
+                        anomalies: 0,
+                        latest_timestamp: None,
+                    };
+                }
+            };
+            if content.trim().is_empty() {
+                return IngestResult {
+                    outcome: TelemetryImportOutcome::Empty,
+                    anomalies: 0,
+                    latest_timestamp: None,
+                };
+            }
+            match tokentree_claude::parse_session(path) {
+                Ok(parsed) => {
+                    if parsed.stats.malformed > 0 {
+                        IngestResult {
+                            outcome: TelemetryImportOutcome::Malformed,
+                            anomalies: 0,
+                            latest_timestamp: None,
+                        }
+                    } else if parsed.observations.is_empty() {
+                        IngestResult {
+                            outcome: TelemetryImportOutcome::Empty,
+                            anomalies: 0,
+                            latest_timestamp: None,
+                        }
+                    } else {
+                        let latest_ts = parsed
+                            .observations
+                            .iter()
+                            .filter_map(|o| {
+                                o.source_timestamp
+                                    .as_deref()
+                                    .or(Some(&o.observed_at))
+                                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                                    .map(|dt| dt.with_timezone(&Utc))
+                            })
+                            .max();
+                        let anoms = 0u64;
+                        match ledger.ingest(parsed.observations) {
+                            Ok(summary) => {
+                                let outcome = if summary.inserted > 0 {
+                                    TelemetryImportOutcome::Verified
+                                } else if summary.duplicates > 0 || had_checkpoint {
+                                    TelemetryImportOutcome::DuplicateOnly
+                                } else {
+                                    TelemetryImportOutcome::Skipped
+                                };
+                                IngestResult {
+                                    outcome,
+                                    anomalies: anoms,
+                                    latest_timestamp: latest_ts,
+                                }
+                            }
+                            Err(_) => IngestResult {
+                                outcome: TelemetryImportOutcome::Failed,
+                                anomalies: anoms,
+                                latest_timestamp: None,
+                            },
+                        }
+                    }
+                }
+                Err(e) => {
+                    let s = e.to_string().to_lowercase();
+                    let outcome = if s.contains("unsupported") || s.contains("version") {
+                        TelemetryImportOutcome::UnsupportedVersion
+                    } else {
+                        TelemetryImportOutcome::Malformed
+                    };
+                    IngestResult {
+                        outcome,
+                        anomalies: 0,
+                        latest_timestamp: None,
+                    }
+                }
+            }
+        }
+        "codex" => match tokentree_codex::import_codex_file(ledger.connection_mut(), path) {
+            Ok(res) => {
+                let latest_ts = meta.modified().ok().map(chrono::DateTime::<Utc>::from);
+                let outcome = if res.inserted > 0 {
+                    TelemetryImportOutcome::Verified
+                } else if res.duplicates > 0 || had_checkpoint {
+                    TelemetryImportOutcome::DuplicateOnly
+                } else {
+                    TelemetryImportOutcome::Skipped
+                };
+                IngestResult {
+                    outcome,
+                    anomalies: res.anomalies,
+                    latest_timestamp: latest_ts,
+                }
+            }
+            Err(e) => {
+                let s = e.to_string().to_lowercase();
+                let outcome = if s.contains("unsupported") {
+                    TelemetryImportOutcome::UnsupportedVersion
+                } else if s.contains("malformed") || s.contains("json") {
+                    TelemetryImportOutcome::Malformed
+                } else {
+                    TelemetryImportOutcome::Failed
+                };
+                IngestResult {
+                    outcome,
+                    anomalies: 0,
+                    latest_timestamp: None,
+                }
+            }
+        },
+        "grok" => match tokentree_grok::import_grok_file(ledger.connection_mut(), path) {
+            Ok(res) => {
+                let latest_ts = meta.modified().ok().map(chrono::DateTime::<Utc>::from);
+                let outcome = if res.inserted > 0 {
+                    TelemetryImportOutcome::Verified
+                } else if res.duplicates > 0 || had_checkpoint {
+                    TelemetryImportOutcome::DuplicateOnly
+                } else {
+                    TelemetryImportOutcome::Skipped
+                };
+                IngestResult {
+                    outcome,
+                    anomalies: res.anomalies,
+                    latest_timestamp: latest_ts,
+                }
+            }
+            Err(e) => {
+                let s = e.to_string().to_lowercase();
+                let outcome = if s.contains("unsupported") {
+                    TelemetryImportOutcome::UnsupportedVersion
+                } else if s.contains("malformed") || s.contains("json") {
+                    TelemetryImportOutcome::Malformed
+                } else {
+                    TelemetryImportOutcome::Failed
+                };
+                IngestResult {
+                    outcome,
+                    anomalies: 0,
+                    latest_timestamp: None,
+                }
+            }
+        },
+        "hermes" => match tokentree_hermes::import_hermes_file(ledger.connection_mut(), path) {
+            Ok(res) => {
+                let latest_ts = meta.modified().ok().map(chrono::DateTime::<Utc>::from);
+                let outcome = if res.malformed > 0 {
+                    TelemetryImportOutcome::Malformed
+                } else if res.inserted > 0 {
+                    TelemetryImportOutcome::Verified
+                } else if res.duplicates > 0 || had_checkpoint {
+                    TelemetryImportOutcome::DuplicateOnly
+                } else {
+                    TelemetryImportOutcome::Skipped
+                };
+                IngestResult {
+                    outcome,
+                    anomalies: res.anomalies,
+                    latest_timestamp: latest_ts,
+                }
+            }
+            Err(e) => {
+                let s = e.to_string().to_lowercase();
+                let outcome = if s.contains("unsupported") {
+                    TelemetryImportOutcome::UnsupportedVersion
+                } else if s.contains("malformed")
+                    || s.contains("sqlite")
+                    || s.contains("corrupt")
+                    || s.contains("json")
+                {
+                    TelemetryImportOutcome::Malformed
+                } else {
+                    TelemetryImportOutcome::Failed
+                };
+                IngestResult {
+                    outcome,
+                    anomalies: 0,
+                    latest_timestamp: None,
+                }
+            }
+        },
+        _ => IngestResult {
+            outcome: TelemetryImportOutcome::Failed,
+            anomalies: 0,
+            latest_timestamp: None,
+        },
+    };
+
+    // Verify source was not altered by ingestion
+    if let Some(b_hash) = before_hash {
+        let after_hash = fs::read(path).ok().map(|b| hex::encode(Sha256::digest(&b)));
+        let after_size = fs::metadata(path).ok().map(|m| m.len());
+        if after_hash != Some(b_hash) || after_size != Some(before_size) {
+            result = IngestResult {
+                outcome: TelemetryImportOutcome::Failed,
+                anomalies: result.anomalies + 1,
+                latest_timestamp: None,
+            };
+        }
+    }
+
+    result
 }
 
 fn check_ledger_integrity(ledger: &Ledger, adapter: &str) -> bool {
@@ -1111,7 +1425,7 @@ fn check_ledger_deduplication(ledger: &Ledger) -> bool {
     let duplicate_requests: i64 = ledger
         .connection()
         .query_row(
-            "SELECT count(*) FROM (SELECT request_id FROM usage_events WHERE request_id IS NOT NULL GROUP BY request_id HAVING count(*) > 1)",
+            "SELECT count(*) FROM (SELECT request_id FROM usage_events WHERE request_id IS NOT NULL AND source_kind NOT IN ('hermes_snapshot_delta', 'snapshot_delta') GROUP BY request_id HAVING count(*) > 1)",
             [],
             |r| r.get(0),
         )
@@ -1326,11 +1640,14 @@ fn print_adapter_terminal_report(adapter: &str, report: &AdapterValidationReport
         report.checks.configuration_status
     );
     println!(
-        "    Host Telemetry:        {} ({} attempted, {} verified, {} failed)",
+        "    Host Telemetry:        {} ({} attempted, {} verified, {} failed, {} duplicate, {} empty, {} skipped)",
         report.checks.telemetry_status,
         report.counters.host_files.attempted,
         report.counters.host_files.verified,
-        report.counters.host_files.failed
+        report.counters.host_files.failed,
+        report.counters.host_files.duplicate_only,
+        report.counters.host_files.empty,
+        report.counters.host_files.skipped
     );
     println!(
         "    Ledger Integrity:      {}",
