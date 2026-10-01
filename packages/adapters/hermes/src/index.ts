@@ -68,10 +68,13 @@ export function decimalDollarsToMicros(s: string): number | null {
 
 export function valueToMicros(val: unknown): number | undefined {
   if (typeof val === 'number') {
-    if (val < 0) return undefined;
-    return decimalDollarsToMicros(String(val)) ?? undefined;
+    if (!Number.isFinite(val) || val < 0 || val > 1_000_000) return undefined;
+    const s = val.toString();
+    if (s.includes('e') || s.includes('E')) return undefined;
+    return decimalDollarsToMicros(s) ?? undefined;
   }
   if (typeof val === 'string') {
+    if (val.includes('e') || val.includes('E')) return undefined;
     return decimalDollarsToMicros(val) ?? undefined;
   }
   return undefined;

@@ -33,3 +33,4 @@ tempfile.workspace = true
 tempfile.workspace = true
 tower.workspace = true
 http-body-util.workspace = true
+rusqlite.workspace = true

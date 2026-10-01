@@ -17,6 +17,23 @@ pub fn html_escape(input: &str) -> String {
     escaped
 }
 
+pub fn csv_escape(input: &str) -> String {
+    let trimmed = input.trim_start();
+    let needs_formula_neutralization = trimmed.starts_with('=')
+        || trimmed.starts_with('+')
+        || trimmed.starts_with('-')
+        || trimmed.starts_with('@')
+        || trimmed.starts_with('\t')
+        || trimmed.starts_with('\r');
+
+    let escaped = input.replace('"', "\"\"");
+    if needs_formula_neutralization {
+        format!("'{escaped}")
+    } else {
+        escaped
+    }
+}
+
 pub fn export_json(trees: &[ProjectTree]) -> Result<String> {
     Ok(serde_json::to_string_pretty(trees)?)
 }
@@ -50,18 +67,20 @@ pub fn export_csv(trees: &[ProjectTree]) -> Result<String> {
 
         let parent_id_str = node.parent_id.as_deref().unwrap_or("");
 
-        // CSV escape quotes
-        let safe_prj_title = project_title.replace('"', "\"\"");
-        let safe_title = node.title.replace('"', "\"\"");
+        // CSV escape quotes and neutralize formula injection
+        let safe_prj_title = csv_escape(project_title);
+        let safe_title = csv_escape(&node.title);
+        let safe_node_id = csv_escape(&node.id);
+        let safe_parent_id = csv_escape(parent_id_str);
 
         out.push_str(&format!(
             "\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",{},{},{},{},{},{},{},{},{},{},{}\n",
             project_id,
             project_key,
             safe_prj_title,
-            node.id,
+            safe_node_id,
             safe_title,
-            parent_id_str,
+            safe_parent_id,
             u.input,
             u.cache_read,
             u.cache_write,

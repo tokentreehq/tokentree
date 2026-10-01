@@ -968,6 +968,7 @@ dependencies = [
  "dirs",
  "hex",
  "http-body-util",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",

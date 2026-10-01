@@ -2,6 +2,7 @@
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -12,6 +13,11 @@ use tokentree_ledger::Ledger;
 pub const VALIDATE_SCHEMA_VERSION: &str = "1.0.0";
 pub const VALIDATE_GENERATOR: &str = "tokentree validate 0.2.0";
 
+pub const EXIT_HEALTHY: i32 = 0;
+pub const EXIT_VALIDATION_FAILURE: i32 = 1;
+pub const EXIT_INVOCATION_ERROR: i32 = 2;
+pub const EXIT_UNAVAILABLE: i32 = 3;
+
 const FIXTURE_CLAUDE: &str =
     include_str!("../../../fixtures/parsers/claude/public-small-v2.1.80.jsonl");
 const FIXTURE_CODEX: &str =
@@ -21,40 +27,120 @@ const FIXTURE_HERMES: &str = include_str!("../../../fixtures/parsers/hermes/ones
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ValidationStatus {
+pub enum SelfTestStatus {
     Passed,
     Failed,
-    Unavailable,
-    Skipped,
+    NotRun,
 }
 
-impl std::fmt::Display for ValidationStatus {
+impl std::fmt::Display for SelfTestStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Passed => write!(f, "PASS"),
-            Self::Failed => write!(f, "FAIL"),
-            Self::Unavailable => write!(f, "UNAVAILABLE"),
-            Self::Skipped => write!(f, "SKIPPED"),
+            Self::Passed => write!(f, "passed"),
+            Self::Failed => write!(f, "failed"),
+            Self::NotRun => write!(f, "not_run"),
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum AdapterOverallStatus {
-    Passed,
-    Failed,
+pub enum ProviderStatus {
+    Available,
     Unavailable,
-    SelfTestPassed,
+    Misconfigured,
 }
 
-impl std::fmt::Display for AdapterOverallStatus {
+impl std::fmt::Display for ProviderStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Passed => write!(f, "PASS"),
-            Self::Failed => write!(f, "FAIL"),
-            Self::Unavailable => write!(f, "UNAVAILABLE"),
-            Self::SelfTestPassed => write!(f, "SELF-TEST PASS"),
+            Self::Available => write!(f, "available"),
+            Self::Unavailable => write!(f, "unavailable"),
+            Self::Misconfigured => write!(f, "misconfigured"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TelemetryStatus {
+    Verified,
+    NotFound,
+    Unsupported,
+    Failed,
+    NotRun,
+}
+
+impl std::fmt::Display for TelemetryStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Verified => write!(f, "verified"),
+            Self::NotFound => write!(f, "not_found"),
+            Self::Unsupported => write!(f, "unsupported"),
+            Self::Failed => write!(f, "failed"),
+            Self::NotRun => write!(f, "not_run"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveCaptureStatus {
+    Verified,
+    Unavailable,
+    Failed,
+    NotRun,
+}
+
+impl std::fmt::Display for LiveCaptureStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Verified => write!(f, "verified"),
+            Self::Unavailable => write!(f, "unavailable"),
+            Self::Failed => write!(f, "failed"),
+            Self::NotRun => write!(f, "not_run"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckStatus {
+    Verified,
+    Misconfigured,
+    NotFound,
+    Failed,
+    NotRun,
+}
+
+impl std::fmt::Display for CheckStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Verified => write!(f, "verified"),
+            Self::Misconfigured => write!(f, "misconfigured"),
+            Self::NotFound => write!(f, "not_found"),
+            Self::Failed => write!(f, "failed"),
+            Self::NotRun => write!(f, "not_run"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverallStatus {
+    Healthy,
+    Degraded,
+    Unavailable,
+    Failed,
+}
+
+impl std::fmt::Display for OverallStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Healthy => write!(f, "healthy"),
+            Self::Degraded => write!(f, "degraded"),
+            Self::Unavailable => write!(f, "unavailable"),
+            Self::Failed => write!(f, "failed"),
         }
     }
 }
@@ -89,15 +175,26 @@ pub struct AdapterCapabilities {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AdapterChecks {
-    pub self_test: ValidationStatus,
-    pub discovery: ValidationStatus,
-    pub configuration: ValidationStatus,
-    pub host_telemetry: ValidationStatus,
-    pub ledger_integrity: ValidationStatus,
-    pub reconciliation: ValidationStatus,
-    pub privacy_audit: ValidationStatus,
-    pub live_capture: ValidationStatus,
-    pub overall_status: AdapterOverallStatus,
+    pub self_test_status: SelfTestStatus,
+    pub provider_status: ProviderStatus,
+    pub configuration_status: CheckStatus,
+    pub telemetry_status: TelemetryStatus,
+    pub ledger_integrity_status: CheckStatus,
+    pub reconciliation_status: CheckStatus,
+    pub privacy_audit_status: CheckStatus,
+    pub live_capture_status: LiveCaptureStatus,
+    pub overall_status: OverallStatus,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HostTelemetryFiles {
+    pub attempted: u64,
+    pub verified: u64,
+    pub failed: u64,
+    pub unsupported: u64,
+    pub anomalous: u64,
+    pub skipped: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -113,6 +210,7 @@ pub struct AdapterCounters {
     pub anomalies_detected: u64,
     pub duplicate_requests: u64,
     pub privacy_violations: u64,
+    pub host_files: HostTelemetryFiles,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -143,18 +241,24 @@ pub struct ValidationSuiteReport {
     pub timestamp: String,
     pub mode: String,
     pub environment: EnvironmentMetadata,
-    pub overall_passed: bool,
+    pub overall_status: OverallStatus,
+    pub exit_code: i32,
     pub adapters: BTreeMap<String, AdapterValidationReport>,
 }
 
 /// Assert that the validation report JSON parses strictly against typed structs
 /// with `#[serde(deny_unknown_fields)]` and passes all semantic and privacy assertions.
 pub fn assert_report_schema_and_privacy(report_json: &str) -> Result<ValidationSuiteReport> {
-    // 1. Strict typed deserialization with deny_unknown_fields
+    // 1. Check byte size limit
+    if report_json.len() > 1_000_000 {
+        bail!("Report exceeds maximum size limit of 1MB");
+    }
+
+    // 2. Strict typed deserialization with deny_unknown_fields
     let report: ValidationSuiteReport = serde_json::from_str(report_json)
         .context("Validation report failed strict schema validation (unknown or invalid fields)")?;
 
-    // 2. Semantic version assertions
+    // 3. Semantic version assertions
     if report.schema_version != VALIDATE_SCHEMA_VERSION {
         bail!(
             "Invalid schema version: expected '{}', got '{}'",
@@ -168,8 +272,33 @@ pub fn assert_report_schema_and_privacy(report_json: &str) -> Result<ValidationS
     if chrono::DateTime::parse_from_rfc3339(&report.timestamp).is_err() {
         bail!("Invalid timestamp format: {}", report.timestamp);
     }
+    if !["self_test", "require_live", "host"].contains(&report.mode.as_str()) {
+        bail!("Invalid validation mode: {}", report.mode);
+    }
 
-    // 3. Privacy assertions: reject forbidden secret patterns and user home paths
+    // 4. Semantic field assertions on each adapter
+    for (adapter_name, adapter_rep) in &report.adapters {
+        if !["claude", "codex", "grok", "hermes"].contains(&adapter_name.as_str()) {
+            bail!("Invalid adapter key in report: {adapter_name}");
+        }
+        if let Some(diag) = &adapter_rep.local_diagnostics {
+            if diag.models_observed.len() > 100 {
+                bail!("Models observed array exceeds maximum bound of 100");
+            }
+            for model in &diag.models_observed {
+                if model.len() > 128 {
+                    bail!("Model identifier exceeds 128 characters: {model}");
+                }
+            }
+            if let Some(pct) = diag.completeness_pct {
+                if !pct.is_finite() || !(0.0..=100.0).contains(&pct) {
+                    bail!("Invalid completeness percentage: {pct}");
+                }
+            }
+        }
+    }
+
+    // 5. Privacy assertions: reject forbidden secret patterns and user home paths
     let forbidden_patterns = [
         "sk-ant-",
         "sk-proj-",
@@ -231,24 +360,39 @@ pub struct ValidateOptions {
     pub local_details: bool,
 }
 
-pub fn run_validation(options: ValidateOptions) -> Result<bool> {
+pub fn run_validation(options: ValidateOptions) -> Result<i32> {
     let supported_adapters = ["claude", "codex", "grok", "hermes"];
+
+    // Validate mutually exclusive or incompatible options
+    if options.all && options.fixture.is_some() {
+        eprintln!("Error: --fixture cannot be combined with --all; specify a single adapter.");
+        return Ok(EXIT_INVOCATION_ERROR);
+    }
+
+    if let Some(fix_path) = &options.fixture {
+        if !fix_path.is_file() {
+            eprintln!("Error: Fixture file not found: {}", fix_path.display());
+            return Ok(EXIT_INVOCATION_ERROR);
+        }
+    }
 
     let target_adapters: Vec<String> = if options.all {
         supported_adapters.iter().map(|s| s.to_string()).collect()
     } else if let Some(a) = &options.adapter {
         let lower = a.trim().to_lowercase();
         if !supported_adapters.contains(&lower.as_str()) {
-            bail!(
-                "Unknown adapter '{a}'. Supported adapters: {}",
+            eprintln!(
+                "Error: Unknown adapter '{a}'. Supported adapters: {}",
                 supported_adapters.join(", ")
             );
+            return Ok(EXIT_INVOCATION_ERROR);
         }
         vec![lower]
     } else {
-        bail!(
-            "Specify an adapter (claude, codex, grok, hermes) or pass --all to validate all adapters."
+        eprintln!(
+            "Error: Specify an adapter (claude, codex, grok, hermes) or pass --all to validate all adapters."
         );
+        return Ok(EXIT_INVOCATION_ERROR);
     };
 
     let mode_str = if options.self_test {
@@ -259,7 +403,7 @@ pub fn run_validation(options: ValidateOptions) -> Result<bool> {
         "host"
     };
 
-    println!("TokenTree Provider Validation Suite");
+    println!("TokenTree Truthful Provider Validation Suite");
     println!("Schema Version: {VALIDATE_SCHEMA_VERSION}");
     println!("Mode: {mode_str}");
     println!(
@@ -272,58 +416,97 @@ pub fn run_validation(options: ValidateOptions) -> Result<bool> {
     let mut adapter_reports = BTreeMap::new();
     let mut any_failed = false;
     let mut any_unavailable = false;
-    let mut any_passed = false;
+    let mut any_healthy = false;
+    let mut any_verified_live = false;
 
     for adapter in &target_adapters {
         let rep = validate_single_adapter(adapter, &options)?;
         match rep.checks.overall_status {
-            AdapterOverallStatus::Passed | AdapterOverallStatus::SelfTestPassed => {
-                any_passed = true;
+            OverallStatus::Healthy => {
+                any_healthy = true;
             }
-            AdapterOverallStatus::Unavailable => {
+            OverallStatus::Degraded | OverallStatus::Unavailable => {
                 any_unavailable = true;
             }
-            AdapterOverallStatus::Failed => {
+            OverallStatus::Failed => {
                 any_failed = true;
             }
         }
+        if rep.checks.live_capture_status == LiveCaptureStatus::Verified
+            || rep.checks.telemetry_status == TelemetryStatus::Verified
+        {
+            any_verified_live = true;
+        }
+
         print_adapter_terminal_report(adapter, &rep);
         adapter_reports.insert(adapter.clone(), rep);
     }
 
-    let overall_success = if options.self_test {
-        !any_failed
-    } else if options.require_live {
-        !any_failed && !any_unavailable && any_passed
-    } else {
-        // Default host mode: fail if any check failed, or if single requested adapter is unavailable,
-        // or if --all was requested but 0 providers are present on this machine.
+    // Determine overall status and exit code
+    let (overall_status, exit_code) = if options.self_test {
         if any_failed {
-            false
-        } else if options.adapter.is_some() {
-            !any_unavailable
+            (OverallStatus::Failed, EXIT_VALIDATION_FAILURE)
         } else {
-            any_passed && !any_failed
+            (OverallStatus::Healthy, EXIT_HEALTHY)
+        }
+    } else if options.require_live {
+        if any_failed {
+            (OverallStatus::Failed, EXIT_VALIDATION_FAILURE)
+        } else if !any_verified_live || any_unavailable {
+            (OverallStatus::Unavailable, EXIT_VALIDATION_FAILURE)
+        } else {
+            (OverallStatus::Healthy, EXIT_HEALTHY)
+        }
+    } else {
+        // Default host mode:
+        if any_failed {
+            (OverallStatus::Failed, EXIT_VALIDATION_FAILURE)
+        } else if options.adapter.is_some() {
+            // Specific single adapter requested:
+            if any_unavailable && !any_healthy {
+                (OverallStatus::Unavailable, EXIT_UNAVAILABLE)
+            } else {
+                (OverallStatus::Healthy, EXIT_HEALTHY)
+            }
+        } else {
+            // --all requested:
+            if !any_healthy && any_unavailable {
+                (OverallStatus::Unavailable, EXIT_UNAVAILABLE)
+            } else if any_healthy && any_unavailable {
+                (OverallStatus::Degraded, EXIT_HEALTHY)
+            } else {
+                (OverallStatus::Healthy, EXIT_HEALTHY)
+            }
         }
     };
 
     println!("============================================================");
-    if overall_success {
-        if options.self_test {
-            println!(
-                "Overall Validation: PASS (all adapter parsers & invariants certified offline)"
-            );
-        } else {
-            println!("Overall Validation: PASS (all targeted host environments satisfied)");
+    match overall_status {
+        OverallStatus::Healthy => {
+            if options.self_test {
+                println!(
+                    "Overall Status: HEALTHY (all adapter parsers & invariants verified offline)"
+                );
+            } else {
+                println!("Overall Status: HEALTHY (targeted environments fully verified)");
+            }
         }
-    } else if any_unavailable && !any_failed && !options.self_test {
-        println!("Overall Validation: UNAVAILABLE (no active host provider detected)");
-        println!(
-            "Hint: Run with --self-test to verify adapter parsers and ledger pipelines offline."
-        );
-    } else {
-        println!("Overall Validation: FAIL (one or more verification checks failed)");
+        OverallStatus::Degraded => {
+            println!("Overall Status: DEGRADED (some optional providers unavailable on host)");
+        }
+        OverallStatus::Unavailable => {
+            println!(
+                "Overall Status: UNAVAILABLE (target host provider not detected or not verified)"
+            );
+            println!(
+                "Hint: Run with --self-test to verify adapter parsers and ledger pipelines offline."
+            );
+        }
+        OverallStatus::Failed => {
+            println!("Overall Status: FAILED (one or more verification checks failed)");
+        }
     }
+    println!("Exit Code: {exit_code}");
     println!("============================================================");
 
     let suite_report = ValidationSuiteReport {
@@ -332,7 +515,8 @@ pub fn run_validation(options: ValidateOptions) -> Result<bool> {
         timestamp: Utc::now().to_rfc3339(),
         mode: mode_str.to_string(),
         environment: EnvironmentMetadata::current(),
-        overall_passed: overall_success,
+        overall_status,
+        exit_code,
         adapters: adapter_reports,
     };
 
@@ -346,7 +530,7 @@ pub fn run_validation(options: ValidateOptions) -> Result<bool> {
         println!("\nValidation report written to: {}", out_path.display());
     }
 
-    Ok(overall_success)
+    Ok(exit_code)
 }
 
 fn validate_single_adapter(
@@ -396,21 +580,7 @@ fn validate_single_adapter(
         capture_available,
     };
 
-    // 1. Adapter Discovery Check
-    let discovery = if cli_installed || sessions_discovered || config_present {
-        ValidationStatus::Passed
-    } else {
-        ValidationStatus::Unavailable
-    };
-
-    // 2. Configuration Check
-    let configuration = if options.self_test {
-        ValidationStatus::Skipped
-    } else {
-        verify_configuration(adapter, config_path.as_deref())
-    };
-
-    // 3. Isolated Ledger Ingestion Sandbox
+    // 1. Adapter Parser Self-Test on versioned regression fixture
     let temp_dir = tempdir().context("create temporary validation ledger directory")?;
     let db_path = temp_dir.path().join("validate.db");
     let mut ledger = Ledger::open(&db_path).context("open validation ledger")?;
@@ -418,7 +588,6 @@ fn validate_single_adapter(
     let mut sessions_evaluated = 0u64;
     let mut total_anomalies = 0u64;
 
-    // Self-Test on embedded (or custom) fixture
     let (self_test_ok, fixture_anoms) = if let Some(custom) = &options.fixture {
         sessions_evaluated += 1;
         ingest_adapter_telemetry(adapter, &mut ledger, custom)
@@ -428,55 +597,83 @@ fn validate_single_adapter(
     };
     total_anomalies += fixture_anoms;
 
-    let self_test = if self_test_ok {
-        ValidationStatus::Passed
+    let self_test_status = if self_test_ok {
+        SelfTestStatus::Passed
     } else {
-        ValidationStatus::Failed
+        SelfTestStatus::Failed
     };
 
-    // 4. Host Telemetry Validation
-    let host_telemetry = if options.self_test || options.fixture.is_some() {
-        ValidationStatus::Skipped
+    // 2. Provider Installation & Discovery Check
+    let provider_status = if options.self_test {
+        ProviderStatus::Unavailable
+    } else if cli_installed || sessions_discovered {
+        ProviderStatus::Available
+    } else {
+        ProviderStatus::Unavailable
+    };
+
+    // 3. Configuration Check
+    let configuration_status = if options.self_test {
+        CheckStatus::NotRun
+    } else {
+        verify_configuration(adapter, config_path.as_deref())
+    };
+
+    // 4. Host Telemetry Validation (never let fixture success override host telemetry failure!)
+    let mut host_files = HostTelemetryFiles::default();
+    let telemetry_status = if options.self_test || options.fixture.is_some() {
+        TelemetryStatus::NotRun
     } else if !sessions_discovered {
-        ValidationStatus::Unavailable
+        TelemetryStatus::NotFound
     } else {
         let found = discover_sample_sessions(adapter, session_dir.as_ref().unwrap());
         if found.is_empty() {
-            ValidationStatus::Unavailable
+            TelemetryStatus::NotFound
         } else {
-            let mut all_host_ok = true;
+            let mut any_file_failed = false;
+            let mut verified_count = 0u64;
             for p in &found {
+                host_files.attempted += 1;
                 sessions_evaluated += 1;
                 let (ok, anoms) = ingest_adapter_telemetry(adapter, &mut ledger, p);
-                if !ok {
-                    all_host_ok = false;
+                if ok {
+                    verified_count += 1;
+                } else {
+                    any_file_failed = true;
+                    host_files.failed += 1;
+                }
+                if anoms > 0 {
+                    host_files.anomalous += 1;
                 }
                 total_anomalies += anoms;
             }
-            if all_host_ok {
-                ValidationStatus::Passed
+            host_files.verified = verified_count;
+            if any_file_failed {
+                TelemetryStatus::Failed
+            } else if verified_count > 0 {
+                TelemetryStatus::Verified
             } else {
-                ValidationStatus::Failed
+                TelemetryStatus::NotFound
             }
         }
     };
 
     // 5. Ledger Invariant & Integrity Checks
     let integrity_ok = check_ledger_integrity(&ledger, adapter);
-    let ledger_integrity = if integrity_ok {
-        ValidationStatus::Passed
+    let ledger_integrity_status = if integrity_ok {
+        CheckStatus::Verified
     } else {
-        ValidationStatus::Failed
+        CheckStatus::Failed
     };
 
     // 6. Reconciliation Checks
     let recon = ledger.reconcile().context("run ledger reconciliation")?;
     let reconciliation_ok =
         recon.duplicate_request_ids == 0 && recon.duplicate_subagent_counters == 0;
-    let reconciliation = if reconciliation_ok {
-        ValidationStatus::Passed
+    let reconciliation_status = if reconciliation_ok {
+        CheckStatus::Verified
     } else {
-        ValidationStatus::Failed
+        CheckStatus::Failed
     };
 
     // 7. Privacy & Leak Audit
@@ -486,61 +683,63 @@ fn validate_single_adapter(
     let db_leak_free = scan_ledger_strings_for_secrets(&ledger);
     let privacy_violations =
         (prompt_audit.leaks_detected + if db_leak_free { 0 } else { 1 }) as u64;
-    let privacy_audit = if privacy_violations == 0 {
-        ValidationStatus::Passed
+    let privacy_audit_status = if privacy_violations == 0 {
+        CheckStatus::Verified
     } else {
-        ValidationStatus::Failed
+        CheckStatus::Failed
     };
 
     // 8. Live Capture Capability State
-    let live_capture = if options.self_test {
-        ValidationStatus::Skipped
-    } else if capture_available {
-        ValidationStatus::Passed
+    let live_capture_status = if options.self_test {
+        LiveCaptureStatus::NotRun
+    } else if capture_available && telemetry_status == TelemetryStatus::Verified {
+        LiveCaptureStatus::Verified
     } else {
-        ValidationStatus::Unavailable
+        LiveCaptureStatus::Unavailable
     };
 
     // Overall Adapter Status
-    let has_any_failure = self_test == ValidationStatus::Failed
-        || configuration == ValidationStatus::Failed
-        || host_telemetry == ValidationStatus::Failed
-        || ledger_integrity == ValidationStatus::Failed
-        || reconciliation == ValidationStatus::Failed
-        || privacy_audit == ValidationStatus::Failed;
+    let has_any_failure = self_test_status == SelfTestStatus::Failed
+        || configuration_status == CheckStatus::Failed
+        || configuration_status == CheckStatus::Misconfigured
+        || telemetry_status == TelemetryStatus::Failed
+        || ledger_integrity_status == CheckStatus::Failed
+        || reconciliation_status == CheckStatus::Failed
+        || privacy_audit_status == CheckStatus::Failed;
 
     let overall_status = if has_any_failure {
-        AdapterOverallStatus::Failed
+        OverallStatus::Failed
     } else if options.self_test {
-        AdapterOverallStatus::SelfTestPassed
+        OverallStatus::Healthy
     } else if options.require_live {
-        if discovery == ValidationStatus::Passed
-            && (host_telemetry == ValidationStatus::Passed || capture_available)
+        if (telemetry_status == TelemetryStatus::Verified
+            || live_capture_status == LiveCaptureStatus::Verified)
+            && provider_status == ProviderStatus::Available
         {
-            AdapterOverallStatus::Passed
+            OverallStatus::Healthy
         } else {
-            AdapterOverallStatus::Failed
+            OverallStatus::Failed
         }
     } else {
         // Default host validation
-        if discovery == ValidationStatus::Passed
-            && (host_telemetry == ValidationStatus::Passed || capture_available)
+        if provider_status == ProviderStatus::Available
+            && (telemetry_status == TelemetryStatus::Verified || capture_available)
         {
-            AdapterOverallStatus::Passed
+            OverallStatus::Healthy
         } else {
-            AdapterOverallStatus::Unavailable
+            OverallStatus::Unavailable
         }
     };
 
     let checks = AdapterChecks {
-        self_test,
-        discovery,
-        configuration,
-        host_telemetry,
-        ledger_integrity,
-        reconciliation,
-        privacy_audit,
-        live_capture,
+        self_test_status,
+        provider_status,
+        configuration_status,
+        telemetry_status,
+        ledger_integrity_status,
+        reconciliation_status,
+        privacy_audit_status,
+        live_capture_status,
         overall_status,
     };
 
@@ -551,6 +750,7 @@ fn validate_single_adapter(
         total_anomalies,
         recon.duplicate_request_ids,
         privacy_violations,
+        host_files,
     );
 
     let local_diagnostics = if options.local_details {
@@ -601,10 +801,10 @@ fn discover_sample_sessions(adapter: &str, root: &Path) -> Vec<PathBuf> {
     }
 }
 
-fn verify_configuration(adapter: &str, config_path: Option<&Path>) -> ValidationStatus {
+fn verify_configuration(adapter: &str, config_path: Option<&Path>) -> CheckStatus {
     let path = match config_path {
         Some(p) if p.exists() => p,
-        _ => return ValidationStatus::Unavailable,
+        _ => return CheckStatus::NotFound,
     };
 
     match adapter {
@@ -614,21 +814,21 @@ fn verify_configuration(adapter: &str, config_path: Option<&Path>) -> Validation
                 use std::os::unix::fs::PermissionsExt;
                 if let Ok(meta) = fs::metadata(path) {
                     if meta.permissions().mode() & 0o002 != 0 {
-                        return ValidationStatus::Failed; // World-writable config directory
+                        return CheckStatus::Misconfigured; // World-writable config directory
                     }
                 }
             }
             if path.is_file() {
                 if let Ok(content) = fs::read_to_string(path) {
                     if serde_json::from_str::<serde_json::Value>(&content).is_err() {
-                        return ValidationStatus::Failed;
+                        return CheckStatus::Misconfigured;
                     }
                     if content.contains("sk-ant-api") {
-                        return ValidationStatus::Failed; // Plaintext secret in config
+                        return CheckStatus::Misconfigured; // Plaintext secret in config
                     }
                 }
             }
-            ValidationStatus::Passed
+            CheckStatus::Verified
         }
         "codex" => {
             #[cfg(unix)]
@@ -636,7 +836,7 @@ fn verify_configuration(adapter: &str, config_path: Option<&Path>) -> Validation
                 use std::os::unix::fs::PermissionsExt;
                 if let Ok(meta) = fs::metadata(path) {
                     if meta.permissions().mode() & 0o002 != 0 {
-                        return ValidationStatus::Failed;
+                        return CheckStatus::Misconfigured;
                     }
                 }
             }
@@ -644,11 +844,11 @@ fn verify_configuration(adapter: &str, config_path: Option<&Path>) -> Validation
             if config_json.is_file() {
                 if let Ok(content) = fs::read_to_string(&config_json) {
                     if serde_json::from_str::<serde_json::Value>(&content).is_err() {
-                        return ValidationStatus::Failed;
+                        return CheckStatus::Misconfigured;
                     }
                 }
             }
-            ValidationStatus::Passed
+            CheckStatus::Verified
         }
         "grok" => {
             #[cfg(unix)]
@@ -656,11 +856,19 @@ fn verify_configuration(adapter: &str, config_path: Option<&Path>) -> Validation
                 use std::os::unix::fs::PermissionsExt;
                 if let Ok(meta) = fs::metadata(path) {
                     if meta.permissions().mode() & 0o002 != 0 {
-                        return ValidationStatus::Failed;
+                        return CheckStatus::Misconfigured;
                     }
                 }
             }
-            ValidationStatus::Passed
+            let config_json = path.join("config.json");
+            if config_json.is_file() {
+                if let Ok(content) = fs::read_to_string(&config_json) {
+                    if serde_json::from_str::<serde_json::Value>(&content).is_err() {
+                        return CheckStatus::Misconfigured;
+                    }
+                }
+            }
+            CheckStatus::Verified
         }
         "hermes" => {
             #[cfg(unix)]
@@ -668,7 +876,7 @@ fn verify_configuration(adapter: &str, config_path: Option<&Path>) -> Validation
                 use std::os::unix::fs::PermissionsExt;
                 if let Ok(meta) = fs::metadata(path) {
                     if meta.permissions().mode() & 0o002 != 0 {
-                        return ValidationStatus::Failed;
+                        return CheckStatus::Misconfigured;
                     }
                 }
             }
@@ -676,11 +884,11 @@ fn verify_configuration(adapter: &str, config_path: Option<&Path>) -> Validation
             if state_db.is_file()
                 && tokentree_hermes::parse_hermes_state_db(&state_db, None).is_err()
             {
-                return ValidationStatus::Failed;
+                return CheckStatus::Misconfigured;
             }
-            ValidationStatus::Passed
+            CheckStatus::Verified
         }
-        _ => ValidationStatus::Unavailable,
+        _ => CheckStatus::NotFound,
     }
 }
 
@@ -702,15 +910,20 @@ fn ingest_embedded_fixture(adapter: &str, ledger: &mut Ledger, temp_dir: &Path) 
 }
 
 fn ingest_adapter_telemetry(adapter: &str, ledger: &mut Ledger, path: &Path) -> (bool, u64) {
-    match adapter {
+    // Verify read-only source access: record SHA-256 and size before reading
+    let before_hash = fs::read(path).ok().map(|b| hex::encode(Sha256::digest(&b)));
+    let before_size = fs::metadata(path).ok().map(|m| m.len());
+
+    let (ok, anoms) = match adapter {
         "claude" => match tokentree_claude::parse_session(path) {
             Ok(parsed) => {
                 if parsed.stats.malformed > 0 {
-                    return (false, 0);
-                }
-                match ledger.ingest(parsed.observations) {
-                    Ok(summary) => (summary.inserted > 0 || summary.duplicates > 0, 0),
-                    Err(_) => (false, 0),
+                    (false, 0)
+                } else {
+                    match ledger.ingest(parsed.observations) {
+                        Ok(summary) => (summary.inserted > 0 || summary.duplicates > 0, 0),
+                        Err(_) => (false, 0),
+                    }
                 }
             }
             Err(_) => (false, 0),
@@ -728,7 +941,18 @@ fn ingest_adapter_telemetry(adapter: &str, ledger: &mut Ledger, path: &Path) -> 
             Err(_) => (false, 0),
         },
         _ => (false, 0),
+    };
+
+    // Verify source was not altered by ingestion
+    if let (Some(b_hash), Some(b_size)) = (before_hash, before_size) {
+        let after_hash = fs::read(path).ok().map(|b| hex::encode(Sha256::digest(&b)));
+        let after_size = fs::metadata(path).ok().map(|m| m.len());
+        if after_hash != Some(b_hash) || after_size != Some(b_size) {
+            return (false, anoms);
+        }
     }
+
+    (ok, anoms)
 }
 
 fn check_ledger_integrity(ledger: &Ledger, adapter: &str) -> bool {
@@ -757,6 +981,16 @@ fn check_ledger_integrity(ledger: &Ledger, adapter: &str) -> bool {
 
     // Monotonicity & non-negative counter checks
     if !check_ledger_monotonicity(ledger) {
+        return false;
+    }
+
+    // Attribution invariants
+    if !check_ledger_attribution_invariants(ledger) {
+        return false;
+    }
+
+    // Deduplication check
+    if !check_ledger_deduplication(ledger) {
         return false;
     }
 
@@ -845,6 +1079,46 @@ fn check_ledger_monotonicity(ledger: &Ledger) -> bool {
     true
 }
 
+fn check_ledger_attribution_invariants(ledger: &Ledger) -> bool {
+    let missing_sessions: i64 = ledger
+        .connection()
+        .query_row(
+            "SELECT count(*) FROM usage_events WHERE session_id IS NULL OR session_id = ''",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if missing_sessions != 0 {
+        return false;
+    }
+
+    let orphan_subagents: i64 = ledger
+        .connection()
+        .query_row(
+            "SELECT count(*) FROM usage_events WHERE parent_agent_id IS NOT NULL AND (agent_id IS NULL OR agent_id = '')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if orphan_subagents != 0 {
+        return false;
+    }
+
+    true
+}
+
+fn check_ledger_deduplication(ledger: &Ledger) -> bool {
+    let duplicate_requests: i64 = ledger
+        .connection()
+        .query_row(
+            "SELECT count(*) FROM (SELECT request_id FROM usage_events WHERE request_id IS NOT NULL GROUP BY request_id HAVING count(*) > 1)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    duplicate_requests == 0
+}
+
 fn scan_ledger_strings_for_secrets(ledger: &Ledger) -> bool {
     let forbidden = [
         "sk-ant-",
@@ -857,7 +1131,7 @@ fn scan_ledger_strings_for_secrets(ledger: &Ledger) -> bool {
         "canary_prompt_leak",
     ];
     let mut stmt = match ledger.connection().prepare(
-        "SELECT coalesce(model, ''), coalesce(request_id, ''), coalesce(turn_id, ''), coalesce(agent_id, '') FROM usage_events"
+        "SELECT coalesce(model, ''), coalesce(request_id, ''), coalesce(turn_id, ''), coalesce(agent_id, ''), coalesce(parent_agent_id, '') FROM usage_events"
     ) {
         Ok(s) => s,
         Err(_) => return false,
@@ -869,12 +1143,13 @@ fn scan_ledger_strings_for_secrets(ledger: &Ledger) -> bool {
             r.get::<_, String>(1)?,
             r.get::<_, String>(2)?,
             r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
         ))
     });
 
     if let Ok(iter) = rows {
         for r in iter.flatten() {
-            let combined = format!("{} {} {} {}", r.0, r.1, r.2, r.3).to_lowercase();
+            let combined = format!("{} {} {} {} {}", r.0, r.1, r.2, r.3, r.4).to_lowercase();
             for f in &forbidden {
                 if combined.contains(f) {
                     return false;
@@ -892,6 +1167,7 @@ fn extract_counters(
     anomalies_detected: u64,
     duplicate_requests: u64,
     privacy_violations: u64,
+    host_files: HostTelemetryFiles,
 ) -> AdapterCounters {
     let conn = ledger.connection();
 
@@ -953,6 +1229,7 @@ fn extract_counters(
         anomalies_detected,
         duplicate_requests,
         privacy_violations,
+        host_files,
     }
 }
 
@@ -981,7 +1258,7 @@ fn extract_local_diagnostics(ledger: &Ledger, adapter: &str) -> LocalDiagnostics
 
     let measured_turns: u64 = conn
         .query_row(
-            "SELECT count(*) FROM usage_events WHERE adapter = ? AND source != 'unavailable'",
+            "SELECT count(*) FROM usage_events WHERE adapter = ? AND source_kind NOT IN ('grok_turn_failed', 'grok_session_failed', 'hermes_failed_run', 'hermes_unmeasured')",
             [adapter],
             |r| r.get::<_, i64>(0),
         )
@@ -990,7 +1267,7 @@ fn extract_local_diagnostics(ledger: &Ledger, adapter: &str) -> LocalDiagnostics
 
     let unmeasured_turns: u64 = conn
         .query_row(
-            "SELECT count(*) FROM usage_events WHERE adapter = ? AND source = 'unavailable'",
+            "SELECT count(*) FROM usage_events WHERE adapter = ? AND source_kind IN ('grok_turn_failed', 'grok_session_failed', 'hermes_failed_run', 'hermes_unmeasured')",
             [adapter],
             |r| r.get::<_, i64>(0),
         )
@@ -1038,31 +1315,43 @@ fn print_adapter_terminal_report(adapter: &str, report: &AdapterValidationReport
     println!("  Checks:");
     println!(
         "    Self-Test (Fixtures):  {} ({} tokens)",
-        report.checks.self_test, report.counters.total_tokens
+        report.checks.self_test_status, report.counters.total_tokens
     );
-    println!("    Discovery:             {}", report.checks.discovery);
-    println!("    Configuration:         {}", report.checks.configuration);
     println!(
-        "    Host Telemetry:        {}",
-        report.checks.host_telemetry
+        "    Provider Status:       {}",
+        report.checks.provider_status
+    );
+    println!(
+        "    Configuration:         {}",
+        report.checks.configuration_status
+    );
+    println!(
+        "    Host Telemetry:        {} ({} attempted, {} verified, {} failed)",
+        report.checks.telemetry_status,
+        report.counters.host_files.attempted,
+        report.counters.host_files.verified,
+        report.counters.host_files.failed
     );
     println!(
         "    Ledger Integrity:      {}",
-        report.checks.ledger_integrity
+        report.checks.ledger_integrity_status
     );
     println!(
         "    Reconciliation:        {} ({} duplicates, {} anomalies)",
-        report.checks.reconciliation,
+        report.checks.reconciliation_status,
         report.counters.duplicate_requests,
         report.counters.anomalies_detected
     );
     println!(
         "    Privacy & Secret Audit:{} ({} violations)",
-        report.checks.privacy_audit, report.counters.privacy_violations
+        report.checks.privacy_audit_status, report.counters.privacy_violations
     );
-    println!("    Live Capture:          {}", report.checks.live_capture);
     println!(
-        "  Status:                  {}",
+        "    Live Capture:          {}",
+        report.checks.live_capture_status
+    );
+    println!(
+        "  Overall Status:          {}",
         report.checks.overall_status
     );
     println!();

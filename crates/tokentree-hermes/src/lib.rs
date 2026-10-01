@@ -210,7 +210,14 @@ pub fn decimal_dollars_to_micros(val_str: &str) -> Result<u64, String> {
 #[must_use]
 pub fn value_to_micros(val: Option<&Value>) -> Option<u64> {
     match val {
-        Some(Value::Number(num)) => decimal_dollars_to_micros(&num.to_string()).ok(),
+        Some(Value::Number(num)) => {
+            if let Some(f) = num.as_f64() {
+                if !f.is_finite() || f < 0.0 || f > 1_000_000.0 {
+                    return None;
+                }
+            }
+            decimal_dollars_to_micros(&num.to_string()).ok()
+        }
         Some(Value::String(s)) => decimal_dollars_to_micros(s).ok(),
         _ => None,
     }
@@ -591,7 +598,10 @@ pub fn parse_hermes_state_db(db_path: &Path, since_timestamp: Option<f64>) -> Re
             Some(rusqlite::types::Value::Integer(i)) if *i >= 0 => {
                 (*i as u64).checked_mul(1_000_000)
             }
-            Some(rusqlite::types::Value::Real(f)) if *f >= 0.0 => {
+            Some(rusqlite::types::Value::Real(f))
+                if f.is_finite() && *f >= 0.0 && *f <= 1_000_000.0 =>
+            {
+                // Honestly normalize IEEE-754 floating point SQLite REAL source to 6 decimal places before exact conversion
                 let s = format!("{f:.6}");
                 decimal_dollars_to_micros(&s).ok()
             }
@@ -602,7 +612,9 @@ pub fn parse_hermes_state_db(db_path: &Path, since_timestamp: Option<f64>) -> Re
             Some(rusqlite::types::Value::Integer(i)) if *i >= 0 => {
                 (*i as u64).checked_mul(1_000_000)
             }
-            Some(rusqlite::types::Value::Real(f)) if *f >= 0.0 => {
+            Some(rusqlite::types::Value::Real(f))
+                if f.is_finite() && *f >= 0.0 && *f <= 1_000_000.0 =>
+            {
                 let s = format!("{f:.6}");
                 decimal_dollars_to_micros(&s).ok()
             }
@@ -745,59 +757,33 @@ pub fn import_hermes_file(connection: &mut Connection, path: &Path) -> Result<He
         .map(|t| chrono::DateTime::<Utc>::from(t).to_rfc3339())
         .unwrap_or_else(|| Utc::now().to_rfc3339());
 
-    let file_content = if !is_sqlite {
-        Some(fs::read(path).with_context(|| format!("read {}", path.display()))?)
-    } else {
-        None
-    };
-    let file_identity_hash = file_content
-        .as_ref()
-        .map(|c| hex::encode(Sha256::digest(c)))
-        .unwrap_or_else(|| hex::encode(Sha256::digest(source_path_str.as_bytes())));
+    let file_content = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let file_identity_hash = hex::encode(Sha256::digest(&file_content));
 
-    if !is_sqlite {
-        let checkpoint: Option<(i64, Option<String>, Option<String>)> = connection
-            .query_row(
-                "SELECT last_offset, file_hash, parser_version FROM ingestion_checkpoints WHERE adapter = 'hermes' AND source_path = ?1",
-                [&source_path_str],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .ok();
+    let checkpoint: Option<(i64, Option<String>, Option<String>)> = connection
+        .query_row(
+            "SELECT last_offset, file_hash, parser_version FROM ingestion_checkpoints WHERE adapter = 'hermes' AND source_path = ?1",
+            [&source_path_str],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .ok();
 
-        if let Some((_, Some(last_hash), Some(p_ver))) = checkpoint {
-            if last_hash == file_identity_hash && p_ver == PARSER_VERSION {
-                return Ok(HermesImportResult {
-                    inserted: 0,
-                    duplicates: 0,
-                    anomalies: 0,
-                    start_offset: file_size,
-                    end_offset: file_size,
-                });
-            }
+    if let Some((_, Some(last_hash), Some(p_ver))) = checkpoint {
+        if last_hash == file_identity_hash && p_ver == PARSER_VERSION {
+            return Ok(HermesImportResult {
+                inserted: 0,
+                duplicates: 0,
+                anomalies: 0,
+                start_offset: file_size,
+                end_offset: file_size,
+            });
         }
     }
 
     let parse_res = if is_sqlite {
-        // Read previous state checkpoint
-        let prev_state_ts: Option<f64> = connection
-            .query_row(
-                "SELECT adapter_state_json FROM ingestion_checkpoints WHERE adapter = 'hermes' AND source_path = ?1",
-                [&source_path_str],
-                |row| {
-                    let json_str: Option<String> = row.get(0)?;
-                    if let Some(s) = json_str {
-                        let parsed: HermesParserState = serde_json::from_str(&s).unwrap_or_default();
-                        Ok(parsed.last_seen_timestamp)
-                    } else {
-                        Ok(None)
-                    }
-                },
-            )
-            .unwrap_or(None);
-
-        parse_hermes_state_db(path, prev_state_ts)?
+        parse_hermes_state_db(path, None)?
     } else {
-        let content_str = String::from_utf8_lossy(file_content.as_ref().unwrap());
+        let content_str = String::from_utf8_lossy(&file_content);
         parse_json_usage_str(&content_str, path, 0, HermesParserState::default())?
     };
 
@@ -838,48 +824,112 @@ pub fn import_hermes_file(connection: &mut Connection, path: &Path) -> Result<He
             None
         };
 
-        let evt_hash = obs.event_hash();
-        last_event_hash = Some(evt_hash.clone());
+        let existing_tokens: Option<(i64, i64, i64, i64, i64)> = if is_sqlite {
+            tx.query_row(
+                "SELECT coalesce(sum(input_tokens), 0), coalesce(sum(output_tokens), 0), coalesce(sum(cached_input_tokens), 0), coalesce(sum(cache_write_tokens), 0), coalesce(sum(reasoning_tokens), 0)
+                 FROM usage_events
+                 WHERE adapter = 'hermes' AND session_id = ?1 AND (request_id = ?2 OR request_id LIKE (?2 || ':delta:%'))",
+                params![&session_id, obs.request_id.as_deref().unwrap_or("")],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            ).ok()
+        } else {
+            None
+        };
 
-        let changed = tx.execute(
-            "INSERT OR IGNORE INTO usage_events(
-              id, adapter, source_kind, source_event_id, session_id, turn_id, request_id, agent_id, parent_agent_id, source_timestamp,
-              observed_at, ingested_at, model, service_tier, region, input_tokens, cached_input_tokens,
-              cache_write_tokens, output_tokens, reasoning_tokens, provider_reported_cost_micros,
-              source_path, source_offset, event_hash, adapter_version, parser_version
-            ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
-            params![
-                format!("evt_{}", &evt_hash[..16]),
-                obs.adapter,
-                obs.source_subtype.as_deref().unwrap_or(obs.source.as_str()),
-                obs.source_event_id,
-                session_id,
-                turn_db_id,
-                obs.request_id,
-                obs.agent_id,
-                obs.parent_agent_id,
-                obs.source_timestamp,
-                obs.observed_at,
-                obs.observed_at,
-                obs.model,
-                obs.service_tier,
-                obs.region,
-                obs.usage.input_tokens.map(|v| v as i64),
-                obs.usage.cached_input_tokens.map(|v| v as i64),
-                obs.usage.cache_write_tokens.map(|v| v as i64),
-                obs.usage.output_tokens.map(|v| v as i64),
-                obs.usage.reasoning_tokens.map(|v| v as i64),
-                obs.provider_reported_cost_micros.map(|v| v as i64),
-                obs.source_path,
-                obs.source_offset as i64,
-                evt_hash,
-                obs.adapter_version,
-                obs.parser_version,
-            ],
-        )?;
+        let target_obs = if let Some((ex_in, ex_out, ex_cr, ex_cw, ex_reas)) = existing_tokens {
+            let total_ex = ex_in + ex_out + ex_cr + ex_cw + ex_reas;
+            let cur_in = obs.usage.input_tokens.unwrap_or(0) as i64;
+            let cur_out = obs.usage.output_tokens.unwrap_or(0) as i64;
+            let cur_cr = obs.usage.cached_input_tokens.unwrap_or(0) as i64;
+            let cur_cw = obs.usage.cache_write_tokens.unwrap_or(0) as i64;
+            let cur_reas = obs.usage.reasoning_tokens.unwrap_or(0) as i64;
+            let total_cur = cur_in + cur_out + cur_cr + cur_cw + cur_reas;
 
-        if changed == 1 {
-            inserted += 1;
+            if total_ex > 0 && total_cur > total_ex {
+                // Growth detected: emit append-only snapshot delta
+                let delta_in = (cur_in - ex_in).max(0) as u64;
+                let delta_out = (cur_out - ex_out).max(0) as u64;
+                let delta_cr = (cur_cr - ex_cr).max(0) as u64;
+                let delta_cw = (cur_cw - ex_cw).max(0) as u64;
+                let delta_reas = (cur_reas - ex_reas).max(0) as u64;
+
+                let mut d = obs.clone();
+                d.source = tokentree_core::MeasurementSource::SnapshotDelta;
+                d.source_subtype = Some("hermes_snapshot_delta".to_string());
+                d.source_event_id = Some(format!(
+                    "{}:delta:{}",
+                    obs.source_event_id.as_deref().unwrap_or(""),
+                    total_cur
+                ));
+                d.request_id = Some(format!(
+                    "{}:delta:{}",
+                    obs.request_id.as_deref().unwrap_or(""),
+                    total_cur
+                ));
+                d.usage = TokenUsage {
+                    input_tokens: Some(delta_in),
+                    output_tokens: Some(delta_out),
+                    cached_input_tokens: Some(delta_cr),
+                    cache_write_tokens: Some(delta_cw),
+                    reasoning_tokens: Some(delta_reas),
+                };
+                Some(d)
+            } else if total_ex > 0 {
+                // Already fully captured
+                None
+            } else {
+                Some(obs.clone())
+            }
+        } else {
+            Some(obs.clone())
+        };
+
+        if let Some(to_insert) = target_obs {
+            let evt_hash = to_insert.event_hash();
+            last_event_hash = Some(evt_hash.clone());
+
+            let changed = tx.execute(
+                "INSERT OR IGNORE INTO usage_events(
+                  id, adapter, source_kind, source_event_id, session_id, turn_id, request_id, agent_id, parent_agent_id, source_timestamp,
+                  observed_at, ingested_at, model, service_tier, region, input_tokens, cached_input_tokens,
+                  cache_write_tokens, output_tokens, reasoning_tokens, provider_reported_cost_micros,
+                  source_path, source_offset, event_hash, adapter_version, parser_version
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
+                params![
+                    format!("evt_{}", &evt_hash[..16]),
+                    to_insert.adapter,
+                    to_insert.source_subtype.as_deref().unwrap_or(to_insert.source.as_str()),
+                    to_insert.source_event_id,
+                    session_id,
+                    turn_db_id,
+                    to_insert.request_id,
+                    to_insert.agent_id,
+                    to_insert.parent_agent_id,
+                    to_insert.source_timestamp,
+                    to_insert.observed_at,
+                    to_insert.observed_at,
+                    to_insert.model,
+                    to_insert.service_tier,
+                    to_insert.region,
+                    to_insert.usage.input_tokens.map(|v| v as i64),
+                    to_insert.usage.cached_input_tokens.map(|v| v as i64),
+                    to_insert.usage.cache_write_tokens.map(|v| v as i64),
+                    to_insert.usage.output_tokens.map(|v| v as i64),
+                    to_insert.usage.reasoning_tokens.map(|v| v as i64),
+                    to_insert.provider_reported_cost_micros.map(|v| v as i64),
+                    to_insert.source_path,
+                    to_insert.source_offset as i64,
+                    evt_hash,
+                    to_insert.adapter_version,
+                    to_insert.parser_version,
+                ],
+            )?;
+
+            if changed == 1 {
+                inserted += 1;
+            } else {
+                duplicates += 1;
+            }
         } else {
             duplicates += 1;
         }

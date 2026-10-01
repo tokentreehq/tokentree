@@ -233,10 +233,10 @@ fn test_hermes_state_db_read_only_snapshot_safe_and_idempotent_growth() {
         .unwrap();
     }
 
-    // 4. Third import: exactly the 2 new rows are inserted, 0 duplicates
+    // 4. Third import: exactly the 2 new rows are inserted, 2 existing rows recorded as duplicates
     let res3 = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
     assert_eq!(res3.inserted, 2);
-    assert_eq!(res3.duplicates, 0);
+    assert_eq!(res3.duplicates, 2);
 
     // 5. Fourth import without changes: 0 inserted
     let res4 = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
@@ -372,6 +372,210 @@ fn test_authoritative_some_zero_tokens_on_measured_row() {
     assert_eq!(obs.usage.output_tokens, Some(0));
     assert_eq!(obs.usage.cached_input_tokens, Some(0));
     assert_eq!(obs.usage.reasoning_tokens, Some(0));
+}
+
+#[test]
+fn test_hermes_decimal_parsing_rejects_malformed_and_exponents() {
+    // Malformed and exponent strings must be rejected
+    assert!(decimal_dollars_to_micros("1e-5").is_err());
+    assert!(decimal_dollars_to_micros("-0.05").is_err());
+    assert!(decimal_dollars_to_micros("1.2.3").is_err());
+    assert!(decimal_dollars_to_micros("").is_err());
+    assert!(decimal_dollars_to_micros("NaN").is_err());
+    assert!(decimal_dollars_to_micros("inf").is_err());
+    assert!(decimal_dollars_to_micros("abc").is_err());
+    assert!(decimal_dollars_to_micros("999999999999999999999999").is_err());
+
+    // value_to_micros must reject negative, infinite, and out-of-range values
+    assert_eq!(value_to_micros(Some(&serde_json::json!(-0.01))), None);
+    assert_eq!(value_to_micros(Some(&serde_json::json!("1e-5"))), None);
+    assert_eq!(value_to_micros(Some(&serde_json::json!("-5.0"))), None);
+    assert_eq!(value_to_micros(Some(&serde_json::json!(2_000_000.0))), None);
+}
+
+#[test]
+fn test_hermes_state_db_source_database_byte_for_byte_unchanged() {
+    use sha2::{Digest, Sha256};
+    let dir = tempdir().unwrap();
+    let state_db_path = dir.path().join("hermes_state.db");
+
+    // Initialize mock database
+    {
+        let conn = rusqlite::Connection::open(&state_db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT);
+             CREATE TABLE session_model_usage (
+                 session_id TEXT NOT NULL, model TEXT NOT NULL, billing_provider TEXT DEFAULT '',
+                 task TEXT DEFAULT '', api_call_count INTEGER DEFAULT 1, input_tokens INTEGER DEFAULT 0,
+                 output_tokens INTEGER DEFAULT 0, cache_read_tokens INTEGER DEFAULT 0,
+                 cache_write_tokens INTEGER DEFAULT 0, reasoning_tokens INTEGER DEFAULT 0,
+                 estimated_cost_usd REAL, actual_cost_usd REAL, cost_status TEXT, cost_source TEXT,
+                 first_seen REAL, last_seen REAL, PRIMARY KEY (session_id, model, task)
+             );
+             INSERT INTO sessions VALUES ('ses_test', NULL);
+             INSERT INTO session_model_usage (session_id, model, task, input_tokens, output_tokens, estimated_cost_usd, first_seen, last_seen)
+             VALUES ('ses_test', 'liquid/lfm-2.5-2.6b:free', '', 500, 50, 0.0, 100.0, 100.0);",
+        ).unwrap();
+    }
+
+    let initial_bytes = std::fs::read(&state_db_path).unwrap();
+    let initial_hash = hex::encode(Sha256::digest(&initial_bytes));
+
+    let ledger_path = dir.path().join("ledger.db");
+    let mut ledger = Ledger::open(&ledger_path).unwrap();
+
+    // Ingest into ledger
+    let res = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
+    assert_eq!(res.inserted, 1);
+
+    // Verify byte-for-byte identity of source database
+    let post_bytes = std::fs::read(&state_db_path).unwrap();
+    let post_hash = hex::encode(Sha256::digest(&post_bytes));
+
+    assert_eq!(
+        initial_hash, post_hash,
+        "TokenTree must never modify source Hermes database"
+    );
+    assert_eq!(initial_bytes, post_bytes, "Source bytes must be identical");
+}
+
+#[test]
+fn test_hermes_state_db_timestamp_collisions_and_updated_rows() {
+    let dir = tempdir().unwrap();
+    let state_db_path = dir.path().join("hermes_state.db");
+
+    // 1. Initialize DB with 2 records sharing the EXACT same timestamp (collision)
+    {
+        let conn = rusqlite::Connection::open(&state_db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT);
+             CREATE TABLE session_model_usage (
+                 session_id TEXT NOT NULL, model TEXT NOT NULL, billing_provider TEXT DEFAULT '',
+                 task TEXT DEFAULT '', api_call_count INTEGER DEFAULT 1, input_tokens INTEGER DEFAULT 0,
+                 output_tokens INTEGER DEFAULT 0, cache_read_tokens INTEGER DEFAULT 0,
+                 cache_write_tokens INTEGER DEFAULT 0, reasoning_tokens INTEGER DEFAULT 0,
+                 estimated_cost_usd REAL, actual_cost_usd REAL, cost_status TEXT, cost_source TEXT,
+                 first_seen REAL, last_seen REAL, PRIMARY KEY (session_id, model, task)
+             );
+             INSERT INTO sessions VALUES ('ses_1', NULL);
+             INSERT INTO session_model_usage (session_id, model, task, input_tokens, output_tokens, estimated_cost_usd, first_seen, last_seen)
+             VALUES ('ses_1', 'liquid/lfm-2.5-2.6b:free', 'main', 500, 50, 0.0, 100.0, 100.0);
+             INSERT INTO session_model_usage (session_id, model, task, input_tokens, output_tokens, estimated_cost_usd, first_seen, last_seen)
+             VALUES ('ses_1', 'liquid/lfm-2.5-2.6b:free', 'aux', 200, 20, 0.0, 100.0, 100.0);",
+        ).unwrap();
+    }
+
+    let ledger_path = dir.path().join("ledger.db");
+    let mut ledger = Ledger::open(&ledger_path).unwrap();
+
+    let res1 = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
+    assert_eq!(
+        res1.inserted, 2,
+        "both records sharing timestamp 100.0 must be inserted"
+    );
+
+    // 2. Hermes updates the 'main' task row in place with more tokens as session progresses
+    {
+        let conn = rusqlite::Connection::open(&state_db_path).unwrap();
+        conn.execute(
+            "UPDATE session_model_usage SET input_tokens = 1200, output_tokens = 150 WHERE session_id = 'ses_1' AND task = 'main'",
+            [],
+        ).unwrap();
+    }
+
+    let res2 = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
+    assert_eq!(
+        res2.inserted, 1,
+        "updated row must emit append-only delta event"
+    );
+
+    // Total events in ledger is 3 (2 initial + 1 append-only delta)
+    let total_evts: i64 = ledger
+        .connection()
+        .query_row(
+            "SELECT count(*) FROM usage_events WHERE adapter = 'hermes'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(total_evts, 3);
+
+    // Total tokens must reflect updated counts: 1200 + 150 + 200 + 20 = 1570
+    let total_tokens: i64 = ledger
+        .connection()
+        .query_row("SELECT sum(coalesce(input_tokens, 0) + coalesce(output_tokens, 0)) FROM usage_events WHERE adapter = 'hermes'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(total_tokens, 1570);
+
+    let recon = ledger.reconcile().unwrap();
+    assert_eq!(recon.duplicate_request_ids, 0);
+}
+
+#[test]
+fn test_hermes_state_db_replacement_and_truncation() {
+    let dir = tempdir().unwrap();
+    let state_db_path = dir.path().join("hermes_state.db");
+
+    // 1. Initial database with session ses_old
+    {
+        let conn = rusqlite::Connection::open(&state_db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT);
+             CREATE TABLE session_model_usage (
+                 session_id TEXT NOT NULL, model TEXT NOT NULL, billing_provider TEXT DEFAULT '',
+                 task TEXT DEFAULT '', api_call_count INTEGER DEFAULT 1, input_tokens INTEGER DEFAULT 0,
+                 output_tokens INTEGER DEFAULT 0, cache_read_tokens INTEGER DEFAULT 0,
+                 cache_write_tokens INTEGER DEFAULT 0, reasoning_tokens INTEGER DEFAULT 0,
+                 estimated_cost_usd REAL, actual_cost_usd REAL, cost_status TEXT, cost_source TEXT,
+                 first_seen REAL, last_seen REAL, PRIMARY KEY (session_id, model, task)
+             );
+             INSERT INTO sessions VALUES ('ses_old', NULL);
+             INSERT INTO session_model_usage (session_id, model, task, input_tokens, output_tokens, estimated_cost_usd, first_seen, last_seen)
+             VALUES ('ses_old', 'liquid/lfm-2.5-2.6b:free', '', 500, 50, 0.0, 200.0, 200.0);",
+        ).unwrap();
+    }
+
+    let ledger_path = dir.path().join("ledger.db");
+    let mut ledger = Ledger::open(&ledger_path).unwrap();
+
+    let res1 = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
+    assert_eq!(res1.inserted, 1);
+
+    // 2. Database is replaced with a new truncated DB that has an older timestamp (e.g. 50.0)
+    std::fs::remove_file(&state_db_path).unwrap();
+    {
+        let conn = rusqlite::Connection::open(&state_db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT);
+             CREATE TABLE session_model_usage (
+                 session_id TEXT NOT NULL, model TEXT NOT NULL, billing_provider TEXT DEFAULT '',
+                 task TEXT DEFAULT '', api_call_count INTEGER DEFAULT 1, input_tokens INTEGER DEFAULT 0,
+                 output_tokens INTEGER DEFAULT 0, cache_read_tokens INTEGER DEFAULT 0,
+                 cache_write_tokens INTEGER DEFAULT 0, reasoning_tokens INTEGER DEFAULT 0,
+                 estimated_cost_usd REAL, actual_cost_usd REAL, cost_status TEXT, cost_source TEXT,
+                 first_seen REAL, last_seen REAL, PRIMARY KEY (session_id, model, task)
+             );
+             INSERT INTO sessions VALUES ('ses_new', NULL);
+             INSERT INTO session_model_usage (session_id, model, task, input_tokens, output_tokens, estimated_cost_usd, first_seen, last_seen)
+             VALUES ('ses_new', 'openai/gpt-4o', '', 800, 80, 0.005, 50.0, 50.0);",
+        ).unwrap();
+    }
+
+    let res2 = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
+    assert_eq!(
+        res2.inserted, 1,
+        "records from replacement database must be ingested"
+    );
+
+    let total_evts: i64 = ledger
+        .connection()
+        .query_row(
+            "SELECT count(*) FROM usage_events WHERE adapter = 'hermes'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(total_evts, 2);
 }
 
 fn parse_session_file(path: &Path) -> anyhow::Result<ParseResult> {

@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { isFreeModel, parseHermesSession, usdToMicros } from '../src/index.js';
+import {
+  decimalDollarsToMicros,
+  isFreeModel,
+  parseHermesSession,
+  usdToMicros,
+  valueToMicros,
+} from '../src/index.js';
 
 const root = resolve(import.meta.dirname, '../../../../');
 
@@ -10,6 +16,24 @@ describe('Hermes adapter parser', () => {
     expect(usdToMicros(0.00011)).toBe(110);
     expect(usdToMicros(0)).toBe(0);
     expect(usdToMicros(1.5)).toBe(1500000);
+  });
+
+  it('rejects invalid numbers, exponents, and out-of-range values in decimal conversion', () => {
+    expect(decimalDollarsToMicros('1e-5')).toBeNull();
+    expect(decimalDollarsToMicros('1E+3')).toBeNull();
+    expect(decimalDollarsToMicros('abc')).toBeNull();
+    expect(decimalDollarsToMicros('-1.5')).toBeNull();
+    expect(decimalDollarsToMicros('1.2.3')).toBeNull();
+    expect(decimalDollarsToMicros('')).toBeNull();
+
+    expect(valueToMicros(NaN)).toBeUndefined();
+    expect(valueToMicros(Infinity)).toBeUndefined();
+    expect(valueToMicros(-Infinity)).toBeUndefined();
+    expect(valueToMicros(-0.5)).toBeUndefined();
+    expect(valueToMicros(1_000_001)).toBeUndefined();
+    expect(valueToMicros('1e-5')).toBeUndefined();
+    expect(valueToMicros('0.00011')).toBe(110);
+    expect(valueToMicros(0.00011)).toBe(110);
   });
 
   it('detects free models accurately without substring false positives', () => {

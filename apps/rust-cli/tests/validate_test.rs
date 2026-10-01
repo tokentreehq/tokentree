@@ -48,15 +48,26 @@ struct TestAdapterCapabilities {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct TestAdapterChecks {
-    self_test: String,
-    discovery: String,
-    configuration: String,
-    host_telemetry: String,
-    ledger_integrity: String,
-    reconciliation: String,
-    privacy_audit: String,
-    live_capture: String,
+    self_test_status: String,
+    provider_status: String,
+    configuration_status: String,
+    telemetry_status: String,
+    ledger_integrity_status: String,
+    reconciliation_status: String,
+    privacy_audit_status: String,
+    live_capture_status: String,
     overall_status: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct TestHostTelemetryFiles {
+    attempted: u64,
+    verified: u64,
+    failed: u64,
+    unsupported: u64,
+    anomalous: u64,
+    skipped: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -72,6 +83,7 @@ struct TestAdapterCounters {
     anomalies_detected: u64,
     duplicate_requests: u64,
     privacy_violations: u64,
+    host_files: TestHostTelemetryFiles,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -102,7 +114,8 @@ struct TestValidationSuiteReport {
     timestamp: String,
     mode: String,
     environment: TestEnvironmentMetadata,
-    overall_passed: bool,
+    overall_status: String,
+    exit_code: i32,
     adapters: BTreeMap<String, TestAdapterValidationReport>,
 }
 
@@ -123,8 +136,8 @@ fn test_validate_self_test_all_passes() {
         stdout,
         stderr
     );
-    assert!(stdout.contains("Overall Validation: PASS"));
-    assert!(stdout.contains("SELF-TEST PASS"));
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stdout.contains("Overall Status: HEALTHY"));
     assert!(stdout.contains("[claude]"));
     assert!(stdout.contains("[codex]"));
     assert!(stdout.contains("[grok]"));
@@ -145,15 +158,15 @@ fn test_validate_self_test_individual_adapters() {
             output.status.success(),
             "validate --self-test {adapter} failed: {stdout}\nstderr: {stderr}"
         );
+        assert_eq!(output.status.code(), Some(0));
         assert!(stdout.contains(&format!("[{adapter}]")));
-        assert!(stdout.contains("Status:                  SELF-TEST PASS"));
-        assert!(stdout.contains("Overall Validation: PASS"));
+        assert!(stdout.contains("Self-Test (Fixtures):  passed"));
+        assert!(stdout.contains("Overall Status: HEALTHY"));
     }
 }
 
 #[test]
 fn test_validate_require_live_fails_when_uninstalled() {
-    // When requiring live environment, nonexistent or uninstalled adapters must fail closed
     let output = std::process::Command::new(bin_path())
         .args(["validate", "--require-live", "codex"])
         .output()
@@ -161,11 +174,15 @@ fn test_validate_require_live_fails_when_uninstalled() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     if stdout.contains("CLI Installed:         no") {
-        assert!(
-            !output.status.success(),
-            "--require-live must fail when CLI is not installed"
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "--require-live must fail with code 1 when CLI is not installed"
         );
-        assert!(stdout.contains("FAIL") || stdout.contains("UNAVAILABLE"));
+        assert!(
+            stdout.contains("Overall Status: UNAVAILABLE")
+                || stdout.contains("Overall Status: FAILED")
+        );
     }
 }
 
@@ -180,12 +197,13 @@ fn test_validate_host_mode_distinguishes_unavailable_from_passed() {
     // If Codex CLI is not installed on this machine, host validation must report UNAVAILABLE, not PASS!
     if stdout.contains("CLI Installed:         no") && stdout.contains("Telemetry Discovered:  no")
     {
-        assert!(
-            !output.status.success(),
-            "uninstalled provider in host mode must not succeed"
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "uninstalled provider in host mode must exit with code 3 (unavailable)"
         );
-        assert!(stdout.contains("Status:                  UNAVAILABLE"));
-        assert!(stdout.contains("Overall Validation: UNAVAILABLE"));
+        assert!(stdout.contains("Provider Status:       unavailable"));
+        assert!(stdout.contains("Overall Status: UNAVAILABLE"));
     }
 }
 
@@ -196,9 +214,22 @@ fn test_validate_unknown_adapter_fails_closed() {
         .output()
         .expect("execute validate with unknown adapter");
 
-    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("Unknown adapter") || stderr.contains("unsupported_llm_tool"));
+}
+
+#[test]
+fn test_validate_fixture_with_all_incompatible() {
+    let fixture = repo_root().join("fixtures/parsers/grok/multi-turn.json");
+    let output = std::process::Command::new(bin_path())
+        .args(["validate", "--all", "--fixture", fixture.to_str().unwrap()])
+        .output()
+        .expect("execute validate --all with --fixture");
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--fixture cannot be combined with --all"));
 }
 
 #[test]
@@ -211,12 +242,13 @@ fn test_validate_malformed_fixture_fails_closed() {
         .output()
         .expect("execute validate on corrupted fixture");
 
-    assert!(
-        !output.status.success(),
-        "malformed fixture must fail closed"
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "malformed fixture must fail with exit code 1"
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("FAIL"));
+    assert!(stdout.contains("FAILED"));
 }
 
 #[test]
@@ -236,7 +268,7 @@ fn test_validate_output_report_schema_and_deny_unknown_fields() {
         .output()
         .expect("execute validate with output report");
 
-    assert!(output.status.success());
+    assert_eq!(output.status.code(), Some(0));
     assert!(report_path.exists());
 
     let content = std::fs::read_to_string(&report_path).unwrap();
@@ -248,18 +280,22 @@ fn test_validate_output_report_schema_and_deny_unknown_fields() {
     assert_eq!(report.schema_version, "1.0.0");
     assert_eq!(report.mode, "self_test");
     assert!(report.generator.starts_with("tokentree validate"));
-    assert!(report.overall_passed);
+    assert_eq!(report.overall_status, "healthy");
+    assert_eq!(report.exit_code, 0);
     assert_eq!(report.adapters.len(), 4);
 
     for (name, ad) in &report.adapters {
-        assert_eq!(ad.checks.self_test, "passed");
-        assert_eq!(ad.checks.overall_status, "self_test_passed");
+        assert_eq!(ad.checks.self_test_status, "passed");
+        assert_eq!(ad.checks.overall_status, "healthy");
         assert_eq!(ad.counters.duplicate_requests, 0);
         assert_eq!(ad.counters.privacy_violations, 0);
         assert!(ad.counters.total_tokens > 0);
 
         let diag = ad.local_diagnostics.as_ref().expect("local diagnostics");
         assert!(!diag.models_observed.is_empty(), "models for {name}");
+        if let Some(pct) = diag.completeness_pct {
+            assert!((0.0..=100.0).contains(&pct));
+        }
     }
 
     // 2. Adversarial unknown field injection test: deny_unknown_fields must reject unknown key

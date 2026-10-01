@@ -14,7 +14,7 @@ pub use corrections::{
     move_work_item, reclassify_work_item, rename_work_item, split_work_item,
     validate_group_invariant,
 };
-pub use export::{export_csv, export_html, export_json, html_escape};
+pub use export::{csv_escape, export_csv, export_html, export_json, html_escape};
 pub use manual::{
     ManualCounts, ManualStartInput, ManualStartResult, ManualStopResult, start_manual, stop_manual,
 };

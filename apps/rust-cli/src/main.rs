@@ -214,7 +214,7 @@ fn run() -> Result<()> {
             output,
             local_details,
         } => {
-            let ok = validate::run_validation(validate::ValidateOptions {
+            let exit_code = validate::run_validation(validate::ValidateOptions {
                 adapter,
                 all,
                 self_test,
@@ -223,8 +223,8 @@ fn run() -> Result<()> {
                 output,
                 local_details,
             })?;
-            if !ok {
-                std::process::exit(1);
+            if exit_code != 0 {
+                std::process::exit(exit_code);
             }
             Ok(())
         }
