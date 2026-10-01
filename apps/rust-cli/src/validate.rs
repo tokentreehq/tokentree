@@ -400,8 +400,19 @@ fn validate_single_adapter(
         capture_available,
     };
 
-    // Discovery check passes if capabilities are detected or custom fixture provided
-    let discovery_passed = custom_fixture.is_some() || capture_available || config_present;
+    // Discovery check validates that custom fixture (if specified) exists and that
+    // host telemetry paths (if present) are accessible and readable.
+    let discovery_passed = if let Some(fix) = custom_fixture {
+        fix.exists() && fix.is_file()
+    } else if let Some(s_dir) = &session_dir {
+        if s_dir.exists() {
+            fs::read_dir(s_dir).is_ok()
+        } else {
+            true
+        }
+    } else {
+        true
+    };
 
     // Configuration checks
     let config_passed = verify_configuration(adapter, config_path.as_deref());
