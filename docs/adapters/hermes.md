@@ -27,16 +27,16 @@ Hermes persists usage telemetry across two primary locations:
    - Auxiliary tasks map their `parent_agent_id` to the parent session.
 
 3. **Provider Costs & Pricing Fallback**:
-   - Provider-reported costs (`actual_cost_usd` or `estimated_cost_usd`) are converted to integer microdollars ($10^{-6}$ USD):
-     $$\text{micros} = \operatorname{round}(\text{costUsd} \times 1{,}000{,}000)$$
+   - Provider-reported costs (`actual_cost_usd` or `estimated_cost_usd`) are parsed using exact string decimal-to-integer-micros conversion (`decimal_dollars_to_micros(&str)` / `valueToMicros(val)`) with finite range bounds and explicit rejection of scientific notation/exponents.
+   - Precedence order: `actual_cost` > `cost_usd` > `total_cost` > `estimated_cost`.
    - Free models (e.g. models ending in `:free`) report 0 micros native cost.
    - Non-free models with missing provider cost fall back to TokenTree's versioned price snapshot (`PriceSnapshot`). If the rate is unlisted, cost remains unavailable (never fabricated as $0.00).
 
 4. **Zero-Token & Failed Runs**:
    - Aborted runs or provider errors (e.g., HTTP 429 rate limit or HTTP 404 retired model) with `failed: true` are recorded as `hermes_failed_run` with 0 tokens.
 
-5. **Durable Ingestion Checkpoints**:
-   - For `state.db`: The adapter tracks the maximum `last_seen` timestamp in `ingestion_checkpoints`, enabling incremental append imports.
+5. **Durable Ingestion Checkpoints & Active WAL Support**:
+   - For `state.db`: The adapter tracks transactional logical row checkpoints keyed by stable row identity (`(session_id, model, task)`) in `ingestion_checkpoints`, calculating independent category deltas and supporting active WAL commits without mutating the source database.
    - For JSON usage files: Tracked via SHA-256 file hashes.
 
 ## Privacy & Security
