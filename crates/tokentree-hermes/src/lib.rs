@@ -60,10 +60,25 @@ pub struct HermesImportResult {
 pub enum HermesCostClassification {
     /// Free model has authoritative zero cost
     AuthoritativeZero,
+    /// Explicitly measured zero cost from provider (e.g. cache-only turn, promo tier, or zero-billed transaction)
+    MeasuredZero,
     /// Provider reported positive cost, converted exactly to micros
     AuthoritativeProvider(u64),
     /// Provider cost is unavailable; TokenTree catalog pricing will compute fallback cost
     UnavailableProviderCost,
+}
+
+#[must_use]
+pub fn is_free_model(model: &str) -> bool {
+    let lower = model.trim().to_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    lower.ends_with(":free")
+        || lower.ends_with("/free")
+        || lower.ends_with("-free")
+        || lower.contains(":free:")
+        || lower.split('/').any(|seg| seg == "free")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,7 +90,9 @@ pub struct HermesAuxiliaryTask {
     pub cache_read_tokens: Option<u64>,
     pub cache_write_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
+    pub actual_cost_usd: Option<Value>,
     pub estimated_cost_usd: Option<Value>,
+    pub cost_usd: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,7 +112,10 @@ pub struct HermesAuxiliaryReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct HermesUsageFile {
+    pub actual_cost_usd: Option<Value>,
     pub estimated_cost_usd: Option<Value>,
+    pub cost_usd: Option<Value>,
+    pub total_cost: Option<Value>,
     pub cost_status: Option<String>,
     pub cost_source: Option<String>,
     pub input_tokens: Option<u64>,
@@ -133,7 +153,8 @@ pub fn discover_sessions(root: &Path) -> Vec<PathBuf> {
             }
             let name = entry.file_name().to_string_lossy();
             name == "state.db"
-                || name.ends_with(".db")
+                || name.ends_with("_state.db")
+                || name.ends_with("-state.db")
                 || name.ends_with("usage.json")
                 || name.starts_with("request_dump_")
         })
@@ -329,23 +350,41 @@ pub fn parse_json_usage_str(
     };
 
     let model_str = usage_file.model.clone();
-    let is_free_model = model_str
-        .as_ref()
-        .is_some_and(|m| m.contains(":free") || m.contains("free"));
+    let is_model_free = model_str.as_deref().is_some_and(is_free_model);
 
-    let parsed_cost_micros = value_to_micros(usage_file.estimated_cost_usd.as_ref());
+    // Cost precedence: actual cost > cost_usd > total_cost > estimated cost
+    let parsed_actual = value_to_micros(
+        usage_file
+            .actual_cost_usd
+            .as_ref()
+            .or(usage_file.cost_usd.as_ref())
+            .or(usage_file.total_cost.as_ref()),
+    );
+    let parsed_estimated = value_to_micros(usage_file.estimated_cost_usd.as_ref());
+    let parsed_cost_micros = parsed_actual.or(parsed_estimated);
 
     let (_cost_classification, provider_cost_micros) = if is_unmeasured {
         (HermesCostClassification::UnavailableProviderCost, None)
     } else {
         match parsed_cost_micros {
-            Some(micros) if micros > 0 => (
+            Some(0) => {
+                if is_model_free {
+                    (HermesCostClassification::AuthoritativeZero, Some(0))
+                } else {
+                    (HermesCostClassification::MeasuredZero, Some(0))
+                }
+            }
+            Some(micros) => (
                 HermesCostClassification::AuthoritativeProvider(micros),
                 Some(micros),
             ),
-            Some(0) if is_free_model => (HermesCostClassification::AuthoritativeZero, Some(0)),
-            _ if is_free_model => (HermesCostClassification::AuthoritativeZero, Some(0)),
-            _ => (HermesCostClassification::UnavailableProviderCost, None),
+            None => {
+                if is_model_free {
+                    (HermesCostClassification::AuthoritativeZero, Some(0))
+                } else {
+                    (HermesCostClassification::UnavailableProviderCost, None)
+                }
+            }
         }
     };
 
@@ -386,15 +425,22 @@ pub fn parse_json_usage_str(
                     reasoning_tokens: task_data.reasoning_tokens,
                 };
                 let task_is_unmeasured = !task_tokens.is_measured();
-                let task_parsed_cost = value_to_micros(task_data.estimated_cost_usd.as_ref());
+                let task_actual = value_to_micros(
+                    task_data
+                        .actual_cost_usd
+                        .as_ref()
+                        .or(task_data.cost_usd.as_ref()),
+                );
+                let task_estimated = value_to_micros(task_data.estimated_cost_usd.as_ref());
+                let task_parsed = task_actual.or(task_estimated);
                 let (task_source, task_cost_micros) = if task_is_unmeasured {
                     (MeasurementSource::Unavailable, None)
                 } else {
-                    let cost = match task_parsed_cost {
-                        Some(micros) if micros > 0 => Some(micros),
-                        Some(0) if is_free_model => Some(0),
-                        _ if is_free_model => Some(0),
-                        _ => None,
+                    let cost = match task_parsed {
+                        Some(0) => Some(0),
+                        Some(micros) => Some(micros),
+                        None if is_model_free => Some(0),
+                        None => None,
                     };
                     (MeasurementSource::ProviderFields, cost)
                 };
@@ -435,13 +481,15 @@ pub fn parse_json_usage_str(
 }
 
 pub fn parse_hermes_state_db(db_path: &Path, since_timestamp: Option<f64>) -> Result<ParseResult> {
-    let conn = Connection::open_with_flags(
+    let mut conn = Connection::open_with_flags(
         db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
             | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
             | rusqlite::OpenFlags::SQLITE_OPEN_URI,
     )?;
     conn.execute_batch("PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;")?;
+
+    let read_tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
 
     let mut observations = Vec::new();
     let anomalies = Vec::new();
@@ -452,7 +500,7 @@ pub fn parse_hermes_state_db(db_path: &Path, since_timestamp: Option<f64>) -> Re
 
     // Query parent session mapping from `sessions` table if it exists
     let mut parent_map: HashMap<String, String> = HashMap::new();
-    if let Ok(mut stmt) = conn
+    if let Ok(mut stmt) = read_tx
         .prepare("SELECT id, parent_session_id FROM sessions WHERE parent_session_id IS NOT NULL")
     {
         let rows = stmt.query_map([], |row| {
@@ -466,7 +514,17 @@ pub fn parse_hermes_state_db(db_path: &Path, since_timestamp: Option<f64>) -> Re
     // Query session_model_usage
     let query = "SELECT session_id, model, billing_provider, task, api_call_count, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, estimated_cost_usd, actual_cost_usd, cost_status, cost_source, first_seen, last_seen FROM session_model_usage";
 
-    let mut stmt = conn.prepare(query)?;
+    let mut stmt = match read_tx.prepare(query) {
+        Ok(s) => s,
+        Err(_) => {
+            return Ok(ParseResult {
+                observations,
+                anomalies,
+                stats,
+                final_state: HermesParserState::default(),
+            });
+        }
+    };
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,                          // session_id
@@ -526,7 +584,7 @@ pub fn parse_hermes_state_db(db_path: &Path, since_timestamp: Option<f64>) -> Re
 
         stats.parsed += 1;
 
-        let is_free_model = model.contains(":free") || model.contains("free");
+        let is_model_free = is_free_model(&model);
 
         let est_micros = match est_cost.as_ref() {
             Some(rusqlite::types::Value::Text(s)) => decimal_dollars_to_micros(s).ok(),
@@ -553,10 +611,15 @@ pub fn parse_hermes_state_db(db_path: &Path, since_timestamp: Option<f64>) -> Re
         let cost_micros = act_micros.or(est_micros);
 
         let provider_cost_micros = match cost_micros {
-            Some(micros) if micros > 0 => Some(micros),
-            Some(0) if is_free_model => Some(0),
-            _ if is_free_model => Some(0),
-            _ => None,
+            Some(0) => Some(0), // Free model or measured zero on paid model
+            Some(micros) => Some(micros),
+            None => {
+                if is_model_free {
+                    Some(0)
+                } else {
+                    None
+                }
+            }
         };
 
         let parent_session_id = parent_map.get(&session_id).cloned();
@@ -727,7 +790,7 @@ pub fn import_hermes_file(connection: &mut Connection, path: &Path) -> Result<He
         parse_json_usage_str(&content_str, path, 0, HermesParserState::default())?
     };
 
-    let tx = connection.transaction()?;
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
     let mut inserted = 0_u64;
     let mut duplicates = 0_u64;

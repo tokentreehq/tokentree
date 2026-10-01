@@ -65,10 +65,10 @@
 - [x] OpenAI Codex adapter (`crates/tokentree-codex` & `packages/adapters/codex`) with versioned real formats, strict precedence, covered counter suppression, durable append checkpoints, and adversarial tests (Criterion 24 PARTIAL pending official live daemon release)
 - [x] Isolated Claude plugin automation, zero-config report, and cross-platform data preservation on uninstall (Criteria 1 & 2 PARTIAL, Criterion 18 PASS)
 
-## First-Class Adapters & Friend Validation Kit
+## First-Class Adapters & Provider Validation Suite
 - [x] Grok CLI adapter (`crates/tokentree-grok` & `packages/adapters/grok`) with exact $10^{-9}$ USD tick preservation, turn-level precedence, zero-token billing failure handling, and durable ingestion checkpoints
 - [x] Hermes / OpenRouter adapter (`crates/tokentree-hermes` & `packages/adapters/hermes`) with SQLite `state.db` and `--usage-file` parsing, subagent hierarchy correlation, and live verified non-zero token generation
-- [x] Claude Code and OpenAI Codex Friend Validation Kit (`docs/validation-kit/` & `scripts/validation-kit/`) with automated test runners and automated privacy/leakage verification
+- [x] Provider-neutral validation and diagnostics suite (`tokentree validate`, `docs/validation.md`) with automated discovery, configuration, import, integrity, reconciliation, and privacy auditing
 
 
 

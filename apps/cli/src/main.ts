@@ -16,9 +16,10 @@ if (!process.env.TOKENTREE_FORCE_JS) {
 
 const args=process.argv.slice(2); const command=args[0]; const paths=resolvePaths(); const pricesPath=join(import.meta.dirname,'../../../packages/pricing/data/prices.json');
 async function main():Promise<number>{
- if(!command||command==='help'||command==='--help'){console.log('tokentree <doctor|import claude|report --text|query|attach|detach|note|reconcile|migrate prototype --preview|--apply|start|stop|classify>');return 0;}
+ if(!command||command==='help'||command==='--help'){console.log('tokentree <doctor|validate [adapter]|import claude|report --text|query|attach|detach|note|reconcile|migrate prototype --preview|--apply|start|stop|classify>');return 0;}
  const db=openDefaultLedger(paths);
  try{
+  if(command==='validate'){const nativeBin=findNativeBinary();if(nativeBin){const result=spawnSync(nativeBin,process.argv.slice(2),{stdio:'inherit'});return result.status??(result.signal?1:0);}console.error('tokentree validate requires the native engine.');return 1;}
   if(command==='doctor'){const result=doctor(db,paths,pricesPath);console.log(result.lines.join('\n'));return result.ok?0:2;}
   if(command==='import'&&args[1]==='claude'){const path=args[2]??paths.claudeTranscripts;const result=await importClaude(db,path);console.log(JSON.stringify(result,null,2));return result.sessions?0:1;}
   if(command==='report'){if(!args.includes('--text')){console.error('Use --text; it never binds a port.');return 1;}applyPriceSnapshot(db,pricesPath);const i=args.indexOf('--project');console.log(renderProjectTrees(loadProjectTrees(db,i>=0?args[i+1]:undefined)));console.log(`\n${renderTextReport(db)}\n\n${DISCLAIMER}`);return 0;}

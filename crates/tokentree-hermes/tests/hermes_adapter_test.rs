@@ -260,6 +260,73 @@ fn test_hermes_state_db_read_only_snapshot_safe_and_idempotent_growth() {
     assert_eq!(recon.unresolved_anomalies, 0);
 }
 
+#[test]
+fn test_free_model_detection() {
+    assert!(is_free_model("liquid/lfm-2.5-2.6b:free"));
+    assert!(is_free_model("meta-llama/llama-3-8b-instruct:free"));
+    assert!(is_free_model("openrouter/free/test-model"));
+    assert!(is_free_model("provider/model-free"));
+    assert!(is_free_model("provider/model/free"));
+
+    // Non-free models with "free" substring in words must NOT be detected as free
+    assert!(!is_free_model("freedom-ai/model"));
+    assert!(!is_free_model("freeze-v1"));
+    assert!(!is_free_model("freebsd-tools"));
+    assert!(!is_free_model("anthropic/claude-sonnet-4.6"));
+}
+
+#[test]
+fn test_cost_precedence_actual_over_estimated() {
+    let json = serde_json::json!({
+        "actual_cost_usd": 0.005,
+        "estimated_cost_usd": 0.010,
+        "input_tokens": 1000,
+        "output_tokens": 500,
+        "model": "anthropic/claude-sonnet-4.6",
+        "session_id": "ses_precedence_test",
+        "completed": true
+    })
+    .to_string();
+
+    let res = parse_json_usage_str(
+        &json,
+        Path::new("test.json"),
+        0,
+        HermesParserState::default(),
+    )
+    .unwrap();
+    assert_eq!(res.observations.len(), 1);
+    // actual_cost_usd ($0.005 = 5000 micros) must win over estimated_cost_usd ($0.010 = 10000 micros)
+    assert_eq!(
+        res.observations[0].provider_reported_cost_micros,
+        Some(5000)
+    );
+}
+
+#[test]
+fn test_measured_zero_cost_on_paid_model() {
+    let json = serde_json::json!({
+        "actual_cost_usd": 0.0,
+        "input_tokens": 1000,
+        "output_tokens": 500,
+        "model": "anthropic/claude-sonnet-4.6",
+        "session_id": "ses_measured_zero_test",
+        "completed": true
+    })
+    .to_string();
+
+    let res = parse_json_usage_str(
+        &json,
+        Path::new("test.json"),
+        0,
+        HermesParserState::default(),
+    )
+    .unwrap();
+    assert_eq!(res.observations.len(), 1);
+    // Paid model with explicitly measured 0 cost has Some(0) (MeasuredZero)
+    assert_eq!(res.observations[0].provider_reported_cost_micros, Some(0));
+}
+
 fn parse_session_file(path: &Path) -> anyhow::Result<ParseResult> {
     let mut file = std::fs::File::open(path)?;
     let mut content = String::new();

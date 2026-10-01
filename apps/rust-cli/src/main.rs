@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 mod dashboard;
+mod validate;
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
@@ -38,6 +39,18 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Doctor,
+    Validate {
+        #[arg(value_name = "ADAPTER")]
+        adapter: Option<String>,
+        #[arg(long)]
+        all: bool,
+        #[arg(long, value_name = "PATH")]
+        fixture: Option<PathBuf>,
+        #[arg(long, value_name = "PATH")]
+        output: Option<PathBuf>,
+        #[arg(long)]
+        local_details: bool,
+    },
     Import {
         #[command(subcommand)]
         source: ImportSource,
@@ -188,6 +201,25 @@ fn run() -> Result<()> {
     match command {
         Command::HookEnqueue => enqueue_hook(&home),
         Command::Doctor => doctor(&home),
+        Command::Validate {
+            adapter,
+            all,
+            fixture,
+            output,
+            local_details,
+        } => {
+            let ok = validate::run_validation(validate::ValidateOptions {
+                adapter,
+                all,
+                fixture,
+                output,
+                local_details,
+            })?;
+            if !ok {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
         Command::Import {
             source: ImportSource::Claude { path },
         } => import_claude(&home, path.unwrap_or_else(default_claude_path)),

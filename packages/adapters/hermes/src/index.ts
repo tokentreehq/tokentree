@@ -77,6 +77,25 @@ export function valueToMicros(val: unknown): number | undefined {
   return undefined;
 }
 
+export type HermesCostClassification =
+  | 'authoritative_zero'
+  | 'measured_zero'
+  | 'authoritative_provider'
+  | 'unavailable_provider_cost';
+
+export function isFreeModel(model?: string): boolean {
+  if (!model) return false;
+  const lower = model.trim().toLowerCase();
+  if (!lower) return false;
+  return (
+    lower.endsWith(':free') ||
+    lower.endsWith('/free') ||
+    lower.endsWith('-free') ||
+    lower.includes(':free:') ||
+    lower.split('/').some((part) => part === 'free')
+  );
+}
+
 export function usdToMicros(costUsd: number): number {
   return valueToMicros(costUsd) ?? 0;
 }
@@ -130,7 +149,7 @@ export async function parseHermesSession(ref: SessionRef): Promise<ParseResult> 
   const observedAt = new Date().toISOString();
   const isFailed = root.failed === true;
   const modelStr = typeof root.model === 'string' ? root.model : undefined;
-  const isFreeModel = modelStr?.includes(':free') || modelStr?.includes('free') || false;
+  const isModelFree = isFreeModel(modelStr);
 
   stats.parsed++;
 
@@ -165,14 +184,21 @@ export async function parseHermesSession(ref: SessionRef): Promise<ParseResult> 
     });
   }
 
-  const parsedCostMicros = valueToMicros(root.estimated_cost_usd);
+  // Cost precedence: actual_cost > cost_usd > total_cost > estimated_cost
+  const parsedActual = valueToMicros(root.actual_cost_usd ?? root.cost_usd ?? root.total_cost);
+  const parsedEstimated = valueToMicros(root.estimated_cost_usd);
+  const parsedCostMicros = parsedActual ?? parsedEstimated;
 
   let providerCostMicros: number | undefined;
   if (!isUnmeasured) {
     if (parsedCostMicros !== undefined && parsedCostMicros > 0) {
       providerCostMicros = parsedCostMicros;
-    } else if (isFreeModel) {
-      providerCostMicros = 0;
+    } else if (parsedCostMicros === 0) {
+      providerCostMicros = 0; // AuthoritativeZero or MeasuredZero
+    } else if (isModelFree) {
+      providerCostMicros = 0; // AuthoritativeZero
+    } else {
+      providerCostMicros = undefined; // UnavailableProviderCost
     }
   }
 
@@ -230,12 +256,16 @@ export async function parseHermesSession(ref: SessionRef): Promise<ParseResult> 
       );
       const taskIsUnmeasured = !taskHasTokens;
 
-      const taskParsedCost = valueToMicros(task.estimated_cost_usd);
+      const taskActual = valueToMicros(task.actual_cost_usd ?? task.cost_usd);
+      const taskEstimated = valueToMicros(task.estimated_cost_usd);
+      const taskParsedCost = taskActual ?? taskEstimated;
       let taskCostMicros: number | undefined;
       if (!taskIsUnmeasured) {
         if (taskParsedCost !== undefined && taskParsedCost > 0) {
           taskCostMicros = taskParsedCost;
-        } else if (isFreeModel) {
+        } else if (taskParsedCost === 0) {
+          taskCostMicros = 0;
+        } else if (isModelFree) {
           taskCostMicros = 0;
         }
       }

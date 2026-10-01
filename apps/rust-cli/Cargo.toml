@@ -27,6 +27,7 @@ tokentree-hermes = { path = "../../crates/tokentree-hermes" }
 tokentree-ledger = { path = "../../crates/tokentree-ledger" }
 tokentree-otel = { path = "../../crates/tokentree-otel" }
 tokio.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

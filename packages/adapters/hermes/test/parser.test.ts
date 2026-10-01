@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { parseHermesSession, usdToMicros } from '../src/index.js';
+import { isFreeModel, parseHermesSession, usdToMicros } from '../src/index.js';
 
 const root = resolve(import.meta.dirname, '../../../../');
 
@@ -10,6 +10,18 @@ describe('Hermes adapter parser', () => {
     expect(usdToMicros(0.00011)).toBe(110);
     expect(usdToMicros(0)).toBe(0);
     expect(usdToMicros(1.5)).toBe(1500000);
+  });
+
+  it('detects free models accurately without substring false positives', () => {
+    expect(isFreeModel('liquid/lfm-2.5-2.6b:free')).toBe(true);
+    expect(isFreeModel('meta-llama/llama-3-8b-instruct:free')).toBe(true);
+    expect(isFreeModel('openrouter/free/test-model')).toBe(true);
+    expect(isFreeModel('provider/model-free')).toBe(true);
+
+    expect(isFreeModel('freedom-ai/model')).toBe(false);
+    expect(isFreeModel('freeze-v1')).toBe(false);
+    expect(isFreeModel('freebsd-tools')).toBe(false);
+    expect(isFreeModel('anthropic/claude-sonnet-4.6')).toBe(false);
   });
 
   it('parses oneshot Hermes usage fixture with auxiliary task breakdown', async () => {
