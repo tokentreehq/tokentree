@@ -327,6 +327,53 @@ fn test_measured_zero_cost_on_paid_model() {
     assert_eq!(res.observations[0].provider_reported_cost_micros, Some(0));
 }
 
+#[test]
+fn test_authoritative_some_zero_tokens_on_measured_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_db_path = dir.path().join("state.db");
+    {
+        let conn = rusqlite::Connection::open(&state_db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                parent_session_id TEXT
+            );
+            CREATE TABLE session_model_usage (
+                session_id TEXT NOT NULL,
+                model TEXT NOT NULL,
+                billing_provider TEXT,
+                task TEXT,
+                api_call_count INTEGER DEFAULT 1,
+                input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0,
+                cache_read_tokens INTEGER DEFAULT 0,
+                cache_write_tokens INTEGER DEFAULT 0,
+                reasoning_tokens INTEGER DEFAULT 0,
+                estimated_cost_usd REAL,
+                actual_cost_usd REAL,
+                cost_status TEXT,
+                cost_source TEXT,
+                first_seen REAL,
+                last_seen REAL,
+                PRIMARY KEY (session_id, model, task)
+            );
+            INSERT INTO sessions VALUES ('ses_zero_tokens', NULL);
+            INSERT INTO session_model_usage (session_id, model, task, api_call_count, input_tokens, output_tokens, cache_read_tokens, reasoning_tokens, estimated_cost_usd, first_seen, last_seen)
+            VALUES ('ses_zero_tokens', 'openai/gpt-4o', '', 1, 500, 0, 0, 0, 0.001, 100.0, 100.0);",
+        )
+        .unwrap();
+    }
+
+    let res = parse_hermes_state_db(&state_db_path, None).unwrap();
+    assert_eq!(res.observations.len(), 1);
+    let obs = &res.observations[0];
+    assert_eq!(obs.usage.input_tokens, Some(500));
+    // Authoritative Some(0) must be preserved on measured rows
+    assert_eq!(obs.usage.output_tokens, Some(0));
+    assert_eq!(obs.usage.cached_input_tokens, Some(0));
+    assert_eq!(obs.usage.reasoning_tokens, Some(0));
+}
+
 fn parse_session_file(path: &Path) -> anyhow::Result<ParseResult> {
     let mut file = std::fs::File::open(path)?;
     let mut content = String::new();

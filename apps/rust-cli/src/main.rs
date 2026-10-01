@@ -44,6 +44,10 @@ enum Command {
         adapter: Option<String>,
         #[arg(long)]
         all: bool,
+        #[arg(long)]
+        self_test: bool,
+        #[arg(long)]
+        require_live: bool,
         #[arg(long, value_name = "PATH")]
         fixture: Option<PathBuf>,
         #[arg(long, value_name = "PATH")]
@@ -204,6 +208,8 @@ fn run() -> Result<()> {
         Command::Validate {
             adapter,
             all,
+            self_test,
+            require_live,
             fixture,
             output,
             local_details,
@@ -211,6 +217,8 @@ fn run() -> Result<()> {
             let ok = validate::run_validation(validate::ValidateOptions {
                 adapter,
                 all,
+                self_test,
+                require_live,
                 fixture,
                 output,
                 local_details,

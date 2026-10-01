@@ -16,7 +16,7 @@ if (!process.env.TOKENTREE_FORCE_JS) {
 
 const args=process.argv.slice(2); const command=args[0]; const paths=resolvePaths(); const pricesPath=join(import.meta.dirname,'../../../packages/pricing/data/prices.json');
 async function main():Promise<number>{
- if(!command||command==='help'||command==='--help'){console.log('tokentree <doctor|validate [adapter]|import claude|report --text|query|attach|detach|note|reconcile|migrate prototype --preview|--apply|start|stop|classify>');return 0;}
+ if(!command||command==='help'||command==='--help'){console.log('tokentree <doctor|validate [adapter] [--all] [--self-test] [--require-live]|import claude|report --text|query|attach|detach|note|reconcile|migrate prototype --preview|--apply|start|stop|classify>');return 0;}
  const db=openDefaultLedger(paths);
  try{
   if(command==='validate'){const nativeBin=findNativeBinary();if(nativeBin){const result=spawnSync(nativeBin,process.argv.slice(2),{stdio:'inherit'});return result.status??(result.signal?1:0);}console.error('tokentree validate requires the native engine.');return 1;}

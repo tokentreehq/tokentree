@@ -527,22 +527,22 @@ pub fn parse_hermes_state_db(db_path: &Path, since_timestamp: Option<f64>) -> Re
     };
     let rows = stmt.query_map([], |row| {
         Ok((
-            row.get::<_, String>(0)?,                          // session_id
-            row.get::<_, String>(1)?,                          // model
-            row.get::<_, String>(2)?,                          // billing_provider
-            row.get::<_, String>(3)?,                          // task
-            row.get::<_, i64>(4)?,                             // api_call_count
-            row.get::<_, i64>(5)?,                             // input_tokens
-            row.get::<_, i64>(6)?,                             // output_tokens
-            row.get::<_, i64>(7)?,                             // cache_read_tokens
-            row.get::<_, i64>(8)?,                             // cache_write_tokens
-            row.get::<_, i64>(9)?,                             // reasoning_tokens
-            row.get::<_, Option<rusqlite::types::Value>>(10)?, // estimated_cost_usd
-            row.get::<_, Option<rusqlite::types::Value>>(11)?, // actual_cost_usd
-            row.get::<_, Option<String>>(12)?,                 // cost_status
-            row.get::<_, Option<String>>(13)?,                 // cost_source
-            row.get::<_, Option<f64>>(14)?,                    // first_seen
-            row.get::<_, Option<f64>>(15)?,                    // last_seen
+            row.get::<_, String>(0)?,                             // session_id
+            row.get::<_, String>(1)?,                             // model
+            row.get::<_, Option<String>>(2)?.unwrap_or_default(), // billing_provider
+            row.get::<_, Option<String>>(3)?.unwrap_or_default(), // task
+            row.get::<_, Option<i64>>(4)?.unwrap_or(0),           // api_call_count
+            row.get::<_, Option<i64>>(5)?.unwrap_or(0),           // input_tokens
+            row.get::<_, Option<i64>>(6)?.unwrap_or(0),           // output_tokens
+            row.get::<_, Option<i64>>(7)?.unwrap_or(0),           // cache_read_tokens
+            row.get::<_, Option<i64>>(8)?.unwrap_or(0),           // cache_write_tokens
+            row.get::<_, Option<i64>>(9)?.unwrap_or(0),           // reasoning_tokens
+            row.get::<_, Option<rusqlite::types::Value>>(10)?,    // estimated_cost_usd
+            row.get::<_, Option<rusqlite::types::Value>>(11)?,    // actual_cost_usd
+            row.get::<_, Option<String>>(12)?,                    // cost_status
+            row.get::<_, Option<String>>(13)?,                    // cost_source
+            row.get::<_, Option<f64>>(14)?,                       // first_seen
+            row.get::<_, Option<f64>>(15)?,                       // last_seen
         ))
     })?;
 
@@ -552,7 +552,7 @@ pub fn parse_hermes_state_db(db_path: &Path, since_timestamp: Option<f64>) -> Re
             model,
             provider,
             task,
-            _api_calls,
+            api_calls,
             input_tokens,
             output_tokens,
             cache_read,
@@ -640,41 +640,52 @@ pub fn parse_hermes_state_db(db_path: &Path, since_timestamp: Option<f64>) -> Re
             format!("task_{}", task)
         };
 
-        let has_tokens = input_tokens > 0
+        let is_measured = api_calls > 0
+            || input_tokens > 0
             || output_tokens > 0
             || cache_read > 0
             || cache_write > 0
             || reasoning > 0;
 
-        let usage = TokenUsage {
-            input_tokens: if input_tokens > 0 {
-                Some(input_tokens as u64)
-            } else {
-                None
-            },
-            cached_input_tokens: if cache_read > 0 {
-                Some(cache_read as u64)
-            } else {
-                None
-            },
-            cache_write_tokens: if cache_write > 0 {
-                Some(cache_write as u64)
-            } else {
-                None
-            },
-            output_tokens: if output_tokens > 0 {
-                Some(output_tokens as u64)
-            } else {
-                None
-            },
-            reasoning_tokens: if reasoning > 0 {
-                Some(reasoning as u64)
-            } else {
-                None
-            },
+        let usage = if is_measured {
+            TokenUsage {
+                input_tokens: if input_tokens >= 0 {
+                    Some(input_tokens as u64)
+                } else {
+                    None
+                },
+                cached_input_tokens: if cache_read >= 0 {
+                    Some(cache_read as u64)
+                } else {
+                    None
+                },
+                cache_write_tokens: if cache_write >= 0 {
+                    Some(cache_write as u64)
+                } else {
+                    None
+                },
+                output_tokens: if output_tokens >= 0 {
+                    Some(output_tokens as u64)
+                } else {
+                    None
+                },
+                reasoning_tokens: if reasoning >= 0 {
+                    Some(reasoning as u64)
+                } else {
+                    None
+                },
+            }
+        } else {
+            TokenUsage {
+                input_tokens: None,
+                cached_input_tokens: None,
+                cache_write_tokens: None,
+                output_tokens: None,
+                reasoning_tokens: None,
+            }
         };
 
-        let (source, obs_cost) = if !has_tokens {
+        let (source, obs_cost) = if !is_measured {
             (MeasurementSource::Unavailable, None)
         } else {
             (MeasurementSource::ProviderFields, provider_cost_micros)
