@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use axum::{
     Router,
     extract::{Query, State},
@@ -9,7 +9,6 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -29,15 +28,32 @@ pub struct AuthQuery {
     pub token: Option<String>,
 }
 
+/// Constant-time string equality: compares every byte so the comparison
+/// time reveals nothing about how many leading bytes matched. Length is
+/// checked first; all tokens compared here are fixed-length hex digests,
+/// so the length check leaks no secret content.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
 fn verify_token(state: &AppState, headers: &HeaderMap, query: &AuthQuery) -> bool {
     if let Some(t) = &query.token {
-        if t == &state.session_token {
+        if constant_time_eq(t, &state.session_token) {
             return true;
         }
     }
     if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
         if let Some(bearer) = auth.strip_prefix("Bearer ") {
-            if bearer.trim() == state.session_token {
+            if constant_time_eq(bearer.trim(), &state.session_token) {
                 return true;
             }
         }
@@ -46,11 +62,57 @@ fn verify_token(state: &AppState, headers: &HeaderMap, query: &AuthQuery) -> boo
         .get("x-tokentree-token")
         .and_then(|v| v.to_str().ok())
     {
-        if token_hdr.trim() == state.session_token {
+        if constant_time_eq(token_hdr.trim(), &state.session_token) {
             return true;
         }
     }
     false
+}
+
+/// Run blocking SQLite work on Tokio's blocking thread pool instead of an
+/// async worker (H13/H14 fix). Opening the ledger and running queries blocks
+/// the calling thread; doing that directly inside an async handler stalls
+/// every other in-flight request sharing the runtime worker.
+async fn blocking_db<T, F>(home: &Path, work: F) -> std::result::Result<T, DbError>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut Ledger) -> Result<T> + Send + 'static,
+{
+    let db_path = home.join("ledger.db");
+    tokio::task::spawn_blocking(move || {
+        let mut ledger = Ledger::open(&db_path).map_err(DbError::Open)?;
+        work(&mut ledger).map_err(DbError::Op)
+    })
+    .await
+    .map_err(|e| DbError::Open(anyhow!("database worker failed: {e}")))?
+}
+
+/// Error from [`blocking_db`]. Preserves the handlers' original distinction:
+/// failing to *open* the ledger is a 500, failing the *operation* is a 400.
+enum DbError {
+    Open(anyhow::Error),
+    Op(anyhow::Error),
+}
+
+impl DbError {
+    fn status_code(&self) -> StatusCode {
+        match self {
+            DbError::Open(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            DbError::Op(_) => StatusCode::BAD_REQUEST,
+        }
+    }
+
+    fn message(&self) -> String {
+        match self {
+            DbError::Open(e) | DbError::Op(e) => e.to_string(),
+        }
+    }
+}
+
+fn db_error_response(e: DbError) -> Response {
+    apply_security_headers(
+        (e.status_code(), json!({"error": e.message()}).to_string()).into_response(),
+    )
 }
 
 fn apply_security_headers(mut response: Response) -> Response {
@@ -104,30 +166,14 @@ async fn handle_api_projects(
         );
     }
 
-    let db_path = state.home.join("ledger.db");
-    let ledger = match Ledger::open(&db_path) {
-        Ok(l) => l,
-        Err(e) => {
-            return apply_security_headers(
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    json!({"error": e.to_string()}).to_string(),
-                )
-                    .into_response(),
-            );
-        }
-    };
-
-    let trees = match load_project_trees(ledger.connection(), None) {
+    let trees = match blocking_db(&state.home, |ledger| {
+        load_project_trees(ledger.connection(), None)
+    })
+    .await
+    {
         Ok(t) => t,
         Err(e) => {
-            return apply_security_headers(
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    json!({"error": e.to_string()}).to_string(),
-                )
-                    .into_response(),
-            );
+            return db_error_response(e);
         }
     };
 
@@ -156,27 +202,17 @@ async fn handle_rename(
         return apply_security_headers((StatusCode::UNAUTHORIZED, "Unauthorized").into_response());
     }
 
-    let db_path = state.home.join("ledger.db");
-    let mut ledger = match Ledger::open(&db_path) {
-        Ok(l) => l,
-        Err(e) => {
-            return apply_security_headers(
-                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-            );
-        }
-    };
+    let RenamePayload { task, title } = payload;
 
-    match rename_work_item(ledger.connection_mut(), &payload.task, &payload.title) {
+    match blocking_db(&state.home, move |ledger| {
+        rename_work_item(ledger.connection_mut(), &task, &title)
+    })
+    .await
+    {
         Ok(_) => apply_security_headers(
             (StatusCode::OK, json!({"ok": true}).to_string()).into_response(),
         ),
-        Err(e) => apply_security_headers(
-            (
-                StatusCode::BAD_REQUEST,
-                json!({"error": e.to_string()}).to_string(),
-            )
-                .into_response(),
-        ),
+        Err(e) => db_error_response(e),
     }
 }
 
@@ -196,31 +232,17 @@ async fn handle_move(
         return apply_security_headers((StatusCode::UNAUTHORIZED, "Unauthorized").into_response());
     }
 
-    let db_path = state.home.join("ledger.db");
-    let mut ledger = match Ledger::open(&db_path) {
-        Ok(l) => l,
-        Err(e) => {
-            return apply_security_headers(
-                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-            );
-        }
-    };
+    let MovePayload { task, parent } = payload;
 
-    match move_work_item(
-        ledger.connection_mut(),
-        &payload.task,
-        payload.parent.as_deref(),
-    ) {
+    match blocking_db(&state.home, move |ledger| {
+        move_work_item(ledger.connection_mut(), &task, parent.as_deref())
+    })
+    .await
+    {
         Ok(_) => apply_security_headers(
             (StatusCode::OK, json!({"ok": true}).to_string()).into_response(),
         ),
-        Err(e) => apply_security_headers(
-            (
-                StatusCode::BAD_REQUEST,
-                json!({"error": e.to_string()}).to_string(),
-            )
-                .into_response(),
-        ),
+        Err(e) => db_error_response(e),
     }
 }
 
@@ -240,31 +262,17 @@ async fn handle_note(
         return apply_security_headers((StatusCode::UNAUTHORIZED, "Unauthorized").into_response());
     }
 
-    let db_path = state.home.join("ledger.db");
-    let mut ledger = match Ledger::open(&db_path) {
-        Ok(l) => l,
-        Err(e) => {
-            return apply_security_headers(
-                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-            );
-        }
-    };
+    let NotePayload { task, text } = payload;
 
-    match add_note(
-        ledger.connection_mut(),
-        &payload.text,
-        payload.task.as_deref(),
-    ) {
+    match blocking_db(&state.home, move |ledger| {
+        add_note(ledger.connection_mut(), &text, task.as_deref())
+    })
+    .await
+    {
         Ok(id) => apply_security_headers(
             (StatusCode::OK, json!({"ok": true, "id": id}).to_string()).into_response(),
         ),
-        Err(e) => apply_security_headers(
-            (
-                StatusCode::BAD_REQUEST,
-                json!({"error": e.to_string()}).to_string(),
-            )
-                .into_response(),
-        ),
+        Err(e) => db_error_response(e),
     }
 }
 
@@ -284,17 +292,13 @@ async fn handle_attach(
         return apply_security_headers((StatusCode::UNAUTHORIZED, "Unauthorized").into_response());
     }
 
-    let db_path = state.home.join("ledger.db");
-    let mut ledger = match Ledger::open(&db_path) {
-        Ok(l) => l,
-        Err(e) => {
-            return apply_security_headers(
-                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-            );
-        }
-    };
+    let AttachPayload { session, task } = payload;
 
-    match attach_session(ledger.connection_mut(), &payload.session, &payload.task) {
+    match blocking_db(&state.home, move |ledger| {
+        attach_session(ledger.connection_mut(), &session, &task)
+    })
+    .await
+    {
         Ok(changed) => apply_security_headers(
             (
                 StatusCode::OK,
@@ -302,13 +306,7 @@ async fn handle_attach(
             )
                 .into_response(),
         ),
-        Err(e) => apply_security_headers(
-            (
-                StatusCode::BAD_REQUEST,
-                json!({"error": e.to_string()}).to_string(),
-            )
-                .into_response(),
-        ),
+        Err(e) => db_error_response(e),
     }
 }
 
@@ -327,17 +325,13 @@ async fn handle_detach(
         return apply_security_headers((StatusCode::UNAUTHORIZED, "Unauthorized").into_response());
     }
 
-    let db_path = state.home.join("ledger.db");
-    let mut ledger = match Ledger::open(&db_path) {
-        Ok(l) => l,
-        Err(e) => {
-            return apply_security_headers(
-                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-            );
-        }
-    };
+    let DetachPayload { session } = payload;
 
-    match detach_session(ledger.connection_mut(), &payload.session) {
+    match blocking_db(&state.home, move |ledger| {
+        detach_session(ledger.connection_mut(), &session)
+    })
+    .await
+    {
         Ok(changed) => apply_security_headers(
             (
                 StatusCode::OK,
@@ -345,13 +339,7 @@ async fn handle_detach(
             )
                 .into_response(),
         ),
-        Err(e) => apply_security_headers(
-            (
-                StatusCode::BAD_REQUEST,
-                json!({"error": e.to_string()}).to_string(),
-            )
-                .into_response(),
-        ),
+        Err(e) => db_error_response(e),
     }
 }
 
@@ -371,17 +359,13 @@ async fn handle_merge(
         return apply_security_headers((StatusCode::UNAUTHORIZED, "Unauthorized").into_response());
     }
 
-    let db_path = state.home.join("ledger.db");
-    let mut ledger = match Ledger::open(&db_path) {
-        Ok(l) => l,
-        Err(e) => {
-            return apply_security_headers(
-                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-            );
-        }
-    };
+    let MergePayload { source, target } = payload;
 
-    match merge_work_items(ledger.connection_mut(), &payload.source, &payload.target) {
+    match blocking_db(&state.home, move |ledger| {
+        merge_work_items(ledger.connection_mut(), &source, &target)
+    })
+    .await
+    {
         Ok(spans) => apply_security_headers(
             (
                 StatusCode::OK,
@@ -389,13 +373,7 @@ async fn handle_merge(
             )
                 .into_response(),
         ),
-        Err(e) => apply_security_headers(
-            (
-                StatusCode::BAD_REQUEST,
-                json!({"error": e.to_string()}).to_string(),
-            )
-                .into_response(),
-        ),
+        Err(e) => db_error_response(e),
     }
 }
 
@@ -416,22 +394,17 @@ async fn handle_split(
         return apply_security_headers((StatusCode::UNAUTHORIZED, "Unauthorized").into_response());
     }
 
-    let db_path = state.home.join("ledger.db");
-    let mut ledger = match Ledger::open(&db_path) {
-        Ok(l) => l,
-        Err(e) => {
-            return apply_security_headers(
-                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-            );
-        }
-    };
+    let SplitPayload {
+        source,
+        title,
+        spans,
+    } = payload;
 
-    match split_work_item(
-        ledger.connection_mut(),
-        &payload.source,
-        &payload.title,
-        &payload.spans,
-    ) {
+    match blocking_db(&state.home, move |ledger| {
+        split_work_item(ledger.connection_mut(), &source, &title, &spans)
+    })
+    .await
+    {
         Ok(new_id) => apply_security_headers(
             (
                 StatusCode::OK,
@@ -439,13 +412,7 @@ async fn handle_split(
             )
                 .into_response(),
         ),
-        Err(e) => apply_security_headers(
-            (
-                StatusCode::BAD_REQUEST,
-                json!({"error": e.to_string()}).to_string(),
-            )
-                .into_response(),
-        ),
+        Err(e) => db_error_response(e),
     }
 }
 
@@ -459,31 +426,26 @@ async fn handle_api_status(
     }
 
     let db_path = state.home.join("ledger.db");
-    let ledger = match Ledger::open(&db_path) {
-        Ok(l) => l,
-        Err(e) => {
-            return apply_security_headers(
-                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-            );
-        }
-    };
-
-    let session_count: i64 = ledger
-        .connection()
-        .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
-        .unwrap_or(0);
-    let event_count: i64 = ledger
-        .connection()
-        .query_row("SELECT count(*) FROM usage_events", [], |row| row.get(0))
-        .unwrap_or(0);
-    let project_count: i64 = ledger
-        .connection()
-        .query_row("SELECT count(*) FROM projects", [], |row| row.get(0))
-        .unwrap_or(0);
-    let work_item_count: i64 = ledger
-        .connection()
-        .query_row("SELECT count(*) FROM work_items", [], |row| row.get(0))
-        .unwrap_or(0);
+    let (session_count, event_count, project_count, work_item_count) =
+        match blocking_db(&state.home, |ledger| {
+            let conn = ledger.connection();
+            let count = |sql: &str| -> Result<i64> {
+                Ok(conn.query_row(sql, [], |row| row.get(0)).unwrap_or(0))
+            };
+            Ok::<_, anyhow::Error>((
+                count("SELECT count(*) FROM sessions")?,
+                count("SELECT count(*) FROM usage_events")?,
+                count("SELECT count(*) FROM projects")?,
+                count("SELECT count(*) FROM work_items")?,
+            ))
+        })
+        .await
+        {
+            Ok(counts) => counts,
+            Err(e) => {
+                return db_error_response(e);
+            }
+        };
 
     let status_json = json!({
         "ledger_path": db_path.to_string_lossy(),
@@ -505,16 +467,15 @@ async fn handle_api_status(
     )
 }
 
+/// Generate a 256-bit dashboard session token from the OS CSPRNG (H1 fix).
+///
+/// The previous implementation hashed `time:pid`, which any local observer
+/// could predict. Fails fast if the OS CSPRNG is unavailable: falling back
+/// to weak randomness would silently defeat the token.
 pub fn generate_session_token() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let pid = std::process::id();
-    let mut hasher = Sha256::new();
-    hasher.update(format!("{now}:{pid}:tokentree_dashboard_secret"));
-    hex::encode(hasher.finalize())
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).expect("OS CSPRNG failure generating dashboard session token");
+    hex::encode(bytes)
 }
 
 pub fn create_router(state: Arc<AppState>) -> Router {
@@ -1084,6 +1045,23 @@ fn render_dashboard_spa(token: &str) -> String {
   <script>
     const TOKEN = "{token}";
 
+    // C7 fix: escape every dynamic value interpolated into HTML. Project
+    // titles, work-item titles/ids, status strings, and error messages all
+    // originate from the ledger or the network and must never be parsed as
+    // markup. Dynamic text goes through esc(); static markup stays literal.
+    function esc(s) {{
+      return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }}
+
+    // Titles keyed by node id for the Rename action. A Map (not a plain
+    // object) so a hostile id such as "__proto__" cannot pollute anything.
+    const nodeTitles = new Map();
+
     function showTab(tabId) {{
       document.querySelectorAll('.view-panel').forEach(el => el.classList.remove('active'));
       document.querySelectorAll('.nav-btn').forEach(el => el.classList.remove('active'));
@@ -1107,6 +1085,7 @@ fn render_dashboard_spa(token: &str) -> String {
     }}
 
     function renderNode(node, depth) {{
+      nodeTitles.set(node.id, node.title);
       const indent = depth * 24;
       const u = node.inclusive;
       const totalTok = u.input + u.cache_read + u.cache_write + u.output + u.reasoning;
@@ -1128,9 +1107,9 @@ fn render_dashboard_spa(token: &str) -> String {
         <div style="margin-left: ${{indent}}px;">
           <div class="tree-node">
             <div class="node-left">
-              <span class="node-title">${{node.title}}</span>
-              <span class="node-id">${{node.id}}</span>
-              <button class="action-btn" onclick="populateRename('${{node.id}}', '${{node.title.replace(/'/g, "\\'")}}')">Rename</button>
+              <span class="node-title">${{esc(node.title)}}</span>
+              <span class="node-id">${{esc(node.id)}}</span>
+              <button class="action-btn" data-rename-id="${{esc(node.id)}}">Rename</button>
             </div>
             <div style="display: flex; align-items: center; gap: 12px;">
               <span class="cost-val">${{cost}}</span>
@@ -1207,11 +1186,11 @@ fn render_dashboard_spa(token: &str) -> String {
           }}
 
           listHtml += `
-            <div class="project-card" data-key="${{t.key}}">
+            <div class="project-card" data-key="${{esc(t.key)}}">
               <div class="project-header">
                 <div>
-                  <span class="project-title">${{t.title}}</span>
-                  <span class="project-key">${{t.key}}</span>
+                  <span class="project-title">${{esc(t.title)}}</span>
+                  <span class="project-key">${{esc(t.key)}}</span>
                 </div>
                 <div class="project-metrics">
                   <span class="cost-val">${{cost}}</span>
@@ -1227,7 +1206,7 @@ fn render_dashboard_spa(token: &str) -> String {
         }}
         container.innerHTML = listHtml;
       }} catch (err) {{
-        document.getElementById('projectsList').innerHTML = '<div style="color: #EF4444; padding: 24px;">Failed to load projects: ' + err.message + '</div>';
+        document.getElementById('projectsList').innerHTML = '<div style="color: #EF4444; padding: 24px;">Failed to load projects: ' + esc(err.message) + '</div>';
       }}
     }}
 
@@ -1236,14 +1215,14 @@ fn render_dashboard_spa(token: &str) -> String {
         const res = await apiFetch('/api/status');
         const s = await res.json();
         document.getElementById('statusDetails').innerHTML = `
-          <div>Ledger Path: <strong>${{s.ledger_path}}</strong></div>
-          <div>Schema Version: <strong>${{s.schema_version}}</strong></div>
-          <div>Total Sessions: <strong>${{s.session_count}}</strong></div>
-          <div>Total Usage Events: <strong>${{s.event_count}}</strong></div>
-          <div>Projects: <strong>${{s.project_count}}</strong></div>
-          <div>Work Items: <strong>${{s.work_item_count}}</strong></div>
+          <div>Ledger Path: <strong>${{esc(s.ledger_path)}}</strong></div>
+          <div>Schema Version: <strong>${{esc(s.schema_version)}}</strong></div>
+          <div>Total Sessions: <strong>${{esc(s.session_count)}}</strong></div>
+          <div>Total Usage Events: <strong>${{esc(s.event_count)}}</strong></div>
+          <div>Projects: <strong>${{esc(s.project_count)}}</strong></div>
+          <div>Work Items: <strong>${{esc(s.work_item_count)}}</strong></div>
           <div>Loopback Security: <strong>Enforced (127.0.0.1)</strong></div>
-          <div>Capture Mode: <strong>${{s.capture_mode}}</strong></div>
+          <div>Capture Mode: <strong>${{esc(s.capture_mode)}}</strong></div>
         `;
       }} catch (err) {{
         document.getElementById('statusDetails').innerText = 'Failed to load status: ' + err.message;
@@ -1392,6 +1371,16 @@ fn render_dashboard_spa(token: &str) -> String {
         const text = card.textContent.toLowerCase();
         card.style.display = text.includes(term) ? '' : 'none';
       }});
+    }});
+
+    // Rename buttons are rendered dynamically. Delegate clicks instead of an
+    // inline onclick so node ids/titles never pass through the dangerous
+    // HTML-attribute + JS-string double context (C7).
+    document.addEventListener('click', function(e) {{
+      const btn = e.target.closest('[data-rename-id]');
+      if (!btn) return;
+      const id = btn.getAttribute('data-rename-id');
+      populateRename(id, nodeTitles.get(id) || '');
     }});
 
     // Initialize
@@ -1586,6 +1575,61 @@ mod tests {
         assert!(!escaped.contains("<img"));
         assert!(escaped.contains("&lt;script&gt;"));
         assert!(escaped.contains("&quot;"));
+    }
+
+    #[test]
+    fn constant_time_eq_matches_str_eq() {
+        assert!(constant_time_eq("abc", "abc"));
+        assert!(!constant_time_eq("abc", "abd"));
+        assert!(!constant_time_eq("abc", "ab"));
+        assert!(!constant_time_eq("", "a"));
+        assert!(constant_time_eq("", ""));
+        // 64-hex tokens, the actual shape compared in verify_token
+        let t = generate_session_token();
+        assert!(constant_time_eq(&t, &t));
+        assert!(!constant_time_eq(&t, &generate_session_token()));
+    }
+
+    /// C7 regression: the SPA template must route every dynamic interpolation
+    /// through esc(). This statically audits the rendered template for raw
+    /// (unescaped) interpolations and for the old inline-onclick pattern.
+    #[test]
+    fn spa_template_escapes_all_dynamic_interpolations() {
+        let html = render_dashboard_spa("test_token");
+        // The esc() helper must exist and be defined before use.
+        assert!(html.contains("function esc(s)"));
+        // No raw interpolations of ledger-controlled data may remain.
+        for raw in [
+            "${node.title}",
+            "${node.id}",
+            "${t.title}",
+            "${t.key}",
+            "${s.ledger_path}",
+            "${s.capture_mode}",
+            "err.message + '</div>'",
+            "onclick=\"populateRename('",
+        ] {
+            assert!(
+                !html.contains(raw),
+                "unescaped dynamic interpolation remains in SPA template: {raw}"
+            );
+        }
+        // The escaped forms must be present.
+        for escaped in [
+            "${esc(node.title)}",
+            "${esc(node.id)}",
+            "${esc(t.title)}",
+            "${esc(t.key)}",
+            "${esc(s.ledger_path)}",
+            "${esc(s.capture_mode)}",
+            "esc(err.message)",
+            "data-rename-id=\"${esc(node.id)}\"",
+        ] {
+            assert!(
+                html.contains(escaped),
+                "expected escaped interpolation missing from SPA template: {escaped}"
+            );
+        }
     }
 
     #[tokio::test]
