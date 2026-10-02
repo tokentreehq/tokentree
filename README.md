@@ -1,4 +1,22 @@
-![TokenTree](./assets/banner.webp)
+```
+  ______      __            ______
+ /_  __/___  / /_____  ____/_  __/_______  ___
+  / / / __ \/ //_/ _ \/ __ \/ / / ___/ _ \/ _ \
+ / / / /_/ / ,< /  __/ / / / / / /  /  __/  __/
+/_/  \____/_/|_|\___/_/ /_/_/ /_/   \___/\___/
+
+  the meter for the agent economy
+
+──────────────────────────────────────────────────────────
+
+$ tokentree report --text
+
+my-project                              1,248,300 tok      $4.21
+├─ auth refactor                          842,100 tok      $2.84
+│  ├─ session 2026-10-01                  512,400 tok      $1.73
+│  └─ session 2026-10-02                  329,700 tok      $1.11
+└─ bugfix login loop                      406,200 tok      $1.37
+```
 
 **Quickstart** · **[Docs](./docs/install.md)** · **[Plugin](./plugins/claude-code)** · **[npm](https://www.npmjs.com/package/@tokentreehq/cli)** · **[X](https://x.com/0xshrikar)**
 
