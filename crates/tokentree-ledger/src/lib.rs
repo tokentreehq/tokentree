@@ -30,7 +30,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, params};
 use std::fs;
 use std::path::{Path, PathBuf};
-use tokentree_core::{UsageObservation, deduplicate, sha256_hex};
+use tokentree_core::{UsageObservation, deduplicate, sha256_hex, source_kind};
 
 const INITIAL_SCHEMA: &str = include_str!("../../../packages/database/migrations/0001_initial.sql");
 const SCHEMA_VERSION: i64 = 1;
@@ -57,9 +57,15 @@ impl Ledger {
         }
         let connection =
             Connection::open(path).with_context(|| format!("open {}", path.display()))?;
-        connection.execute_batch(
-            "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;",
-        )?;
+        connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")?;
+        // PRAGMA journal_mode returns the resulting mode; execute_batch would
+        // silently swallow a refusal (e.g. read-only FS, unsupported VFS),
+        // leaving the ledger without WAL durability guarantees.
+        let journal_mode: String =
+            connection.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+        if !journal_mode.eq_ignore_ascii_case("wal") {
+            bail!("PRAGMA journal_mode=WAL not honored (got '{journal_mode}')");
+        }
         apply_migrations(&connection)?;
         set_mode(path, 0o600)?;
         Ok(Self {
@@ -181,11 +187,14 @@ pub fn reconcile(connection: &Connection) -> Result<ReconcileResult> {
     let sessions: i64 =
         connection.query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))?;
     let duplicate_requests: i64 = connection.query_row(
-        "SELECT count(*) FROM (
+        &format!(
+            "SELECT count(*) FROM (
             SELECT request_id FROM usage_events
-            WHERE request_id IS NOT NULL AND source_kind NOT IN ('hermes_snapshot_delta', 'snapshot_delta')
+            WHERE request_id IS NOT NULL AND source_kind NOT IN ({})
             GROUP BY request_id HAVING count(*) > 1
         )",
+            source_kind::SNAPSHOT_DELTA_SQL_LIST
+        ),
         [],
         |row| row.get(0),
     )?;
@@ -194,9 +203,10 @@ pub fn reconcile(connection: &Connection) -> Result<ReconcileResult> {
     // Any turn or request where there is both a request-level event and a final-request counter event,
     // or multiple final-request counters for the same turn.
     let duplicate_subagent_counters: i64 = connection.query_row(
-        "SELECT count(*) FROM (
+        &format!(
+            "SELECT count(*) FROM (
             SELECT session_id, turn_id FROM usage_events
-            WHERE source_kind IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter')
+            WHERE source_kind IN ({lifecycle})
             GROUP BY session_id, turn_id
             HAVING count(*) > 1
             UNION
@@ -204,9 +214,12 @@ pub fn reconcile(connection: &Connection) -> Result<ReconcileResult> {
             FROM usage_events e1
             JOIN usage_events e2 ON e1.session_id = e2.session_id
                 AND ((e1.turn_id IS NOT NULL AND e1.turn_id = e2.turn_id) OR (e1.request_id IS NOT NULL AND e1.request_id = e2.request_id))
-            WHERE e1.source_kind IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter')
-              AND e2.source_kind NOT IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter', 'hermes_snapshot_delta', 'snapshot_delta')
+            WHERE e1.source_kind IN ({lifecycle})
+              AND e2.source_kind NOT IN ({lifecycle}, {deltas})
         )",
+            lifecycle = source_kind::LIFECYCLE_COUNTER_SQL_LIST,
+            deltas = source_kind::SNAPSHOT_DELTA_SQL_LIST,
+        ),
         [],
         |row| row.get(0),
     ).unwrap_or(0);
@@ -320,21 +333,34 @@ pub fn ingest_observations(
     connection: &mut Connection,
     observations: Vec<UsageObservation>,
 ) -> Result<IngestSummary> {
-    let deduped = deduplicate(observations);
     let transaction = connection.transaction()?;
+    let summary = ingest_observations_tx(&transaction, &observations)?;
+    transaction.commit()?;
+    Ok(summary)
+}
+
+/// Canonical session-ID derivation shared by ingest and the CLI import paths.
+/// Keep in exactly one place so attribution lookups can never drift from ingest.
+#[must_use]
+pub fn session_stable_id(adapter: &str, provider_session_id: &str) -> String {
+    stable_id("ses", &format!("{adapter}:{provider_session_id}"))
+}
+
+/// Ingest observations inside an already-open transaction. Callers that need
+/// to bundle the ingest with further writes atomically (e.g. `stop_manual`)
+/// use this directly and commit once; everyone else uses [`ingest_observations`].
+pub fn ingest_observations_tx(
+    transaction: &rusqlite::Transaction<'_>,
+    observations: &[UsageObservation],
+) -> Result<IngestSummary> {
+    let deduped = deduplicate(observations.to_vec());
     let mut summary = IngestSummary {
         conflicts: deduped.conflicts as u64,
         ..IngestSummary::default()
     };
 
     for observation in &deduped.canonical {
-        let session_id = stable_id(
-            "ses",
-            &format!(
-                "{}:{}",
-                observation.adapter, observation.provider_session_id
-            ),
-        );
+        let session_id = session_stable_id(&observation.adapter, &observation.provider_session_id);
         transaction.execute(
             "INSERT OR IGNORE INTO sessions(id,adapter,provider_session_id,source_path,started_at) VALUES(?,?,?,?,?)",
             params![session_id, observation.adapter, observation.provider_session_id, observation.source_path, observation.source_timestamp.as_deref().unwrap_or(&observation.observed_at)],
@@ -383,10 +409,9 @@ pub fn ingest_observations(
             params![
                 stable_id("evt", &observation.canonical_identity()),
                 observation.adapter,
-                observation
-                    .source_subtype
-                    .as_deref()
-                    .unwrap_or(observation.source.as_str()),
+                // Canonical vocabulary choke point: never write raw
+                // provider-internal record types into source_kind.
+                tokentree_core::canonical_source_kind(observation),
                 observation.source_event_id,
                 session_id,
                 turn_db_id,
@@ -413,15 +438,14 @@ pub fn ingest_observations(
             ],
         )?;
         if changed == 1 {
-            summary.inserted += 1;
+            summary.inserted = summary.inserted.saturating_add(1);
             if !observation.usage.is_measured() {
-                summary.unavailable += 1;
+                summary.unavailable = summary.unavailable.saturating_add(1);
             }
         } else {
-            summary.duplicates += 1;
+            summary.duplicates = summary.duplicates.saturating_add(1);
         }
     }
-    transaction.commit()?;
     Ok(summary)
 }
 
@@ -509,21 +533,27 @@ pub fn aggregate_usage_with_policy(connection: &Connection) -> Result<AggregateU
         .max(0) as u64;
 
     let is_subagent = "(ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id))";
-    let is_covered_turn_counter = "(ue.source_kind IN ('codex_turn_counter', 'turn_counter', 'turn_summary', 'cumulative_turn_counter') AND EXISTS (SELECT 1 FROM usage_events d WHERE d.session_id = ue.session_id AND d.turn_id IS NOT NULL AND d.turn_id = ue.turn_id AND d.source_kind NOT IN ('codex_turn_counter', 'turn_counter', 'turn_summary', 'cumulative_turn_counter', 'final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter')))";
+    let is_covered_turn_counter = format!(
+        "(ue.source_kind IN ({turn_counters}) AND EXISTS (SELECT 1 FROM usage_events d WHERE d.session_id = ue.session_id AND d.turn_id IS NOT NULL AND d.turn_id = ue.turn_id AND d.source_kind NOT IN ({turn_counters}, {lifecycle})))",
+        turn_counters = source_kind::TURN_COUNTER_SQL_LIST,
+        lifecycle = source_kind::LIFECYCLE_COUNTER_SQL_LIST,
+    );
 
     match policy {
         SubagentPolicy::AlreadyInParent => {
             // Child/subagent events already represented in parent totals:
             // exclude child events so parent totals are not added again.
             let query = format!(
-                "SELECT coalesce(sum(CASE WHEN ue.source_kind IN ('hermes_snapshot_delta', 'snapshot_delta') THEN 0 ELSE 1 END), 0),
-                 coalesce(sum(CASE WHEN ue.source_kind IN ('hermes_snapshot_delta', 'snapshot_delta') THEN 0 WHEN input_tokens IS NOT NULL OR cached_input_tokens IS NOT NULL OR cache_write_tokens IS NOT NULL OR output_tokens IS NOT NULL OR reasoning_tokens IS NOT NULL THEN 1 ELSE 0 END),0),
-                 coalesce(sum(CASE WHEN ue.source_kind IN ('hermes_snapshot_delta', 'snapshot_delta') THEN 0 WHEN input_tokens IS NULL AND cached_input_tokens IS NULL AND cache_write_tokens IS NULL AND output_tokens IS NULL AND reasoning_tokens IS NULL THEN 1 ELSE 0 END),0),
+                "SELECT coalesce(sum(CASE WHEN ue.source_kind IN ({deltas}) THEN 0 ELSE 1 END), 0),
+                 coalesce(sum(CASE WHEN ue.source_kind IN ({deltas}) THEN 0 WHEN input_tokens IS NOT NULL OR cached_input_tokens IS NOT NULL OR cache_write_tokens IS NOT NULL OR output_tokens IS NOT NULL OR reasoning_tokens IS NOT NULL THEN 1 ELSE 0 END),0),
+                 coalesce(sum(CASE WHEN ue.source_kind IN ({deltas}) THEN 0 WHEN input_tokens IS NULL AND cached_input_tokens IS NULL AND cache_write_tokens IS NULL AND output_tokens IS NULL AND reasoning_tokens IS NULL THEN 1 ELSE 0 END),0),
                  coalesce(sum(input_tokens),0),coalesce(sum(cached_input_tokens),0),coalesce(sum(cache_write_tokens),0),coalesce(sum(output_tokens),0),coalesce(sum(reasoning_tokens),0)
                  FROM usage_events ue
-                 WHERE ue.source_kind NOT IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter')
+                 WHERE ue.source_kind NOT IN ({lifecycle})
                    AND NOT {is_subagent}
-                   AND NOT {is_covered_turn_counter}"
+                   AND NOT {is_covered_turn_counter}",
+                deltas = source_kind::SNAPSHOT_DELTA_SQL_LIST,
+                lifecycle = source_kind::LIFECYCLE_COUNTER_SQL_LIST,
             );
             connection
                 .query_row(&query, [], |row| {
@@ -545,13 +575,15 @@ pub fn aggregate_usage_with_policy(connection: &Connection) -> Result<AggregateU
         SubagentPolicy::Independent => {
             // Independent child request events roll up exactly once.
             let query = format!(
-                "SELECT coalesce(sum(CASE WHEN ue.source_kind IN ('hermes_snapshot_delta', 'snapshot_delta') THEN 0 ELSE 1 END), 0),
-                 coalesce(sum(CASE WHEN ue.source_kind IN ('hermes_snapshot_delta', 'snapshot_delta') THEN 0 WHEN input_tokens IS NOT NULL OR cached_input_tokens IS NOT NULL OR cache_write_tokens IS NOT NULL OR output_tokens IS NOT NULL OR reasoning_tokens IS NOT NULL THEN 1 ELSE 0 END),0),
-                 coalesce(sum(CASE WHEN ue.source_kind IN ('hermes_snapshot_delta', 'snapshot_delta') THEN 0 WHEN input_tokens IS NULL AND cached_input_tokens IS NULL AND cache_write_tokens IS NULL AND output_tokens IS NULL AND reasoning_tokens IS NULL THEN 1 ELSE 0 END),0),
+                "SELECT coalesce(sum(CASE WHEN ue.source_kind IN ({deltas}) THEN 0 ELSE 1 END), 0),
+                 coalesce(sum(CASE WHEN ue.source_kind IN ({deltas}) THEN 0 WHEN input_tokens IS NOT NULL OR cached_input_tokens IS NOT NULL OR cache_write_tokens IS NOT NULL OR output_tokens IS NOT NULL OR reasoning_tokens IS NOT NULL THEN 1 ELSE 0 END),0),
+                 coalesce(sum(CASE WHEN ue.source_kind IN ({deltas}) THEN 0 WHEN input_tokens IS NULL AND cached_input_tokens IS NULL AND cache_write_tokens IS NULL AND output_tokens IS NULL AND reasoning_tokens IS NULL THEN 1 ELSE 0 END),0),
                  coalesce(sum(input_tokens),0),coalesce(sum(cached_input_tokens),0),coalesce(sum(cache_write_tokens),0),coalesce(sum(output_tokens),0),coalesce(sum(reasoning_tokens),0)
                  FROM usage_events ue
-                 WHERE ue.source_kind NOT IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter')
-                   AND NOT {is_covered_turn_counter}"
+                 WHERE ue.source_kind NOT IN ({lifecycle})
+                   AND NOT {is_covered_turn_counter}",
+                deltas = source_kind::SNAPSHOT_DELTA_SQL_LIST,
+                lifecycle = source_kind::LIFECYCLE_COUNTER_SQL_LIST,
             );
             connection
                 .query_row(&query, [], |row| {
@@ -575,14 +607,14 @@ pub fn aggregate_usage_with_policy(connection: &Connection) -> Result<AggregateU
             // Parent events are measured normally.
             // Child request events are unverified, counted in requests and unavailable, tokens not added to measured totals.
             let query = format!(
-                "SELECT coalesce(sum(CASE WHEN ue.source_kind IN ('hermes_snapshot_delta', 'snapshot_delta') THEN 0 ELSE 1 END), 0),
+                "SELECT coalesce(sum(CASE WHEN ue.source_kind IN ({deltas}) THEN 0 ELSE 1 END), 0),
                  coalesce(sum(CASE
-                     WHEN ue.source_kind IN ('hermes_snapshot_delta', 'snapshot_delta') THEN 0
+                     WHEN ue.source_kind IN ({deltas}) THEN 0
                      WHEN {is_subagent} THEN 0
                      WHEN input_tokens IS NOT NULL OR cached_input_tokens IS NOT NULL OR cache_write_tokens IS NOT NULL OR output_tokens IS NOT NULL OR reasoning_tokens IS NOT NULL THEN 1
                      ELSE 0 END), 0),
                  coalesce(sum(CASE
-                     WHEN ue.source_kind IN ('hermes_snapshot_delta', 'snapshot_delta') THEN 0
+                     WHEN ue.source_kind IN ({deltas}) THEN 0
                      WHEN {is_subagent} THEN 1
                      WHEN input_tokens IS NULL AND cached_input_tokens IS NULL AND cache_write_tokens IS NULL AND output_tokens IS NULL AND reasoning_tokens IS NULL THEN 1
                      ELSE 0 END), 0),
@@ -592,8 +624,10 @@ pub fn aggregate_usage_with_policy(connection: &Connection) -> Result<AggregateU
                  coalesce(sum(CASE WHEN {is_subagent} THEN 0 ELSE output_tokens END), 0),
                  coalesce(sum(CASE WHEN {is_subagent} THEN 0 ELSE reasoning_tokens END), 0)
                  FROM usage_events ue
-                 WHERE ue.source_kind NOT IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter')
-                   AND NOT {is_covered_turn_counter}"
+                 WHERE ue.source_kind NOT IN ({lifecycle})
+                   AND NOT {is_covered_turn_counter}",
+                deltas = source_kind::SNAPSHOT_DELTA_SQL_LIST,
+                lifecycle = source_kind::LIFECYCLE_COUNTER_SQL_LIST,
             );
             connection
                 .query_row(&query, [], |row| {
@@ -640,6 +674,7 @@ fn apply_migrations(connection: &Connection) -> Result<()> {
                 "ALTER TABLE ingestion_checkpoints ADD COLUMN adapter_state_json TEXT",
                 [],
             );
+            normalize_legacy_source_kinds(connection)?;
             return Ok(());
         }
         bail!("unsupported or incomplete schema version {existing:?}");
@@ -662,6 +697,75 @@ fn apply_migrations(connection: &Connection) -> Result<()> {
 #[must_use]
 pub fn stable_id(prefix: &str, value: &str) -> String {
     format!("{prefix}_{}", &sha256_hex(value.as_bytes())[..24])
+}
+
+/// Normalize pre-vocabulary `source_kind` values left by older Rust parsers.
+///
+/// MIGRATION CHOICE (deliberate): this is a lightweight, idempotent *data*
+/// migration run at open time, NOT a schema version bump. The schema is shared
+/// with the TypeScript side at version 1, and both binaries refuse to open a
+/// database whose `schema_metadata` version they do not recognize — bumping to
+/// 2 here would brick the DB for the other binary until it also bumps. The
+/// UPDATE below only touches rows whose value is outside the canonical
+/// vocabulary, so re-running it on an already-clean database is a no-op.
+///
+/// The `usage_events` append-only triggers are dropped and recreated inside
+/// the same transaction around the fix. This is a one-time vocabulary
+/// migration (mapping each legacy value to its true canonical meaning), not
+/// a measurement rewrite: no token counts, timestamps, or identities change.
+///
+/// Legacy values and their mapping:
+/// * `"provider_usage"` (old Claude parser subtype) -> `"provider_fields"`.
+/// * Raw Claude transcript record types (`"assistant"`, `"user"`, `"summary"`,
+///   ...) and the old direct-write default `"claude_transcript"` ->
+///   `"transcript_request"` (every one of those rows was a TranscriptRequest
+///   record; the special `provider_usage` record type is handled explicitly).
+fn normalize_legacy_source_kinds(connection: &Connection) -> Result<()> {
+    let mut stmt = connection.prepare("SELECT DISTINCT source_kind FROM usage_events")?;
+    let kinds: Vec<String> = stmt
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    drop(stmt);
+    let legacy: Vec<(String, &'static str)> = kinds
+        .into_iter()
+        .filter(|kind| !source_kind::is_recognized(kind))
+        .map(|kind| {
+            let canonical = if kind == "provider_usage" {
+                source_kind::PROVIDER_FIELDS
+            } else {
+                source_kind::TRANSCRIPT_REQUEST
+            };
+            (kind, canonical)
+        })
+        .collect();
+    if legacy.is_empty() {
+        return Ok(());
+    }
+    connection.execute_batch("BEGIN IMMEDIATE;")?;
+    let result = (|| -> Result<()> {
+        connection.execute_batch(
+            "DROP TRIGGER usage_events_no_update;
+             DROP TRIGGER usage_events_no_delete;",
+        )?;
+        for (kind, canonical) in &legacy {
+            connection.execute(
+                "UPDATE usage_events SET source_kind = ?1 WHERE source_kind = ?2",
+                params![canonical, kind],
+            )?;
+        }
+        connection.execute_batch(
+            "CREATE TRIGGER usage_events_no_update BEFORE UPDATE ON usage_events
+             BEGIN SELECT RAISE(ABORT, 'usage_events are append-only'); END;
+             CREATE TRIGGER usage_events_no_delete BEFORE DELETE ON usage_events
+             BEGIN SELECT RAISE(ABORT, 'usage_events are append-only'); END;",
+        )?;
+        connection.execute_batch("COMMIT;")?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = connection.execute_batch("ROLLBACK;");
+    }
+    result
 }
 
 #[cfg(unix)]

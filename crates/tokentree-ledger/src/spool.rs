@@ -13,6 +13,8 @@ use tokentree_core::{ResolveProjectInput, resolve_project};
 pub struct HookWorkerSummary {
     pub processed: u64,
     pub skipped: u64,
+    /// Events that failed to apply and were moved to the quarantine file (H3).
+    pub quarantined: u64,
     pub projects: u64,
     pub sessions: u64,
     pub turns: u64,
@@ -61,8 +63,9 @@ pub fn process_claude_hook_spool(
     let mut reader = BufReader::new(file);
     let mut current_offset = start_offset;
     let mut summary = HookWorkerSummary::default();
+    let quarantine_path = quarantine_path_for(spool_path);
 
-    let transaction = connection.transaction()?;
+    let mut transaction = connection.transaction()?;
 
     let mut line = String::new();
     while let Ok(bytes_read) = reader.read_line(&mut line) {
@@ -79,8 +82,26 @@ pub fn process_claude_hook_spool(
 
         match serde_json::from_str::<HookEnvelope>(trimmed) {
             Ok(event) => {
-                apply_hook_event(&transaction, &event, spool_path, &mut summary)?;
-                summary.processed += 1;
+                // Per-event savepoint: a poison event rolls back only its
+                // own partial writes (dropped savepoint = ROLLBACK TO), then
+                // is quarantined. The checkpoint still advances past it, so
+                // one bad event can never stall the queue (H3).
+                let savepoint = transaction.savepoint()?;
+                match apply_hook_event(&savepoint, &event, spool_path, &mut summary) {
+                    Ok(()) => {
+                        savepoint.commit()?;
+                        summary.processed += 1;
+                    }
+                    // H3: quarantine the poison event and keep going. The old
+                    // code returned Err here, which rolled back the whole
+                    // transaction *including the checkpoint* — the same bad
+                    // event would then stall every future run forever.
+                    Err(e) => {
+                        drop(savepoint);
+                        quarantine_poison_event(&quarantine_path, trimmed, &e);
+                        summary.quarantined += 1;
+                    }
+                }
             }
             Err(_) => {
                 summary.skipped += 1;
@@ -100,9 +121,10 @@ pub fn process_claude_hook_spool(
             last_offset = excluded.last_offset",
         params![
             spool_str,
-            file_size as i64,
+            i64::try_from(file_size).context("spool file size exceeds SQLite integer range")?,
             modified_at,
-            current_offset as i64,
+            i64::try_from(current_offset)
+                .context("spool offset exceeds SQLite integer range")?,
         ],
     )?;
 
@@ -110,8 +132,65 @@ pub fn process_claude_hook_spool(
     Ok(summary)
 }
 
+/// Sibling path for quarantined spool events, e.g.
+/// `spool/claude-hooks.jsonl` -> `spool/claude-hooks.quarantine.jsonl`.
+/// Poison events are preserved here for forensic inspection instead of
+/// being dropped or blocking the queue.
+fn quarantine_path_for(spool_path: &Path) -> std::path::PathBuf {
+    let file_name = spool_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("spool.jsonl");
+    let stem = file_name.strip_suffix(".jsonl").unwrap_or(file_name);
+    spool_path.with_file_name(format!("{stem}.quarantine.jsonl"))
+}
+
+/// Persist a poison spool event for later inspection (H3). Best-effort by
+/// design: quarantining must never itself fail ingestion, so all IO errors
+/// are swallowed after a stderr notice. The quarantine file gets the same
+/// 0600 treatment as the spool file on unix since it may contain hook
+/// payloads.
+fn quarantine_poison_event(quarantine_path: &Path, raw_line: &str, error: &anyhow::Error) {
+    use std::io::Write as _;
+    if let Some(parent) = quarantine_path.parent() {
+        if fs::create_dir_all(parent).is_err() {
+            eprintln!("tokentree: cannot create quarantine dir for spool poison event: {error}");
+            return;
+        }
+    }
+    let mut options = fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(quarantine_path) {
+        Ok(mut file) => {
+            let record = serde_json::json!({
+                "quarantined_at": chrono::Utc::now().to_rfc3339(),
+                "error": error.to_string(),
+                "raw_line": raw_line,
+            });
+            if writeln!(file, "{record}").is_err() {
+                eprintln!("tokentree: failed to write quarantined spool event: {error}");
+            }
+        }
+        Err(io_err) => {
+            eprintln!(
+                "tokentree: cannot open quarantine file {} for poison spool event ({io_err}): {error}",
+                quarantine_path.display()
+            );
+        }
+    }
+    eprintln!(
+        "tokentree: quarantined poison spool event -> {}: {error}",
+        quarantine_path.display()
+    );
+}
+
 fn apply_hook_event(
-    transaction: &rusqlite::Transaction<'_>,
+    connection: &rusqlite::Connection,
     event: &HookEnvelope,
     spool_path: &Path,
     summary: &mut HookWorkerSummary,
@@ -150,7 +229,7 @@ fn apply_hook_event(
     let session_id = stable_id("ses", &format!("claude:{session_key}"));
 
     // 1. Ensure project exists
-    let prj_changed = transaction.execute(
+    let prj_changed = connection.execute(
         "INSERT OR IGNORE INTO projects(
             id, key, display_name, identity_hash, detection_method, confidence, created_at, updated_at
         ) VALUES(?,?,?,?,?,?,?,?)",
@@ -171,7 +250,7 @@ fn apply_hook_event(
 
     // 2. Ensure project root exists
     let root_path_str = project.root.to_string_lossy().to_string();
-    transaction.execute(
+    connection.execute(
         "INSERT OR IGNORE INTO project_roots(
             project_id, canonical_path, root_type, fingerprint, active, first_seen_at, last_seen_at
         ) VALUES(?,?,?,?,1,?,?)",
@@ -188,7 +267,7 @@ fn apply_hook_event(
     // 3. Ensure session exists
     let transcript_path = event.payload.get("transcript_path").and_then(Value::as_str);
     let cwd_str = cwd.to_string_lossy().to_string();
-    let ses_changed = transaction.execute(
+    let ses_changed = connection.execute(
         "INSERT OR IGNORE INTO sessions(
             id, adapter, provider_session_id, project_id, source_path, cwd, started_at
         ) VALUES(?,'claude',?,?,?,?,?)",
@@ -204,7 +283,7 @@ fn apply_hook_event(
     if ses_changed == 1 {
         summary.sessions += 1;
     }
-    transaction.execute(
+    connection.execute(
         "UPDATE sessions SET project_id=?, cwd=? WHERE id=?",
         params![project_id, cwd_str, session_id],
     )?;
@@ -212,7 +291,7 @@ fn apply_hook_event(
     // 4. Handle event kinds
     match event.kind.as_str() {
         "UserPromptSubmit" => {
-            let sequence: i64 = transaction.query_row(
+            let sequence: i64 = connection.query_row(
                 "SELECT count(*) FROM turns WHERE session_id=?",
                 params![session_id],
                 |row| row.get(0),
@@ -228,7 +307,7 @@ fn apply_hook_event(
             let turn_id = stable_id("turn", &format!("{session_id}:{prompt_id}"));
             let work_item_id = stable_id("wi", &format!("{project_id}:uncategorized"));
 
-            transaction.execute(
+            connection.execute(
                 "INSERT OR IGNORE INTO work_items(
                     id, project_id, type, title, status, confidence, classifier_version, created_at
                 ) VALUES(?,?,'inbox','Uncategorized','open',0,'pending',?)",
@@ -240,7 +319,7 @@ fn apply_hook_event(
                 .get("prompt_fingerprint")
                 .and_then(Value::as_str);
 
-            let turn_changed = transaction.execute(
+            let turn_changed = connection.execute(
                 "INSERT OR IGNORE INTO turns(
                     id, session_id, sequence_number, started_at, prompt_fingerprint, prompt_storage_mode
                 ) VALUES(?,?,?,?,?,'fingerprint_only')",
@@ -249,7 +328,7 @@ fn apply_hook_event(
 
             if turn_changed == 1 {
                 summary.turns += 1;
-                transaction.execute(
+                connection.execute(
                     "INSERT INTO classification_events(
                         id, turn_id, outcome, signals_json, score, classifier_version, created_at
                     ) VALUES(?,?,'UNCERTAIN','[\"prompt_not_persisted\",\"pending_worker\"]',0,'pending',?)",
@@ -259,7 +338,7 @@ fn apply_hook_event(
             }
         }
         "Stop" | "StopFailure" => {
-            transaction.execute(
+            connection.execute(
                 "UPDATE turns SET ended_at=? WHERE id=(
                     SELECT id FROM turns WHERE session_id=? AND ended_at IS NULL ORDER BY sequence_number DESC LIMIT 1
                 )",
@@ -267,7 +346,7 @@ fn apply_hook_event(
             )?;
         }
         "SessionEnd" => {
-            transaction.execute(
+            connection.execute(
                 "UPDATE sessions SET ended_at=? WHERE id=?",
                 params![event.captured_at, session_id],
             )?;
@@ -330,5 +409,78 @@ mod tests {
         // Interrupted/checkpoint test: re-running should process 0 new records
         let summary2 = ledger.process_claude_hook_spool(&spool_path).unwrap();
         assert_eq!(summary2.processed, 0);
+    }
+
+    #[test]
+    fn quarantine_path_for_appends_quarantine_suffix() {
+        let p = std::path::Path::new("/tmp/spool/claude-hooks.jsonl");
+        assert_eq!(
+            quarantine_path_for(p),
+            std::path::Path::new("/tmp/spool/claude-hooks.quarantine.jsonl")
+        );
+    }
+
+    /// H3: a poison event (here: a hook whose cwd contains a `.tokentree.yml`
+    /// with a forbidden key, making project resolution fail) must be
+    /// quarantined without stalling the events around it, and the checkpoint
+    /// must advance past it so re-runs do not stall either.
+    #[test]
+    fn poison_spool_event_is_quarantined_not_stalling() {
+        let dir = tempdir().unwrap();
+        let spool_path = dir.path().join("claude-hooks.jsonl");
+
+        let good_cwd = dir.path().join("good-proj");
+        std::fs::create_dir_all(&good_cwd).unwrap();
+        let poison_cwd = dir.path().join("poison-proj");
+        std::fs::create_dir_all(&poison_cwd).unwrap();
+        // Forbidden capability key -> resolve_project fails -> apply fails.
+        std::fs::write(
+            poison_cwd.join(".tokentree.yml"),
+            "project: poison\nexec: /bin/true\n",
+        )
+        .unwrap();
+
+        let hook = |session: &str, cwd: &std::path::Path| {
+            json!({
+                "version": 1,
+                "kind": "UserPromptSubmit",
+                "capturedAt": "2026-09-29T10:00:00Z",
+                "payload": {
+                    "session_id": session,
+                    "prompt_fingerprint": "abc12345",
+                    "cwd": cwd.to_str().unwrap()
+                }
+            })
+        };
+
+        let mut file = File::create(&spool_path).unwrap();
+        writeln!(file, "{}", hook("ses_good_1", &good_cwd)).unwrap();
+        writeln!(file, "{}", hook("ses_poison", &poison_cwd)).unwrap();
+        writeln!(file, "{}", hook("ses_good_2", &good_cwd)).unwrap();
+        drop(file);
+
+        let mut ledger = Ledger::open_memory().unwrap();
+        let summary = ledger.process_claude_hook_spool(&spool_path).unwrap();
+        assert_eq!(summary.processed, 2);
+        assert_eq!(summary.quarantined, 1);
+        assert_eq!(summary.skipped, 0);
+
+        // The good sessions after the poison event were still ingested.
+        let session_count: i64 = ledger
+            .connection()
+            .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(session_count, 2);
+
+        // The poison event is preserved in the quarantine file.
+        let quarantine_path = dir.path().join("claude-hooks.quarantine.jsonl");
+        let quarantined = std::fs::read_to_string(&quarantine_path).unwrap();
+        assert!(quarantined.contains("ses_poison"));
+        assert!(quarantined.contains("forbidden capability"));
+
+        // Re-running must not stall on the poison event: checkpoint advanced.
+        let summary2 = ledger.process_claude_hook_spool(&spool_path).unwrap();
+        assert_eq!(summary2.processed, 0);
+        assert_eq!(summary2.quarantined, 0);
     }
 }

@@ -155,7 +155,7 @@ pub fn stop_manual(connection: &mut Connection, counts: ManualCounts) -> Result<
     let observation = UsageObservation {
         adapter: "manual".into(),
         source: MeasurementSource::ExplicitCli,
-        source_subtype: Some("manual_stop".into()),
+        source_subtype: Some(tokentree_core::source_kind::MANUAL_STOP.into()),
         source_event_id: Some(run.id.clone()),
         provider_session_id: run.id.clone(),
         request_id: Some(format!("manual:{}", run.id)),
@@ -179,12 +179,16 @@ pub fn stop_manual(connection: &mut Connection, counts: ManualCounts) -> Result<
     let span_id = stable_id("span", &event_id);
     let group_id = stable_id("attr", &observation.event_hash());
 
-    let summary = crate::ingest_observations(connection, vec![observation])?;
+    // Single atomic transaction: the usage event, the run state change, and the
+    // span/attribution rows commit together. A crash can no longer leave the
+    // event ingested while the run stays 'active' with no span (previously
+    // unrecoverable: retrying bailed on the duplicate event).
+    let transaction = connection.transaction()?;
+
+    let summary = crate::ingest_observations_tx(&transaction, &[observation])?;
     if summary.inserted != 1 {
         bail!("Manual usage event already exists");
     }
-
-    let transaction = connection.transaction()?;
 
     transaction.execute(
         "UPDATE sessions SET ended_at = ? WHERE id = ?",

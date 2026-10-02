@@ -120,7 +120,8 @@ pub fn apply_price_snapshot(
             params![
                 event.id,
                 price_id,
-                amount_micros as i64,
+                i64::try_from(amount_micros)
+                    .context("cost amount exceeds SQLite integer range")?,
                 coverage,
                 now,
             ],
