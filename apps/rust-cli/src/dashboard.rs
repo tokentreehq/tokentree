@@ -434,7 +434,7 @@ async fn handle_api_status(
             };
             Ok::<_, anyhow::Error>((
                 count("SELECT count(*) FROM sessions")?,
-                count("SELECT count(*) FROM usage_events")?,
+                count("SELECT count(*) FROM usage_events WHERE superseded_by IS NULL")?,
                 count("SELECT count(*) FROM projects")?,
                 count("SELECT count(*) FROM work_items")?,
             ))
@@ -1073,15 +1073,27 @@ fn render_dashboard_spa(token: &str) -> String {
     }}
 
     function apiFetch(url, options = {{}}) {{
-      const authUrl = url + (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(TOKEN);
-      return fetch(authUrl, {{
+      // The session token never appears in API URLs: it lives only in memory
+      // (the TOKEN constant above, embedded by the server in this already-
+      // authenticated page) and travels via the Authorization header. The
+      // query string is stripped on load (see below) so the credential never
+      // lands in browser history, server logs, or Referer headers.
+      return fetch(url, {{
         ...options,
         headers: {{
           'Content-Type': 'application/json',
-          'X-TokenTree-Token': TOKEN,
+          'Authorization': 'Bearer ' + TOKEN,
           ...(options.headers || {{}})
         }}
       }});
+    }}
+
+    // Strip the one-time ?token= credential from the address bar immediately
+    // after the first authenticated navigation. The token remains available
+    // to this page via the in-memory TOKEN constant; it is deliberately never
+    // written to localStorage (XSS-readable) or left in the URL.
+    if (window.location.search.indexOf('token=') !== -1) {{
+      history.replaceState(null, '', window.location.pathname);
     }}
 
     function renderNode(node, depth) {{
@@ -1395,6 +1407,33 @@ fn render_dashboard_spa(token: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn served_spa_never_puts_reusable_credential_in_urls() {
+        // The session token is a reusable credential: it must not appear in
+        // API URLs (browser history, server logs, Referer) and must not be
+        // persisted to XSS-readable storage.
+        let html = render_dashboard_spa("test_token_12345");
+        // 1. The one-time ?token= is stripped from the address bar on load.
+        assert!(
+            html.contains("history.replaceState"),
+            "SPA must strip the query-string token on first load"
+        );
+        // 2. API calls carry the token via the Authorization header only.
+        assert!(
+            html.contains("'Authorization': 'Bearer ' + TOKEN"),
+            "API calls must use the Bearer header"
+        );
+        assert!(
+            !html.contains("'token=' + encodeURIComponent"),
+            "API URLs must not embed the token in the query string"
+        );
+        // 3. No persistence to XSS-readable storage.
+        assert!(
+            !html.contains("localStorage.setItem"),
+            "token must not be written to localStorage"
+        );
+    }
 
     #[test]
     fn generates_high_entropy_session_token() {
