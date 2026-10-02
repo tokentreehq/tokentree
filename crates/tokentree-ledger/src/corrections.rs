@@ -66,6 +66,7 @@ pub fn ensure_session_attribution(connection: &mut Connection, session_id: &str)
         "SELECT id, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, reasoning_tokens
          FROM usage_events
          WHERE session_id = ?1
+           AND superseded_by IS NULL
            AND source_kind NOT IN ({})",
         source_kind::LIFECYCLE_COUNTER_SQL_LIST,
     ))?;
@@ -141,6 +142,41 @@ pub fn ensure_session_attribution(connection: &mut Connection, session_id: &str)
     Ok(created)
 }
 
+/// Ensure default project/work-item attribution for every session ingested
+/// from `source_path` (mirrors the TypeScript import flow). Sessions are
+/// looked up by source file, so this is robust to checkpointed re-imports
+/// that ingest zero new rows. The stable session ID is derived with the
+/// shared [`tokentree_core::session_stable_id`] helper so the lookup can
+/// never drift from what ingest wrote. Idempotent: returns the number of
+/// sessions attributed.
+pub fn ensure_session_attribution_for_source(
+    connection: &mut Connection,
+    adapter: &str,
+    source_path: &std::path::Path,
+) -> Result<u64> {
+    let source_path_str = source_path.to_string_lossy();
+    let pairs: Vec<(String, Option<String>)> = connection
+        .prepare(
+            "SELECT DISTINCT adapter, provider_session_id FROM sessions WHERE source_path = ?1",
+        )?
+        .query_map([source_path_str.as_ref()], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut attributed = 0u64;
+    for (row_adapter, provider_session_id) in &pairs {
+        if row_adapter == adapter {
+            if let Some(psid) = provider_session_id {
+                attributed = attributed.saturating_add(ensure_session_attribution(
+                    connection,
+                    &tokentree_core::session_stable_id(row_adapter, psid),
+                )?);
+            }
+        }
+    }
+    Ok(attributed)
+}
+
 pub fn attach_session(
     connection: &mut Connection,
     session_id: &str,
@@ -160,8 +196,9 @@ pub fn attach_session(
         id: String,
         source_kind: String,
     }
-    let mut stmt =
-        connection.prepare("SELECT id, source_kind FROM usage_events WHERE session_id = ?1")?;
+    let mut stmt = connection.prepare(
+        "SELECT id, source_kind FROM usage_events WHERE session_id = ?1 AND superseded_by IS NULL",
+    )?;
     let events = stmt
         .query_map([session_id], |row| {
             Ok(AttachEvent {
