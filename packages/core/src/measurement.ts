@@ -11,6 +11,28 @@ export const SOURCE_RANK = {
 } as const;
 export type MeasurementSource = keyof typeof SOURCE_RANK;
 
+/**
+ * Canonical `source_kind` vocabulary persisted in `usage_events.source_kind`.
+ *
+ * AUTHORITY: `crates/tokentree-core/src/lib.rs` — `MeasurementSource::as_str()`
+ * (the ledger lane is promoting these to `tokentree_core::source_kind::*`
+ * constants; this list must match those exactly when they land).
+ *
+ * Both the Rust and TypeScript writers must only persist these strings.
+ * Known divergence (audit C2): the Rust writer additionally persists adapter
+ * `source_subtype` strings (e.g. 'assistant', 'hermes_snapshot_delta') into
+ * the same column today — converging that is owned by the ledger lane.
+ */
+export const SOURCE_KIND_VOCABULARY = [
+  'unavailable',
+  'explicit_cli',
+  'snapshot_delta',
+  'transcript_request',
+  'provider_fields',
+  'official_telemetry',
+] as const;
+export type SourceKind = (typeof SOURCE_KIND_VOCABULARY)[number];
+
 export interface TokenUsage {
   readonly inputTokens: number | null;
   readonly cachedInputTokens: number | null;

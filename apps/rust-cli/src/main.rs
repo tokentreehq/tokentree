@@ -7,6 +7,7 @@ use chrono::Utc;
 use clap::{Parser, Subcommand};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::SocketAddr;
@@ -15,8 +16,9 @@ use tokentree_claude::{discover_sessions, parse_session};
 use tokentree_core::{PriceSnapshot, token_completeness};
 use tokentree_ledger::{
     Ledger, ManualCounts, ManualStartInput, add_note, apply_prototype, attach_session,
-    detach_session, export_csv, export_html, export_json, load_project_trees, merge_work_items,
-    move_work_item, preview_prototype, query_ledger, rename_work_item, render_project_trees,
+    detach_session, ensure_session_attribution, ensure_session_attribution_for_source, export_csv,
+    export_html, export_json, load_project_trees, merge_work_items, move_work_item,
+    preview_prototype, query_ledger, rename_work_item, render_project_trees, session_stable_id,
     split_work_item, start_manual, stop_manual,
 };
 
@@ -34,6 +36,25 @@ struct Cli {
     home: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum RepairAction {
+    /// Repair historical Claude snapshot overcounting (C4): recompute
+    /// per-session deltas for `snapshot_delta` rows written by pre-fix
+    /// parsers. Backs up every touched row first; idempotent.
+    SnapshotOvercount {
+        /// Preview what would change without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Required to actually modify the ledger (ignored with --dry-run).
+        #[arg(long)]
+        yes: bool,
+        /// Restore a previous repair run's original rows. With no value,
+        /// restores the most recent run.
+        #[arg(long, value_name = "RUN_ID")]
+        restore: Option<Option<String>>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -166,6 +187,10 @@ enum Command {
         preview: bool,
         #[arg(long)]
         apply: bool,
+    },
+    Repair {
+        #[command(subcommand)]
+        action: RepairAction,
     },
     OtlpServe {
         #[arg(long, default_value = "127.0.0.1:4318")]
@@ -318,13 +343,35 @@ fn run() -> Result<()> {
             preview,
             apply,
         } => migrate_prototype(&home, source, preview, apply),
+        Command::Repair { action } => match action {
+            RepairAction::SnapshotOvercount {
+                dry_run,
+                yes,
+                restore,
+            } => repair_snapshot_overcount(&home, dry_run, yes, restore),
+        },
         Command::OtlpServe { address } => {
+            // H2: the loopback receiver requires a per-run bearer secret so a
+            // malicious local process cannot append poisoned rows to the
+            // append-only ledger. Pin via TOKENTREE_OTLP_TOKEN for automation.
+            let auth = match std::env::var("TOKENTREE_OTLP_TOKEN") {
+                Ok(token) if !token.trim().is_empty() => tokentree_otel::OtlpAuth {
+                    bearer_token: token,
+                },
+                _ => tokentree_otel::OtlpAuth::generate(),
+            };
             println!("TokenTree OTLP receiver: http://{address}/v1/logs");
+            println!("Bearer token (required on every ingest request):");
+            println!("  {}\n", auth.bearer_token);
+            println!("Point the sender at this endpoint with:");
+            println!("  export OTEL_EXPORTER_OTLP_PROTOCOL=http/json");
+            println!("  export OTEL_EXPORTER_OTLP_ENDPOINT=http://{address}");
             println!(
-                "Set OTEL_EXPORTER_OTLP_PROTOCOL=http/json and point Claude Code logs to this loopback endpoint."
+                "  export OTEL_EXPORTER_OTLP_HEADERS=\"Authorization=Bearer {}\"",
+                auth.bearer_token
             );
             let ledger = ledger(&home)?;
-            tokio::runtime::Runtime::new()?.block_on(tokentree_otel::serve(address, ledger))
+            tokio::runtime::Runtime::new()?.block_on(tokentree_otel::serve(address, ledger, auth))
         }
     }
 }
@@ -477,9 +524,24 @@ fn import_claude(home: &Path, root: PathBuf) -> Result<()> {
         let parsed = parse_session(path)?;
         unknown += parsed.stats.unknown;
         malformed += parsed.stats.malformed;
+        // Collect session identities before ingest moves the observations.
+        let session_keys: HashSet<(String, String)> = parsed
+            .observations
+            .iter()
+            .map(|obs| (obs.adapter.clone(), obs.provider_session_id.clone()))
+            .collect();
         let summary = ledger.ingest(parsed.observations)?;
         inserted += summary.inserted;
         duplicates += summary.duplicates;
+        // Mirror the TypeScript import flow: every imported session gets a
+        // default project/work-item attribution so reports render trees
+        // instead of "No projects".
+        for (adapter, provider_session_id) in &session_keys {
+            ensure_session_attribution(
+                ledger.connection_mut(),
+                &session_stable_id(adapter, provider_session_id),
+            )?;
+        }
     }
     println!(
         "{}",
@@ -502,6 +564,9 @@ fn import_codex(home: &Path, root: PathBuf) -> Result<()> {
         inserted += res.inserted;
         duplicates += res.duplicates;
         anomalies += res.anomalies;
+        // Default attribution for every imported session (mirrors the
+        // TypeScript import flow and the import_claude path above).
+        ensure_session_attribution_for_source(ledger.connection_mut(), "codex", path)?;
     }
     println!(
         "{}",
@@ -524,6 +589,7 @@ fn import_grok(home: &Path, root: PathBuf) -> Result<()> {
         inserted += res.inserted;
         duplicates += res.duplicates;
         anomalies += res.anomalies;
+        ensure_session_attribution_for_source(ledger.connection_mut(), "grok", path)?;
     }
     println!(
         "{}",
@@ -546,6 +612,7 @@ fn import_hermes(home: &Path, root: PathBuf) -> Result<()> {
         inserted += res.inserted;
         duplicates += res.duplicates;
         anomalies += res.anomalies;
+        ensure_session_attribution_for_source(ledger.connection_mut(), "hermes", path)?;
     }
     println!(
         "{}",
@@ -781,6 +848,76 @@ fn reconcile_cmd(home: &Path) -> Result<()> {
         "duplicate subagent counters: {}",
         res.duplicate_subagent_counters
     );
+    Ok(())
+}
+
+fn repair_snapshot_overcount(
+    home: &Path,
+    dry_run: bool,
+    yes: bool,
+    restore: Option<Option<String>>,
+) -> Result<()> {
+    use tokentree_ledger::{
+        apply_snapshot_overcount_repair, plan_snapshot_overcount_repair, restore_snapshot_repair,
+    };
+    let mut ledger = ledger(home)?;
+    if let Some(restore_arg) = restore {
+        // --restore or --restore <RUN_ID>: put the original rows back.
+        let run_id: Option<&str> = restore_arg.as_deref();
+        let outcome = restore_snapshot_repair(ledger.connection_mut(), run_id)?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "restored": true,
+                "run_id": outcome.run_id,
+                "rows_restored": outcome.plan.rows,
+            }))?
+        );
+        return Ok(());
+    }
+    if dry_run {
+        let plan = plan_snapshot_overcount_repair(ledger.connection())?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "dry_run": true,
+                "sessions": plan.sessions,
+                "rows": plan.rows,
+                "baseline_rows": plan.baseline_rows,
+                "delta_rows": plan.delta_rows,
+                "anomaly_rows": plan.anomaly_rows,
+            }))?
+        );
+        return Ok(());
+    }
+    if !yes {
+        anyhow::bail!(
+            "refusing to modify the ledger without --yes; use --dry-run to preview the repair first"
+        );
+    }
+    let outcome = apply_snapshot_overcount_repair(ledger.connection_mut())?;
+    if outcome.run_id.is_empty() {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "repaired": false,
+                "reason": "snapshot-overcount repair already completed; nothing to do",
+            }))?
+        );
+    } else {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "repaired": true,
+                "run_id": outcome.run_id,
+                "sessions": outcome.plan.sessions,
+                "rows": outcome.plan.rows,
+                "baseline_rows": outcome.plan.baseline_rows,
+                "delta_rows": outcome.plan.delta_rows,
+                "anomaly_rows": outcome.plan.anomaly_rows,
+            }))?
+        );
+    }
     Ok(())
 }
 

@@ -41,6 +41,36 @@ const STOP_WORDS: &[&str] = &[
     "a", "an", "and", "the", "to", "for", "of", "in", "on", "that", "this", "please", "now", "also",
 ];
 
+/// True when `word` appears as a standalone token in `haystack` — bounded on
+/// both sides by a non-alphanumeric character or string edge — rather than as
+/// a substring of a larger word (e.g. "it" in "commit" must not match).
+#[must_use]
+fn contains_word(haystack: &str, word: &str) -> bool {
+    if word.is_empty() {
+        return false;
+    }
+    let mut start = 0;
+    while let Some(relative) = haystack[start..].find(word) {
+        let abs_start = start + relative;
+        let abs_end = abs_start + word.len();
+        let before_ok = abs_start == 0
+            || !haystack[..abs_start]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric());
+        let after_ok = abs_end >= haystack.len()
+            || !haystack[abs_end..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric());
+        if before_ok && after_ok {
+            return true;
+        }
+        start = abs_start + 1;
+    }
+    false
+}
+
 #[must_use]
 pub fn redacted_label(text: &str) -> String {
     // 1. Redact secrets: sk-..., gh[pousr]_..., api_key/token/password = ...
@@ -176,7 +206,7 @@ pub fn classify_boundary(input: &BoundaryInput<'_>) -> BoundaryResult {
         || lower.contains("continue")
         || lower.contains("same")
         || lower.contains("that")
-        || lower.contains("it")
+        || contains_word(&lower, "it")
         || lower.contains("nearby")
         || lower.contains("follow up")
         || lower.contains("follow-up")
@@ -245,6 +275,42 @@ mod tests {
     fn classifies_continue_on_follow_up() {
         let res = classify_boundary(&BoundaryInput {
             text: "Also fix the color of that button",
+            has_open_parent: false,
+            issue_id_changed: false,
+            explicit_parent_request: false,
+        });
+        assert_eq!(res.outcome, BoundaryOutcome::CONTINUE);
+    }
+
+    #[test]
+    fn contains_word_respects_word_boundaries() {
+        assert!(contains_word("fix it now", "it"));
+        assert!(contains_word("it works", "it"));
+        assert!(contains_word("do it.", "it"));
+        assert!(contains_word("it's fine", "it"));
+        assert!(!contains_word("commit the fix", "it"));
+        assert!(!contains_word("split item", "it"));
+        assert!(!contains_word("with", "it"));
+        assert!(!contains_word("", "it"));
+        assert!(!contains_word("anything", ""));
+    }
+
+    #[test]
+    fn it_substring_no_longer_forces_continue() {
+        // H12: "commit" contains "it" but carries no continuity signal.
+        let res = classify_boundary(&BoundaryInput {
+            text: "commit the fix with tests",
+            has_open_parent: false,
+            issue_id_changed: false,
+            explicit_parent_request: false,
+        });
+        assert_eq!(res.outcome, BoundaryOutcome::UNCERTAIN);
+    }
+
+    #[test]
+    fn standalone_it_still_signals_continue() {
+        let res = classify_boundary(&BoundaryInput {
+            text: "also fix it tomorrow",
             has_open_parent: false,
             issue_id_changed: false,
             explicit_parent_request: false,

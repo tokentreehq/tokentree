@@ -386,3 +386,37 @@ fn test_idempotent_anomaly_ingestion_on_replay() {
         "Aggregate usage must remain identical across replay"
     );
 }
+
+#[test]
+fn test_large_tail_import_streams_without_buffering_whole_tail() {
+    // H14: import must stream the unread tail (backward newline scan + Take),
+    // not buffer it whole in RAM. >128 KiB forces the backward scan across
+    // multiple 64 KiB chunks.
+    let tmp = tempdir().unwrap();
+    let mut ledger = Ledger::open(tmp.path().join("ledger.db")).unwrap();
+    let session_file = tmp.path().join("session_large.jsonl");
+    let mut content = String::new();
+    for i in 0..3000u64 {
+        content.push_str(&format!(
+            "{{\"type\":\"thread/tokenUsage/updated\",\"request_id\":\"r{i:05}\",\"session_id\":\"big\",\"model\":\"o3-mini\",\"token_usage\":{{\"input_tokens\":10,\"output_tokens\":5}}}}\n"
+        ));
+    }
+    assert!(
+        content.len() > 128 * 1024,
+        "fixture must exceed two scan chunks"
+    );
+    fs::write(&session_file, &content).unwrap();
+
+    let res = import_codex_file(ledger.connection_mut(), &session_file).unwrap();
+    assert_eq!(res.inserted, 3000);
+    assert_eq!(res.end_offset, content.len() as u64);
+
+    let agg = ledger.aggregate_usage().unwrap();
+    assert_eq!(agg.input, 30_000);
+    assert_eq!(agg.output, 15_000);
+    assert_eq!(agg.requests, 3000);
+
+    // Second import is a no-op (checkpoint at EOF).
+    let res2 = import_codex_file(ledger.connection_mut(), &session_file).unwrap();
+    assert_eq!(res2.inserted, 0);
+}

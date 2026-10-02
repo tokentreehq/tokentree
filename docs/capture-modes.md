@@ -19,6 +19,7 @@ For environments where Claude Code or Codex is configured to emit OTLP traces:
 - **Endpoint**: Loopback HTTP receiver listening on `127.0.0.1:4318/v1/logs`.
 - **Precedence**: Official provider API request telemetry outranks transcript observations on the truth ladder.
 - **Security**: The receiver strictly verifies loopback binding, enforces a 1 MiB body limit, and discards raw message bodies.
+- **Authentication**: Every ingest request must present `Authorization: Bearer <secret>`. `tokentree otlp-serve` generates a fresh 256-bit secret from the OS CSPRNG on each run and prints it along with the `OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer <secret>"` export the sender must set. Pin a stable secret for automation with the `TOKENTREE_OTLP_TOKEN` environment variable. Loopback binding alone is not enough: the ledger is append-only, so an unauthenticated local process could otherwise append poisoned rows that can never be removed.
 
 ---
 

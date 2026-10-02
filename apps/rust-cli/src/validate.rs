@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::tempdir;
+use tokentree_core::source_kind;
 use tokentree_core::token_completeness;
 use tokentree_ledger::Ledger;
 
@@ -1368,7 +1369,7 @@ fn check_ledger_checkpoints(ledger: &Ledger, adapter: &str) -> bool {
 
 fn check_ledger_monotonicity(ledger: &Ledger) -> bool {
     let mut stmt = match ledger.connection().prepare(
-        "SELECT input_tokens, output_tokens, cached_input_tokens, reasoning_tokens, provider_reported_cost_micros FROM usage_events"
+        "SELECT input_tokens, output_tokens, cached_input_tokens, reasoning_tokens, provider_reported_cost_micros FROM usage_events WHERE superseded_by IS NULL"
     ) {
         Ok(s) => s,
         Err(_) => return false,
@@ -1419,7 +1420,7 @@ fn check_ledger_attribution_invariants(ledger: &Ledger) -> bool {
     let missing_sessions: i64 = ledger
         .connection()
         .query_row(
-            "SELECT count(*) FROM usage_events WHERE session_id IS NULL OR session_id = ''",
+            "SELECT count(*) FROM usage_events WHERE superseded_by IS NULL AND (session_id IS NULL OR session_id = '')",
             [],
             |r| r.get(0),
         )
@@ -1431,7 +1432,7 @@ fn check_ledger_attribution_invariants(ledger: &Ledger) -> bool {
     let orphan_subagents: i64 = ledger
         .connection()
         .query_row(
-            "SELECT count(*) FROM usage_events WHERE parent_agent_id IS NOT NULL AND (agent_id IS NULL OR agent_id = '')",
+            "SELECT count(*) FROM usage_events WHERE superseded_by IS NULL AND parent_agent_id IS NOT NULL AND (agent_id IS NULL OR agent_id = '')",
             [],
             |r| r.get(0),
         )
@@ -1444,13 +1445,13 @@ fn check_ledger_attribution_invariants(ledger: &Ledger) -> bool {
 }
 
 fn check_ledger_deduplication(ledger: &Ledger) -> bool {
+    let query = format!(
+        "SELECT count(*) FROM (SELECT request_id FROM usage_events WHERE request_id IS NOT NULL AND source_kind NOT IN ({}) AND superseded_by IS NULL GROUP BY request_id HAVING count(*) > 1)",
+        source_kind::SNAPSHOT_DELTA_SQL_LIST
+    );
     let duplicate_requests: i64 = ledger
         .connection()
-        .query_row(
-            "SELECT count(*) FROM (SELECT request_id FROM usage_events WHERE request_id IS NOT NULL AND source_kind NOT IN ('hermes_snapshot_delta', 'snapshot_delta') GROUP BY request_id HAVING count(*) > 1)",
-            [],
-            |r| r.get(0),
-        )
+        .query_row(&query, [], |r| r.get(0))
         .unwrap_or(0);
     duplicate_requests == 0
 }
@@ -1467,7 +1468,7 @@ fn scan_ledger_strings_for_secrets(ledger: &Ledger) -> bool {
         "canary_prompt_leak",
     ];
     let mut stmt = match ledger.connection().prepare(
-        "SELECT coalesce(model, ''), coalesce(request_id, ''), coalesce(turn_id, ''), coalesce(agent_id, ''), coalesce(parent_agent_id, '') FROM usage_events"
+        "SELECT coalesce(model, ''), coalesce(request_id, ''), coalesce(turn_id, ''), coalesce(agent_id, ''), coalesce(parent_agent_id, '') FROM usage_events WHERE superseded_by IS NULL"
     ) {
         Ok(s) => s,
         Err(_) => return false,
@@ -1509,7 +1510,7 @@ fn extract_counters(
 
     let events_ingested: u64 = conn
         .query_row(
-            "SELECT count(*) FROM usage_events WHERE adapter = ?",
+            "SELECT count(*) FROM usage_events WHERE superseded_by IS NULL AND adapter = ?",
             [adapter],
             |r| r.get::<_, i64>(0),
         )
@@ -1518,7 +1519,7 @@ fn extract_counters(
 
     let input_tokens: u64 = conn
         .query_row(
-            "SELECT coalesce(sum(input_tokens), 0) FROM usage_events WHERE adapter = ?",
+            "SELECT coalesce(sum(input_tokens), 0) FROM usage_events WHERE superseded_by IS NULL AND adapter = ?",
             [adapter],
             |r| r.get::<_, i64>(0),
         )
@@ -1527,7 +1528,7 @@ fn extract_counters(
 
     let output_tokens: u64 = conn
         .query_row(
-            "SELECT coalesce(sum(output_tokens), 0) FROM usage_events WHERE adapter = ?",
+            "SELECT coalesce(sum(output_tokens), 0) FROM usage_events WHERE superseded_by IS NULL AND adapter = ?",
             [adapter],
             |r| r.get::<_, i64>(0),
         )
@@ -1536,7 +1537,7 @@ fn extract_counters(
 
     let cached_tokens: u64 = conn
         .query_row(
-            "SELECT coalesce(sum(cached_input_tokens), 0) FROM usage_events WHERE adapter = ?",
+            "SELECT coalesce(sum(cached_input_tokens), 0) FROM usage_events WHERE superseded_by IS NULL AND adapter = ?",
             [adapter],
             |r| r.get::<_, i64>(0),
         )
@@ -1545,7 +1546,7 @@ fn extract_counters(
 
     let reasoning_tokens: u64 = conn
         .query_row(
-            "SELECT coalesce(sum(reasoning_tokens), 0) FROM usage_events WHERE adapter = ?",
+            "SELECT coalesce(sum(reasoning_tokens), 0) FROM usage_events WHERE superseded_by IS NULL AND adapter = ?",
             [adapter],
             |r| r.get::<_, i64>(0),
         )
@@ -1574,7 +1575,7 @@ fn extract_local_diagnostics(ledger: &Ledger, adapter: &str) -> LocalDiagnostics
 
     let mut models = Vec::new();
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT DISTINCT model FROM usage_events WHERE adapter = ? AND model IS NOT NULL ORDER BY model"
+        "SELECT DISTINCT model FROM usage_events WHERE superseded_by IS NULL AND adapter = ? AND model IS NOT NULL ORDER BY model"
     ) {
         if let Ok(rows) = stmt.query_map([adapter], |r| r.get::<_, String>(0)) {
             for m in rows.flatten() {
@@ -1585,16 +1586,28 @@ fn extract_local_diagnostics(ledger: &Ledger, adapter: &str) -> LocalDiagnostics
 
     let total_cost_micros: u64 = conn
         .query_row(
-            "SELECT coalesce(sum(provider_reported_cost_micros), 0) FROM usage_events WHERE adapter = ?",
+            "SELECT coalesce(sum(provider_reported_cost_micros), 0) FROM usage_events WHERE superseded_by IS NULL AND adapter = ?",
             [adapter],
             |r| r.get::<_, i64>(0),
         )
         .unwrap_or(0)
         .max(0) as u64;
 
+    // Per-adapter failure markers share one SQL list so the vocabulary cannot
+    // drift from tokentree_core::source_kind.
+    let failed_kinds = format!(
+        "'{}', '{}', '{}', '{}'",
+        source_kind::GROK_TURN_FAILED,
+        source_kind::GROK_SESSION_FAILED,
+        source_kind::HERMES_FAILED_RUN,
+        source_kind::HERMES_UNMEASURED
+    );
+
     let measured_turns: u64 = conn
         .query_row(
-            "SELECT count(*) FROM usage_events WHERE adapter = ? AND source_kind NOT IN ('grok_turn_failed', 'grok_session_failed', 'hermes_failed_run', 'hermes_unmeasured')",
+            &format!(
+                "SELECT count(*) FROM usage_events WHERE superseded_by IS NULL AND adapter = ? AND source_kind NOT IN ({failed_kinds})"
+            ),
             [adapter],
             |r| r.get::<_, i64>(0),
         )
@@ -1603,7 +1616,9 @@ fn extract_local_diagnostics(ledger: &Ledger, adapter: &str) -> LocalDiagnostics
 
     let unmeasured_turns: u64 = conn
         .query_row(
-            "SELECT count(*) FROM usage_events WHERE adapter = ? AND source_kind IN ('grok_turn_failed', 'grok_session_failed', 'hermes_failed_run', 'hermes_unmeasured')",
+            &format!(
+                "SELECT count(*) FROM usage_events WHERE superseded_by IS NULL AND adapter = ? AND source_kind IN ({failed_kinds})"
+            ),
             [adapter],
             |r| r.get::<_, i64>(0),
         )

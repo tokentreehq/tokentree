@@ -1,20 +1,55 @@
 #!/usr/bin/env node
 // SPDX-License-Identifier: Apache-2.0
 import { spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { addNote,applyPriceSnapshot,DISCLAIMER,applyPrototype,attachSession,detachSession,doctor,importClaude,loadProjectTrees,openDefaultLedger,previewPrototype,processClaudeHookSpool,queryLedger,reconcile,renderProjectTrees,renderTextReport,resolvePaths,startManual,stopManual } from './index.js';
 
-import { findNativeBinary } from './launcher.js';
+import { findNativeBinary, resolvePlatformTarget } from './launcher.js';
 
-if (!process.env.TOKENTREE_FORCE_JS) {
+// The TypeScript CLI is a launcher for the Rust measurement engine — it is
+// not a second implementation. Per the locked Rust-first architecture decision
+// (docs/decisions.md), it must fail clearly when no supported native binary
+// is present and must never silently fall back to the JS engine. The JS engine
+// below remains only as an explicit opt-in reference harness
+// (TOKENTREE_FORCE_JS=1); it is not the production measurement path.
+if (process.env.TOKENTREE_FORCE_JS) {
+  console.error('tokentree: TOKENTREE_FORCE_JS=1 — running the TypeScript reference engine (not the production measurement path).');
+} else {
   const nativeBin = findNativeBinary();
-  if (nativeBin) {
-    const result = spawnSync(nativeBin, process.argv.slice(2), { stdio: 'inherit' });
-    process.exit(result.status ?? (result.signal ? 1 : 0));
+  if (!nativeBin) {
+    const target = resolvePlatformTarget(process.platform, process.arch);
+    const vendorDir = target
+      ? join(import.meta.dirname, '..', 'vendor', target.rustTarget)
+      : join(import.meta.dirname, '..', 'vendor');
+    console.error(
+      'tokentree: no native tokentree binary found for this platform.\n' +
+      'The @tokentreehq/cli package is a launcher for the Rust measurement engine and cannot run without it.\n' +
+      'Install the native binary:\n' +
+      '  1. Download the archive for your platform from https://github.com/tokentreehq/tokentree/releases\n' +
+      `  2. Extract the \`${target?.binaryName ?? 'tokentree'}\` binary into ${vendorDir}\n` +
+      '     (or set TOKENTREE_BIN=/path/to/tokentree to point at an existing binary).'
+    );
+    process.exit(1);
   }
+  const result = spawnSync(nativeBin, process.argv.slice(2), { stdio: 'inherit' });
+  process.exit(result.status ?? (result.signal ? 1 : 0));
 }
 
-const args=process.argv.slice(2); const command=args[0]; const paths=resolvePaths(); const pricesPath=join(import.meta.dirname,'../../../packages/pricing/data/prices.json');
+// prices.json ships inside the published npm package at <pkg>/data/prices.json
+// (see `files` in apps/cli/package.json; staged by apps/cli/scripts/build.ts).
+// In a repo checkout it also lives at packages/pricing/data/prices.json.
+// Resolve the published layout first so the installed package finds its data.
+function resolvePricesPath(): string {
+  const publishedLayout = join(import.meta.dirname, '..', 'data', 'prices.json');
+  const repoLayout = join(import.meta.dirname, '..', '..', '..', 'packages', 'pricing', 'data', 'prices.json');
+  for (const candidate of [publishedLayout, repoLayout]) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return publishedLayout;
+}
+
+const args=process.argv.slice(2); const command=args[0]; const paths=resolvePaths(); const pricesPath=resolvePricesPath();
 async function main():Promise<number>{
  if(!command||command==='help'||command==='--help'){console.log('tokentree <doctor|validate [adapter] [--all] [--self-test] [--require-live]|import claude|report --text|query|attach|detach|note|reconcile|migrate prototype --preview|--apply|start|stop|classify>');return 0;}
  const db=openDefaultLedger(paths);

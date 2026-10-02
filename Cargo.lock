@@ -957,7 +957,9 @@ dependencies = [
  "rusqlite",
  "serde_json",
  "sha2",
+ "tempfile",
  "tokentree-core",
+ "tokentree-ledger",
  "walkdir",
 ]
 
@@ -970,6 +972,7 @@ dependencies = [
  "chrono",
  "clap",
  "dirs",
+ "getrandom",
  "hex",
  "http-body-util",
  "rusqlite",
@@ -1073,10 +1076,13 @@ dependencies = [
  "anyhow",
  "axum",
  "chrono",
+ "getrandom",
+ "hex",
  "serde_json",
  "tokentree-core",
  "tokentree-ledger",
  "tokio",
+ "tower",
 ]
 
 [[package]]

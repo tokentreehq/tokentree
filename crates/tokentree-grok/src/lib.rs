@@ -9,7 +9,9 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use tokentree_core::{MeasurementSource, TokenUsage, UsageObservation};
+use tokentree_core::{
+    MeasurementSource, TokenUsage, UsageObservation, canonical_source_kind, source_kind,
+};
 use walkdir::WalkDir;
 
 pub const ADAPTER_VERSION: &str = "0.2.0-rust";
@@ -380,15 +382,15 @@ pub fn parse_str(
                 (
                     MeasurementSource::Unavailable,
                     if is_failed_or_zero_calls {
-                        "grok_turn_failed".to_string()
+                        source_kind::GROK_TURN_FAILED.to_string()
                     } else {
-                        "grok_turn_unmeasured".to_string()
+                        source_kind::GROK_TURN_UNMEASURED.to_string()
                     },
                 )
             } else {
                 (
                     MeasurementSource::ProviderFields,
-                    "grok_turn_usage".to_string(),
+                    source_kind::GROK_TURN_USAGE.to_string(),
                 )
             };
 
@@ -475,15 +477,15 @@ pub fn parse_str(
                 (
                     MeasurementSource::Unavailable,
                     if is_failed_or_zero_calls {
-                        "grok_session_failed".to_string()
+                        source_kind::GROK_SESSION_FAILED.to_string()
                     } else {
-                        "grok_session_unmeasured".to_string()
+                        source_kind::GROK_SESSION_UNMEASURED.to_string()
                     },
                 )
             } else {
                 (
                     MeasurementSource::ProviderFields,
-                    "grok_session_usage".to_string(),
+                    source_kind::GROK_SESSION_USAGE.to_string(),
                 )
             };
 
@@ -610,20 +612,19 @@ pub fn import_grok_file(connection: &mut Connection, path: &Path) -> Result<Grok
     let mut last_event_hash: Option<String> = None;
 
     for obs in &parse_res.observations {
-        let session_id = format!(
-            "ses_{}",
-            hex::encode(&Sha256::digest(obs.provider_session_id.as_bytes())[..8])
-        );
+        // Canonical session-ID derivation shared with the ledger
+        // (tokentree_core::session_stable_id): default attribution and
+        // every lookup must resolve the same ID ingest wrote.
+        let session_id = tokentree_core::session_stable_id(&obs.adapter, &obs.provider_session_id);
         tx.execute(
             "INSERT OR IGNORE INTO sessions(id, adapter, provider_session_id, source_path, started_at) VALUES(?1, ?2, ?3, ?4, ?5)",
             params![session_id, obs.adapter, obs.provider_session_id, obs.source_path, obs.source_timestamp.as_deref().unwrap_or(&obs.observed_at)],
         )?;
 
         let turn_db_id = if let Some(t_id) = &obs.turn_id {
-            let turn_id = format!(
-                "turn_{}",
-                hex::encode(&Sha256::digest(format!("{}:{}", session_id, t_id).as_bytes())[..8])
-            );
+            // Same derivation as the ledger's ingest path: turn IDs are
+            // namespaced under the canonical session ID.
+            let turn_id = tokentree_core::stable_id("turn", &format!("{session_id}:{t_id}"));
             let seq: i64 = tx
                 .query_row(
                     "SELECT coalesce(max(sequence_number) + 1, 0) FROM turns WHERE session_id = ?1",
@@ -653,7 +654,7 @@ pub fn import_grok_file(connection: &mut Connection, path: &Path) -> Result<Grok
             params![
                 format!("evt_{}", &evt_hash[..16]),
                 obs.adapter,
-                obs.source_subtype.as_deref().unwrap_or(obs.source.as_str()),
+                canonical_source_kind(obs),
                 obs.source_event_id,
                 session_id,
                 turn_db_id,

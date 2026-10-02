@@ -3,6 +3,7 @@ use anyhow::{Result, bail};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use tokentree_core::source_kind;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UsageTotals {
@@ -21,17 +22,19 @@ pub struct UsageTotals {
 impl UsageTotals {
     #[must_use]
     pub fn add(&self, other: &Self) -> Self {
+        // Saturating: token counts come from untrusted provider payloads;
+        // never wrap on adversarial input, clamp instead.
         Self {
-            input: self.input + other.input,
-            cache_read: self.cache_read + other.cache_read,
-            cache_write: self.cache_write + other.cache_write,
-            output: self.output + other.output,
-            reasoning: self.reasoning + other.reasoning,
-            requests: self.requests + other.requests,
-            measured: self.measured + other.measured,
-            unavailable: self.unavailable + other.unavailable,
-            priced: self.priced + other.priced,
-            amount_micros: self.amount_micros + other.amount_micros,
+            input: self.input.saturating_add(other.input),
+            cache_read: self.cache_read.saturating_add(other.cache_read),
+            cache_write: self.cache_write.saturating_add(other.cache_write),
+            output: self.output.saturating_add(other.output),
+            reasoning: self.reasoning.saturating_add(other.reasoning),
+            requests: self.requests.saturating_add(other.requests),
+            measured: self.measured.saturating_add(other.measured),
+            unavailable: self.unavailable.saturating_add(other.unavailable),
+            priced: self.priced.saturating_add(other.priced),
+            amount_micros: self.amount_micros.saturating_add(other.amount_micros),
         }
     }
 }
@@ -127,53 +130,57 @@ fn load_single_project_tree(connection: &Connection, project: &ProjectRow) -> Re
         crate::SubagentPolicy::Unknown => "Unknown",
     };
 
-    let is_covered = "(ue.source_kind IN ('codex_turn_counter', 'turn_counter', 'turn_summary', 'cumulative_turn_counter') AND EXISTS (SELECT 1 FROM usage_events d WHERE d.session_id = ue.session_id AND d.turn_id IS NOT NULL AND d.turn_id = ue.turn_id AND d.source_kind NOT IN ('codex_turn_counter', 'turn_counter', 'turn_summary', 'cumulative_turn_counter', 'final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter')))";
+    let is_covered = format!(
+        "(ue.source_kind IN ({turn_counters}) AND EXISTS (SELECT 1 FROM usage_events d WHERE d.session_id = ue.session_id AND d.turn_id IS NOT NULL AND d.turn_id = ue.turn_id AND d.superseded_by IS NULL AND d.source_kind NOT IN ({turn_counters}, {lifecycle})))",
+        turn_counters = source_kind::TURN_COUNTER_SQL_LIST,
+        lifecycle = source_kind::LIFECYCLE_COUNTER_SQL_LIST,
+    );
 
     let query = format!(
         "SELECT wi.id, wi.parent_id, wi.title,
                 coalesce(sum(CASE
-                    WHEN ue.source_kind IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter') THEN 0
+                    WHEN ue.source_kind IN ({lifecycle}) THEN 0
                     WHEN {is_covered} THEN 0
                     WHEN ?2 = 'AlreadyInParent' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN 0
                     WHEN ?2 = 'Unknown' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN 0
                     ELSE CAST(ROUND(ue.input_tokens * a.weight_basis_points / 10000.0) AS INTEGER)
                 END), 0) input,
                 coalesce(sum(CASE
-                    WHEN ue.source_kind IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter') THEN 0
+                    WHEN ue.source_kind IN ({lifecycle}) THEN 0
                     WHEN {is_covered} THEN 0
                     WHEN ?2 = 'AlreadyInParent' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN 0
                     WHEN ?2 = 'Unknown' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN 0
                     ELSE CAST(ROUND(ue.cached_input_tokens * a.weight_basis_points / 10000.0) AS INTEGER)
                 END), 0) cache_read,
                 coalesce(sum(CASE
-                    WHEN ue.source_kind IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter') THEN 0
+                    WHEN ue.source_kind IN ({lifecycle}) THEN 0
                     WHEN {is_covered} THEN 0
                     WHEN ?2 = 'AlreadyInParent' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN 0
                     WHEN ?2 = 'Unknown' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN 0
                     ELSE CAST(ROUND(ue.cache_write_tokens * a.weight_basis_points / 10000.0) AS INTEGER)
                 END), 0) cache_write,
                 coalesce(sum(CASE
-                    WHEN ue.source_kind IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter') THEN 0
+                    WHEN ue.source_kind IN ({lifecycle}) THEN 0
                     WHEN {is_covered} THEN 0
                     WHEN ?2 = 'AlreadyInParent' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN 0
                     WHEN ?2 = 'Unknown' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN 0
                     ELSE CAST(ROUND(ue.output_tokens * a.weight_basis_points / 10000.0) AS INTEGER)
                 END), 0) output,
                 coalesce(sum(CASE
-                    WHEN ue.source_kind IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter') THEN 0
+                    WHEN ue.source_kind IN ({lifecycle}) THEN 0
                     WHEN {is_covered} THEN 0
                     WHEN ?2 = 'AlreadyInParent' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN 0
                     WHEN ?2 = 'Unknown' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN 0
                     ELSE CAST(ROUND(ue.reasoning_tokens * a.weight_basis_points / 10000.0) AS INTEGER)
                 END), 0) reasoning,
                 coalesce(sum(CASE
-                    WHEN ue.id IS NULL OR ue.source_kind IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter', 'hermes_snapshot_delta', 'snapshot_delta') THEN 0
+                    WHEN ue.id IS NULL OR ue.source_kind IN ({lifecycle}, {deltas}) THEN 0
                     WHEN {is_covered} THEN 0
                     WHEN ?2 = 'AlreadyInParent' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN 0
                     ELSE 1
                 END), 0) requests,
                 coalesce(sum(CASE
-                    WHEN ue.id IS NULL OR ue.source_kind IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter', 'hermes_snapshot_delta', 'snapshot_delta') THEN 0
+                    WHEN ue.id IS NULL OR ue.source_kind IN ({lifecycle}, {deltas}) THEN 0
                     WHEN {is_covered} THEN 0
                     WHEN ?2 = 'AlreadyInParent' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN 0
                     WHEN ?2 = 'Unknown' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN 0
@@ -181,7 +188,7 @@ fn load_single_project_tree(connection: &Connection, project: &ProjectRow) -> Re
                     ELSE 0
                 END), 0) measured,
                 coalesce(sum(CASE
-                    WHEN ue.id IS NULL OR ue.source_kind IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter', 'hermes_snapshot_delta', 'snapshot_delta') THEN 0
+                    WHEN ue.id IS NULL OR ue.source_kind IN ({lifecycle}, {deltas}) THEN 0
                     WHEN {is_covered} THEN 0
                     WHEN ?2 = 'AlreadyInParent' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN 0
                     WHEN ?2 = 'Unknown' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN 1
@@ -190,6 +197,7 @@ fn load_single_project_tree(connection: &Connection, project: &ProjectRow) -> Re
                 END), 0) unavailable,
                 count(CASE
                     WHEN cc.usage_event_id IS NULL THEN NULL
+                    WHEN ue.source_kind IN ({lifecycle}) THEN NULL
                     WHEN {is_covered} THEN NULL
                     WHEN ?2 = 'AlreadyInParent' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN NULL
                     WHEN ?2 = 'Unknown' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN NULL
@@ -197,6 +205,7 @@ fn load_single_project_tree(connection: &Connection, project: &ProjectRow) -> Re
                 END) priced,
                 coalesce(sum(CASE
                     WHEN cc.amount_micros IS NULL THEN 0
+                    WHEN ue.source_kind IN ({lifecycle}) THEN 0
                     WHEN {is_covered} THEN 0
                     WHEN ?2 = 'AlreadyInParent' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN 0
                     WHEN ?2 = 'Unknown' AND (ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id)) THEN 0
@@ -207,12 +216,15 @@ fn load_single_project_tree(connection: &Connection, project: &ProjectRow) -> Re
          LEFT JOIN attribution_groups ag ON ag.id = a.group_id AND ag.active = 1
          LEFT JOIN usage_spans us ON us.id = ag.usage_span_id
          LEFT JOIN usage_events ue ON ue.id = json_extract(us.measured_usage_json, '$.usage_event_id')
+           AND ue.superseded_by IS NULL
          LEFT JOIN cost_calculations cc ON cc.rowid = (
              SELECT c2.rowid FROM cost_calculations c2 WHERE c2.usage_event_id = ue.id ORDER BY c2.calculated_at DESC LIMIT 1
          )
          WHERE wi.project_id = ?1
          GROUP BY wi.id
-         ORDER BY wi.created_at, wi.title"
+         ORDER BY wi.created_at, wi.title",
+        lifecycle = source_kind::LIFECYCLE_COUNTER_SQL_LIST,
+        deltas = source_kind::SNAPSHOT_DELTA_SQL_LIST,
     );
     let mut stmt = connection.prepare(&query)?;
 

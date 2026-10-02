@@ -3,6 +3,7 @@ use crate::stable_id;
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use rusqlite::{Connection, params};
+use tokentree_core::source_kind;
 
 pub fn ensure_session_attribution(connection: &mut Connection, session_id: &str) -> Result<u64> {
     struct SessionRow {
@@ -61,12 +62,14 @@ pub fn ensure_session_attribution(connection: &mut Connection, session_id: &str)
         reasoning_tokens: Option<i64>,
     }
 
-    let mut stmt = connection.prepare(
+    let mut stmt = connection.prepare(&format!(
         "SELECT id, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, reasoning_tokens
          FROM usage_events
          WHERE session_id = ?1
-           AND source_kind NOT IN ('final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter')",
-    )?;
+           AND superseded_by IS NULL
+           AND source_kind NOT IN ({})",
+        source_kind::LIFECYCLE_COUNTER_SQL_LIST,
+    ))?;
 
     let events = stmt
         .query_map([session_id], |row| {
@@ -82,7 +85,7 @@ pub fn ensure_session_attribution(connection: &mut Connection, session_id: &str)
         .collect::<Result<Vec<_>, _>>()?;
     drop(stmt);
 
-    let mut created = 0;
+    let mut created = 0u64;
     let transaction = connection.transaction()?;
 
     for event in events {
@@ -132,11 +135,46 @@ pub fn ensure_session_attribution(connection: &mut Connection, session_id: &str)
 
         validate_group_invariant(&transaction, &group_id)?;
 
-        created += 1;
+        created = created.saturating_add(1);
     }
 
     transaction.commit()?;
     Ok(created)
+}
+
+/// Ensure default project/work-item attribution for every session ingested
+/// from `source_path` (mirrors the TypeScript import flow). Sessions are
+/// looked up by source file, so this is robust to checkpointed re-imports
+/// that ingest zero new rows. The stable session ID is derived with the
+/// shared [`tokentree_core::session_stable_id`] helper so the lookup can
+/// never drift from what ingest wrote. Idempotent: returns the number of
+/// sessions attributed.
+pub fn ensure_session_attribution_for_source(
+    connection: &mut Connection,
+    adapter: &str,
+    source_path: &std::path::Path,
+) -> Result<u64> {
+    let source_path_str = source_path.to_string_lossy();
+    let pairs: Vec<(String, Option<String>)> = connection
+        .prepare(
+            "SELECT DISTINCT adapter, provider_session_id FROM sessions WHERE source_path = ?1",
+        )?
+        .query_map([source_path_str.as_ref()], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut attributed = 0u64;
+    for (row_adapter, provider_session_id) in &pairs {
+        if row_adapter == adapter {
+            if let Some(psid) = provider_session_id {
+                attributed = attributed.saturating_add(ensure_session_attribution(
+                    connection,
+                    &tokentree_core::session_stable_id(row_adapter, psid),
+                )?);
+            }
+        }
+    }
+    Ok(attributed)
 }
 
 pub fn attach_session(
@@ -154,18 +192,38 @@ pub fn attach_session(
 
     ensure_session_attribution(connection, session_id)?;
 
-    let mut stmt = connection.prepare("SELECT id FROM usage_events WHERE session_id = ?1")?;
-    let event_ids = stmt
-        .query_map([session_id], |row| row.get::<_, String>(0))?
+    struct AttachEvent {
+        id: String,
+        source_kind: String,
+    }
+    let mut stmt = connection.prepare(
+        "SELECT id, source_kind FROM usage_events WHERE session_id = ?1 AND superseded_by IS NULL",
+    )?;
+    let events = stmt
+        .query_map([session_id], |row| {
+            Ok(AttachEvent {
+                id: row.get(0)?,
+                source_kind: row.get(1)?,
+            })
+        })?
         .collect::<Result<Vec<_>, _>>()?;
     drop(stmt);
 
     let now = Utc::now().to_rfc3339();
-    let mut changed = 0;
+    let mut changed = 0u64;
+    let mut skipped_lifecycle: Vec<String> = Vec::new();
     let transaction = connection.transaction()?;
 
-    for event_id in event_ids {
-        let span_id = stable_id("span", &event_id);
+    for event in events {
+        // Lifecycle-counter events never get usage_spans (ensure_session_attribution
+        // deliberately excludes them): there is no span to re-attribute, and inserting
+        // an attribution_group for a nonexistent span would FK-violate. Skip them with
+        // a recorded note instead of failing the whole attach.
+        if is_lifecycle_counter_kind(&event.source_kind) {
+            skipped_lifecycle.push(event.id);
+            continue;
+        }
+        let span_id = stable_id("span", &event.id);
         let active_group: Option<String> = transaction
             .query_row(
                 "SELECT id FROM attribution_groups WHERE usage_span_id = ?1 AND active = 1",
@@ -198,7 +256,29 @@ pub fn attach_session(
 
         validate_group_invariant(&transaction, &new_group_id)?;
 
-        changed += 1;
+        changed = changed.saturating_add(1);
+    }
+
+    if !skipped_lifecycle.is_empty() {
+        let note_id = stable_id(
+            "anom",
+            &format!("attach_skipped_lifecycle:{session_id}:{now}"),
+        );
+        let skipped_json =
+            serde_json::json!({ "skipped_event_ids": skipped_lifecycle }).to_string();
+        transaction.execute(
+            "INSERT OR IGNORE INTO measurement_anomalies(
+                id, session_id, turn_id, type, source_values_json, created_at
+            ) VALUES(?,?,?,?,?,?)",
+            params![
+                note_id,
+                session_id,
+                Option::<String>::None,
+                "attach_skipped_lifecycle_counter",
+                skipped_json,
+                now,
+            ],
+        )?;
     }
 
     transaction.execute(
@@ -208,6 +288,15 @@ pub fn attach_session(
 
     transaction.commit()?;
     Ok(changed)
+}
+
+fn is_lifecycle_counter_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        source_kind::FINAL_REQUEST_COUNTER
+            | source_kind::SUBAGENT_STOP
+            | source_kind::SUBAGENT_LIFECYCLE_COUNTER
+    )
 }
 
 pub fn detach_session(connection: &mut Connection, session_id: &str) -> Result<u64> {
@@ -451,7 +540,7 @@ pub fn merge_work_items(
 
     // 3. For each affected group, reproduce ALL attribution rows,
     //    replacing source → target and combining weights if target already present.
-    let mut reattributed_spans = 0;
+    let mut reattributed_spans = 0u64;
     for (old_group_id, usage_span_id) in &affected_group_ids {
         // Read all rows from the superseded group
         let all_rows = read_group_attributions(&tx, old_group_id)?;
@@ -496,7 +585,7 @@ pub fn merge_work_items(
         }
 
         validate_group_invariant(&tx, &new_group_id)?;
-        reattributed_spans += 1;
+        reattributed_spans = reattributed_spans.saturating_add(1);
     }
 
     // 4. Mark source item as merged

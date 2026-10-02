@@ -156,8 +156,44 @@ fn test_case_e_repeated_counters() {
 }
 
 #[test]
-fn test_case_f_cumulative_resets() {
+fn test_case_f_cumulative_scoped_per_turn_no_spurious_reset() {
+    // H5: cumulative counters are keyed per (session, turn, model, agent), so a
+    // counter that restarts in a new turn is a fresh stream, NOT a negative
+    // delta. The old {model}:{agent} key spuriously flagged this as an anomaly.
     let fixture = fixtures_dir().join("adversarial/case-f-cumulative-resets.jsonl");
+    let parsed = parse_session(&fixture).unwrap();
+    assert_eq!(parsed.observations.len(), 2);
+    assert_eq!(
+        parsed.anomalies.len(),
+        0,
+        "cross-turn counter restart must not raise negative_delta"
+    );
+
+    let mut ledger = open_test_ledger();
+    let import = import_codex_file(ledger.connection_mut(), &fixture).unwrap();
+    assert_eq!(import.inserted, 2);
+    assert_eq!(import.duplicates, 0);
+    assert_eq!(import.anomalies, 0);
+
+    let agg = ledger.aggregate_usage().unwrap();
+    let comp = token_completeness(agg.measured, agg.unavailable, agg.anomalous);
+
+    // Turn 1 baseline (500, 100) + turn 2 baseline (200, 50) = 700, 150
+    assert_eq!(agg.input, 700);
+    assert_eq!(agg.cache_read, 0);
+    assert_eq!(agg.output, 150);
+    assert_eq!(agg.reasoning, 0);
+    assert_eq!(agg.requests, 2);
+    assert_eq!(agg.unavailable, 0);
+    assert_eq!(agg.anomalous, 0);
+    assert!((comp.unwrap() - 100.0).abs() < 1e-6);
+}
+
+#[test]
+fn test_case_h_cumulative_reset_within_turn_still_detected() {
+    // A counter that moves backwards WITHIN the same turn is a genuine reset:
+    // it must still raise negative_delta and re-baseline.
+    let fixture = fixtures_dir().join("adversarial/case-h-cumulative-reset-within-turn.jsonl");
     let parsed = parse_session(&fixture).unwrap();
     assert_eq!(parsed.observations.len(), 2);
     assert_eq!(parsed.anomalies.len(), 1);
@@ -172,7 +208,7 @@ fn test_case_f_cumulative_resets() {
     let agg = ledger.aggregate_usage().unwrap();
     let comp = token_completeness(agg.measured, agg.unavailable, agg.anomalous);
 
-    // Delta 1 (500, 100) + Reset 2 (200, 50) = 700, 150
+    // Baseline (500, 100) + reset value (200, 50) = 700, 150
     assert_eq!(agg.input, 700);
     assert_eq!(agg.cache_read, 0);
     assert_eq!(agg.output, 150);

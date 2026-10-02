@@ -7,3 +7,8 @@ coverage/
 .DS_Store
 target/
 *.tgz
+# Native binaries staged for the @tokentreehq/cli launcher (see release.yml
+# "Test npm launcher against archive layout" and the C8 fail-fast message).
+apps/cli/vendor/
+*.log
+.env

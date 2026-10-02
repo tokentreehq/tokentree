@@ -1,0 +1,4 @@
+{"type":"turn/started","turn_id":"turn_case_h","session_id":"ses_case_h","timestamp":"2026-03-30T10:00:00Z"}
+{"type":"thread/tokenUsage/updated","is_cumulative":true,"request_id":"req_case_h_1","turn_id":"turn_case_h","session_id":"ses_case_h","model":"o3-mini","cumulative_token_usage":{"input_tokens":500,"output_tokens":100},"timestamp":"2026-03-30T10:00:01Z"}
+{"type":"thread/tokenUsage/updated","is_cumulative":true,"request_id":"req_case_h_2","turn_id":"turn_case_h","session_id":"ses_case_h","model":"o3-mini","cumulative_token_usage":{"input_tokens":200,"output_tokens":50},"timestamp":"2026-03-30T10:00:02Z"}
+{"type":"turn/completed","turn_id":"turn_case_h","session_id":"ses_case_h","timestamp":"2026-03-30T10:00:03Z"}

@@ -61,13 +61,10 @@ pub fn export_csv(trees: &[ProjectTree]) -> Result<String> {
         } else {
             "unavailable".to_string()
         };
-        let completeness = if u.requests == 0 {
-            "unavailable".to_string()
-        } else {
-            format!(
-                "{:.1}",
-                100.0 * u.measured as f64 / (u.measured + u.unavailable) as f64
-            )
+        let completeness = match tokentree_core::token_completeness(u.measured, u.unavailable, 0) {
+            Some(pct) => format!("{pct:.1}"),
+            // No measured/unavailable signal: neutral, never NaN.
+            None => "unavailable".to_string(),
         };
 
         let parent_id_str = node.parent_id.as_deref().unwrap_or("");
@@ -125,11 +122,17 @@ pub fn export_html(trees: &[ProjectTree], disclaimer: &str) -> String {
 
     for tree in trees {
         let t = &tree.totals;
-        total_tokens += t.input + t.cache_read + t.cache_write + t.output + t.reasoning;
-        total_micros += t.amount_micros;
-        total_requests += t.requests;
-        total_measured += t.measured;
-        total_unavailable += t.unavailable;
+        total_tokens = total_tokens.saturating_add(
+            t.input
+                .saturating_add(t.cache_read)
+                .saturating_add(t.cache_write)
+                .saturating_add(t.output)
+                .saturating_add(t.reasoning),
+        );
+        total_micros = total_micros.saturating_add(t.amount_micros);
+        total_requests = total_requests.saturating_add(t.requests);
+        total_measured = total_measured.saturating_add(t.measured);
+        total_unavailable = total_unavailable.saturating_add(t.unavailable);
         if t.requests > 0 && t.priced < t.requests {
             fully_priced = false;
         }
@@ -141,11 +144,12 @@ pub fn export_html(trees: &[ProjectTree], disclaimer: &str) -> String {
         "Cost Unavailable".to_string()
     };
 
-    let overall_completeness = if total_requests == 0 {
-        100.0
-    } else {
-        100.0 * total_measured as f64 / (total_measured + total_unavailable) as f64
-    };
+    // No requests at all, or requests with no measured/unavailable signal:
+    // show a neutral "unavailable" state, never a green 100% or NaN.
+    let overall_completeness: Option<f64> =
+        tokentree_core::token_completeness(total_measured, total_unavailable, 0);
+    let overall_completeness_html =
+        overall_completeness.map_or_else(|| "unavailable".to_string(), |pct| format!("{pct:.0}%"));
 
     fn render_node_html(node: &WorkTreeNode, depth: usize) -> String {
         let mut html = String::new();
@@ -158,16 +162,15 @@ pub fn export_html(trees: &[ProjectTree], disclaimer: &str) -> String {
             "unavailable".to_string()
         };
 
-        let comp_badge = if u.requests == 0 {
-            r#"<span class="badge badge-muted">no requests</span>"#.to_string()
-        } else if u.unavailable == 0 {
-            r#"<span class="badge badge-green">100% complete</span>"#.to_string()
-        } else {
-            let pct = 100.0 * u.measured as f64 / (u.measured + u.unavailable) as f64;
-            format!(
+        let comp_badge = match tokentree_core::token_completeness(u.measured, u.unavailable, 0) {
+            None => r#"<span class="badge badge-muted">no requests</span>"#.to_string(),
+            Some(_) if u.unavailable == 0 => {
+                r#"<span class="badge badge-green">100% complete</span>"#.to_string()
+            }
+            Some(pct) => format!(
                 r#"<span class="badge badge-amber">{pct:.0}% complete ({} unavailable)</span>"#,
                 u.unavailable
-            )
+            ),
         };
 
         let has_children = !node.children.is_empty();
@@ -547,7 +550,7 @@ pub fn export_html(trees: &[ProjectTree], disclaimer: &str) -> String {
       </div>
       <div class="stat-card">
         <div class="stat-label">Completeness</div>
-        <div class="stat-value">{overall_completeness:.0}%</div>
+        <div class="stat-value">{overall_completeness_html}</div>
       </div>
       <div class="stat-card">
         <div class="stat-label">Unavailable Requests</div>

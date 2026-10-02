@@ -49,6 +49,11 @@ jobs:
           toolchain: 1.98.1
           targets: ${{ matrix.target }}
 
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: ${{ matrix.target }}-
+
       - name: Build binary
         run: cargo build --release --target ${{ matrix.target }} -p tokentree-cli
 
@@ -182,8 +187,28 @@ jobs:
           mkdir -p apps/cli/vendor/x86_64-unknown-linux-gnu
           cp extracted/tokentree apps/cli/vendor/x86_64-unknown-linux-gnu/
           npx vitest run apps/cli/test/launcher.test.ts
-          node apps/cli/dist/index.js --version
-          node apps/cli/dist/index.js doctor
+          node apps/cli/dist/main.js --version
+          node apps/cli/dist/main.js doctor
+
+      - name: Verify launcher fails loudly without a native binary
+        run: |
+          mv apps/cli/vendor apps/cli/vendor-hidden
+          set +e
+          node apps/cli/dist/main.js doctor > launcher-fail.log 2>&1
+          code=$?
+          set -e
+          mv apps/cli/vendor-hidden apps/cli/vendor
+          if [ "$code" -eq 0 ]; then
+            echo "launcher should fail without a native binary"
+            cat launcher-fail.log
+            exit 1
+          fi
+          grep -q "no native tokentree binary found" launcher-fail.log
+
+      - name: Verify explicit JS-engine opt-in still runs
+        env:
+          TOKENTREE_FORCE_JS: '1'
+        run: node apps/cli/dist/main.js doctor
 
       - name: Upload verified release assets
         uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
@@ -192,9 +217,128 @@ jobs:
           path: release-assets/*
           if-no-files-found: error
 
+  publish-npm:
+    name: Verify and publish npm package (@tokentreehq/cli)
+    needs: [build, verify]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a # v4.2.0
+        with:
+          node-version: 22
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@7088e561eb65bb68695d245aa206f005ef30921de2a # v4.1.0
+        with:
+          version: 10.17.1
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify tag matches package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          package_version=$(node -p "require('./apps/cli/package.json').version")
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ "$package_version" != "$tag_version" ]; then
+            echo "release tag v$tag_version does not match package version $package_version"
+            exit 1
+          fi
+
+      - name: Build CLI package
+        run: pnpm --filter @tokentreehq/cli build
+
+      - name: Download verified native archives
+        uses: actions/download-artifact@cc203385981b70ca67e1cc392babf9cc229d5806 # v4.1.9
+        with:
+          path: npm-artifacts
+          pattern: binary-*
+          merge-multiple: true
+
+      - name: Stage native binaries and checksums
+        run: |
+          set -euo pipefail
+          rm -rf npm-vendor
+          mkdir -p npm-vendor
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin; do
+            mkdir -p "npm-vendor/$target"
+            tar -xzf "npm-artifacts/tokentree-$target.tar.gz" -C "npm-vendor/$target"
+            chmod +x "npm-vendor/$target/tokentree"
+          done
+          mkdir -p npm-vendor/x86_64-pc-windows-msvc
+          unzip -q npm-artifacts/tokentree-x86_64-pc-windows-msvc.zip -d npm-vendor/x86_64-pc-windows-msvc
+          test -f npm-vendor/x86_64-pc-windows-msvc/tokentree.exe
+          find npm-vendor -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 sha256sum > npm-vendor/SHA256SUMS.txt
+          sha256sum -c npm-vendor/SHA256SUMS.txt
+
+      - name: Stage publishable package
+        run: |
+          set -euo pipefail
+          rm -rf npm-stage
+          mkdir -p npm-stage
+          cp -r apps/cli/dist apps/cli/data apps/cli/migrations npm-vendor npm-stage/
+          mv npm-stage/npm-vendor npm-stage/vendor
+          cp apps/cli/README.md apps/cli/LICENSE npm-stage/
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const pkg = JSON.parse(fs.readFileSync('apps/cli/package.json', 'utf8'));
+          delete pkg.devDependencies;
+          delete pkg.scripts;
+          pkg.files = ['dist', 'migrations', 'data', 'vendor', 'README.md', 'LICENSE'];
+          fs.writeFileSync('npm-stage/package.json', JSON.stringify(pkg, null, 2) + '\n');
+          NODE
+          test -f npm-stage/dist/main.js
+          test -f npm-stage/data/prices.json
+          for binary in \
+            vendor/x86_64-unknown-linux-gnu/tokentree \
+            vendor/aarch64-unknown-linux-gnu/tokentree \
+            vendor/x86_64-apple-darwin/tokentree \
+            vendor/aarch64-apple-darwin/tokentree \
+            vendor/x86_64-pc-windows-msvc/tokentree.exe; do
+            test -f "npm-stage/$binary"
+          done
+
+      - name: Pack and smoke-test exact npm artifact
+        id: npm-pack
+        run: |
+          set -euo pipefail
+          cd npm-stage
+          tarball=$(npm pack --silent)
+          tar -tf "$tarball" > tarball-contents.txt
+          grep -q 'package/dist/main.js' tarball-contents.txt
+          grep -q 'package/vendor/x86_64-unknown-linux-gnu/tokentree' tarball-contents.txt
+          prefix="$RUNNER_TEMP/tokentree-npm-smoke"
+          npm install --global --prefix "$prefix" "./$tarball"
+          TOKENTREE_HOME="$RUNNER_TEMP/tokentree-npm-home" "$prefix/bin/tokentree" --version
+          TOKENTREE_HOME="$RUNNER_TEMP/tokentree-npm-home" "$prefix/bin/tokentree" doctor
+          echo "tarball=$PWD/$tarball" >> "$GITHUB_OUTPUT"
+
+      - name: Require npm publishing credentials
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "NPM_TOKEN is required for release tags; refusing a partial GitHub-only release"
+            exit 1
+          fi
+
+      - name: Publish exact verified npm artifact
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish "${{ steps.npm-pack.outputs.tarball }}" --access public --provenance
+
   publish:
     name: Publish Release
-    needs: [build, verify]
+    needs: [build, verify, publish-npm]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     steps:

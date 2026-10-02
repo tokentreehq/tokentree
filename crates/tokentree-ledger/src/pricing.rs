@@ -34,7 +34,8 @@ pub fn apply_price_snapshot(
     let mut stmt = transaction.prepare(
         "SELECT id, model, coalesce(source_timestamp, observed_at),
                 input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, reasoning_tokens
-         FROM usage_events",
+         FROM usage_events
+         WHERE superseded_by IS NULL",
     )?;
 
     let event_rows = stmt
@@ -120,7 +121,8 @@ pub fn apply_price_snapshot(
             params![
                 event.id,
                 price_id,
-                amount_micros as i64,
+                i64::try_from(amount_micros)
+                    .context("cost amount exceeds SQLite integer range")?,
                 coverage,
                 now,
             ],
