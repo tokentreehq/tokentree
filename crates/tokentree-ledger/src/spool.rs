@@ -47,7 +47,7 @@ pub fn process_claude_hook_spool(
         .unwrap_or_else(|_| chrono::Utc::now().to_rfc3339());
 
     let spool_str = spool_path.to_string_lossy().to_string();
-    let start_offset: u64 = connection
+    let mut start_offset: u64 = connection
         .query_row(
             "SELECT last_offset FROM ingestion_checkpoints WHERE adapter='claude-hook' AND source_path=?",
             params![spool_str],
@@ -55,6 +55,13 @@ pub fn process_claude_hook_spool(
         )
         .unwrap_or(0)
         .max(0) as u64;
+
+    // M4: if the checkpoint offset is past the current EOF, the spool file
+    // was rotated (or truncated) since the last poll. Rotation only ever
+    // happens after the old file was fully ingested, so restart from 0.
+    if start_offset > file_size {
+        start_offset = 0;
+    }
 
     let mut file = File::open(spool_path)
         .with_context(|| format!("open spool at {}", spool_path.display()))?;
@@ -70,6 +77,17 @@ pub fn process_claude_hook_spool(
     let mut line = String::new();
     while let Ok(bytes_read) = reader.read_line(&mut line) {
         if bytes_read == 0 {
+            break;
+        }
+
+        // M3: a final line without a trailing newline means the hook writer
+        // is mid-append (writers always terminate lines with `\n`; `read_line`
+        // only returns an unterminated chunk at EOF). Do NOT ingest it and do
+        // NOT advance the checkpoint past it — break here so the next poll
+        // re-reads the completed line. Advancing would silently lose the
+        // event: the partial line fails JSON parse (counted `skipped`), and
+        // the remainder read later starts mid-JSON (skipped again).
+        if !line.ends_with('\n') {
             break;
         }
 
@@ -139,7 +157,92 @@ pub fn process_claude_hook_spool(
     )?;
 
     transaction.commit()?;
+
+    // M4: rotate the spool (and quarantine) files if they exceeded the size
+    // cap. Rotation only happens when the spool is fully ingested, so the
+    // next poll picks up the fresh file from offset 0 (see the
+    // start_offset > file_size reset above).
+    maybe_rotate_spool(connection, spool_path, spool_max_bytes())?;
+
     Ok(summary)
+}
+
+/// Maximum spool/quarantine file size before rotation, in bytes.
+/// Overridable via `TOKENTREE_SPOOL_MAX_BYTES`; defaults to 100 MiB.
+pub fn spool_max_bytes() -> u64 {
+    std::env::var("TOKENTREE_SPOOL_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(100 * 1024 * 1024)
+}
+
+/// Generations of rotated spool files kept (`path.1` .. `path.N`).
+const SPOOL_ROTATIONS: u32 = 3;
+
+/// Rotate `spool_path` (and its quarantine sibling) when over `max_bytes`.
+///
+/// The spool file is renamed to `<name>.1` — with older generations shifted
+/// to `.2`, `.3`, … and the oldest dropped — and ingestion restarts from
+/// offset 0 on the fresh file (the poll detects `last_offset > file_size` and
+/// resets). Rotation NEVER happens while un-ingested data remains: it
+/// requires the checkpoint's `last_offset` to cover the whole file. (There is
+/// an unavoidable check-then-rename race if the hook writer appends in the
+/// microseconds between the size check and the rename; the writer appends
+/// complete lines and the M3 hold-checkpoint rule means a torn tail is
+/// re-read, not lost — but operators should treat rotation during active
+/// writes as best-effort.)
+///
+/// The quarantine file is write-only forensic data (never re-read by
+/// ingestion), so it rotates on size alone, independent of the spool.
+fn maybe_rotate_spool(connection: &Connection, spool_path: &Path, max_bytes: u64) -> Result<()> {
+    // The quarantine file is write-only forensic data (never re-read by
+    // ingestion), so it rotates on size alone, independent of the spool.
+    let quarantine_path = quarantine_path_for(spool_path);
+    if fs::metadata(&quarantine_path).map(|m| m.len()).unwrap_or(0) > max_bytes {
+        rotate_generations(&quarantine_path)?;
+    }
+
+    let file_size = fs::metadata(spool_path).map(|m| m.len()).unwrap_or(0);
+    if file_size <= max_bytes {
+        return Ok(());
+    }
+    let spool_str = spool_path.to_string_lossy().to_string();
+    let last_offset: i64 = connection
+        .query_row(
+            "SELECT last_offset FROM ingestion_checkpoints WHERE adapter='claude-hook' AND source_path=?",
+            params![spool_str],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if (last_offset.max(0) as u64) < file_size {
+        // Un-ingested data remains (writer appended after our poll, or the
+        // poll ingested only part of the file). Never rotate; try next poll.
+        return Ok(());
+    }
+    rotate_generations(spool_path)?;
+    Ok(())
+}
+
+/// Shift `<path>` -> `<path>.1`, `<path>.1` -> `<path>.2`, …, keeping
+/// [`SPOOL_ROTATIONS`] generations and dropping the oldest.
+fn rotate_generations(path: &Path) -> Result<()> {
+    let base = path.to_string_lossy().to_string();
+    for generation in (1..SPOOL_ROTATIONS).rev() {
+        let from_name = format!("{base}.{generation}");
+        let from = Path::new(&from_name);
+        if from.exists() {
+            fs::rename(from, format!("{base}.{}", generation + 1)).with_context(|| {
+                format!(
+                    "rotate spool generation {generation} for {}",
+                    path.display()
+                )
+            })?;
+        }
+    }
+    fs::rename(path, format!("{base}.1"))
+        .with_context(|| format!("rotate spool file {}", path.display()))?;
+    Ok(())
 }
 
 /// Sibling path for quarantined spool events, e.g.
@@ -441,6 +544,168 @@ mod tests {
             quarantine_path_for(p),
             std::path::Path::new("/tmp/spool/claude-hooks.quarantine.jsonl")
         );
+    }
+
+    /// M3: a torn final line (writer mid-append, no trailing newline) must
+    /// NOT be ingested and must NOT advance the checkpoint. The next poll
+    /// re-reads the completed line and ingests it exactly once.
+    #[test]
+    fn torn_spool_line_holds_checkpoint_until_completed() {
+        let dir = tempdir().unwrap();
+        let spool_path = dir.path().join("claude-hooks.jsonl");
+
+        let hook = |session: &str| {
+            json!({
+                "version": 1,
+                "kind": "UserPromptSubmit",
+                "capturedAt": "2026-09-29T10:00:00Z",
+                "payload": {
+                    "session_id": session,
+                    "prompt_fingerprint": "abc12345",
+                    "cwd": dir.path().to_str().unwrap()
+                }
+            })
+        };
+
+        // One complete event, then a partial line with no trailing newline,
+        // as if the hook writer was mid-append when we polled.
+        let line1 = format!("{}\n", hook("ses_torn_1"));
+        let partial = format!("{}", hook("ses_torn_2"));
+        fs::write(&spool_path, format!("{line1}{partial}")).unwrap();
+
+        let mut ledger = Ledger::open_memory().unwrap();
+        let summary = ledger.process_claude_hook_spool(&spool_path).unwrap();
+        assert_eq!(summary.processed, 1);
+        assert_eq!(
+            summary.skipped, 0,
+            "torn line must be held, not counted as skipped"
+        );
+
+        // Checkpoint held at the torn line's start byte offset.
+        let offset: i64 = ledger
+            .connection()
+            .query_row(
+                "SELECT last_offset FROM ingestion_checkpoints WHERE adapter='claude-hook'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(offset as u64, line1.len() as u64);
+
+        // Writer completes the line; the next poll ingests it exactly once.
+        {
+            use std::io::Write as _;
+            let mut f = fs::OpenOptions::new()
+                .append(true)
+                .open(&spool_path)
+                .unwrap();
+            writeln!(f).unwrap(); // terminates the partial line
+        }
+        let summary2 = ledger.process_claude_hook_spool(&spool_path).unwrap();
+        assert_eq!(summary2.processed, 1);
+        assert_eq!(summary2.skipped, 0);
+
+        let turn_count: i64 = ledger
+            .connection()
+            .query_row("SELECT count(*) FROM turns", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(turn_count, 2, "torn event ingested exactly once");
+
+        // And the checkpoint now covers the whole file.
+        let offset2: i64 = ledger
+            .connection()
+            .query_row(
+                "SELECT last_offset FROM ingestion_checkpoints WHERE adapter='claude-hook'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let file_len = fs::metadata(&spool_path).unwrap().len();
+        assert_eq!(offset2 as u64, file_len);
+    }
+
+    /// M4: rotation never drops un-ingested data, and ingestion resumes from
+    /// offset 0 on the fresh file with no duplicates.
+    #[test]
+    fn spool_rotates_only_when_fully_ingested() {
+        let dir = tempdir().unwrap();
+        let spool_path = dir.path().join("claude-hooks.jsonl");
+        let rotated_path = dir.path().join("claude-hooks.jsonl.1");
+
+        let hook = |session: &str| {
+            json!({
+                "version": 1,
+                "kind": "UserPromptSubmit",
+                "capturedAt": "2026-09-29T10:00:00Z",
+                "payload": {
+                    "session_id": session,
+                    "prompt_fingerprint": "abc12345",
+                    "cwd": dir.path().to_str().unwrap()
+                }
+            })
+        };
+        let append_line = |session: &str| {
+            use std::io::Write as _;
+            let mut f = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&spool_path)
+                .unwrap();
+            writeln!(f, "{}", hook(session)).unwrap();
+        };
+
+        let mut ledger = Ledger::open_memory().unwrap();
+        append_line("ses_rot_1");
+        append_line("ses_rot_2");
+        let summary = ledger.process_claude_hook_spool(&spool_path).unwrap();
+        assert_eq!(summary.processed, 2);
+
+        // Un-ingested data present: append without polling, then rotation
+        // must refuse (tiny cap forces the size check to trigger).
+        append_line("ses_rot_3");
+        maybe_rotate_spool(ledger.connection(), &spool_path, 10).unwrap();
+        assert!(
+            !rotated_path.exists(),
+            "must not rotate while un-ingested data remains"
+        );
+
+        // Ingest everything, then rotation proceeds.
+        let summary2 = ledger.process_claude_hook_spool(&spool_path).unwrap();
+        assert_eq!(summary2.processed, 1);
+        maybe_rotate_spool(ledger.connection(), &spool_path, 10).unwrap();
+        assert!(rotated_path.exists(), "spool should have rotated");
+        assert!(
+            !spool_path.exists(),
+            "original path renamed away by rotation"
+        );
+
+        // Fresh file: ingestion restarts from offset 0, no duplicates.
+        append_line("ses_rot_4");
+        let summary3 = ledger.process_claude_hook_spool(&spool_path).unwrap();
+        assert_eq!(summary3.processed, 1);
+        let turn_count: i64 = ledger
+            .connection()
+            .query_row("SELECT count(*) FROM turns", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(turn_count, 4);
+    }
+
+    /// M4: the quarantine file rotates on size alone (it is write-only).
+    #[test]
+    fn quarantine_file_rotates_on_size() {
+        let dir = tempdir().unwrap();
+        let spool_path = dir.path().join("claude-hooks.jsonl");
+        let quarantine_path = dir.path().join("claude-hooks.quarantine.jsonl");
+
+        // Spool stays tiny; quarantine exceeds the cap.
+        fs::write(&spool_path, "").unwrap();
+        fs::write(&quarantine_path, "x".repeat(500)).unwrap();
+
+        let ledger = Ledger::open_memory().unwrap();
+        maybe_rotate_spool(ledger.connection(), &spool_path, 100).unwrap();
+
+        assert!(dir.path().join("claude-hooks.quarantine.jsonl.1").exists());
+        assert!(!quarantine_path.exists());
     }
 
     /// H3: a poison event (here: a hook whose cwd contains a `.tokentree.yml`
