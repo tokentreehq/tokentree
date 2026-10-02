@@ -964,3 +964,86 @@ fn test_validate_require_live_installed_cli_timeout_without_telemetry() {
     assert!(stdout.contains("Live Capture:          failed"));
     assert!(stdout.contains("Overall Status: FAILED"));
 }
+
+#[test]
+fn test_validate_polling_counters_unchanged_historical_file_counted_once_without_multiplying_anomalies()
+ {
+    let temp_home = tempdir().unwrap();
+    let mock_bin = temp_home.path().join("mock_bin");
+    let test_path = setup_mock_cli_path(&mock_bin, "grok");
+
+    // Write valid configuration
+    let grok_config = temp_home.path().join(".grok");
+    std::fs::create_dir_all(&grok_config).unwrap();
+    std::fs::write(grok_config.join("config.json"), "{}").unwrap();
+
+    // Create exactly one historical session file with an intentional token sum mismatch anomaly
+    let grok_sessions = temp_home
+        .path()
+        .join(".grok")
+        .join("sessions")
+        .join("ses_hist");
+    std::fs::create_dir_all(&grok_sessions).unwrap();
+
+    // session has totalTokens: 100, but inputTokens (40) + outputTokens (10) = 50 -> triggers token_sum_mismatch anomaly
+    let hist_content = r#"{
+        "sessionId": "ses_hist",
+        "updatedAt": "2026-01-01T00:00:00Z",
+        "session": { "inputTokens": 100, "outputTokens": 20, "primaryModelId": "grok-base" },
+        "turns": [{ "turnNumber": 1, "endedAt": "2026-01-01T00:00:00Z", "totalTokens": 100, "inputTokens": 40, "outputTokens": 10, "primaryModelId": "grok-base" }]
+    }"#;
+    std::fs::write(grok_sessions.join("usage.json"), hist_content).unwrap();
+
+    let report_path = temp_home.path().join("report.json");
+
+    // Run validate with --require-live --wait 2: polls ~20 times over 2 seconds
+    let output = std::process::Command::new(bin_path())
+        .args([
+            "validate",
+            "--require-live",
+            "--wait",
+            "2",
+            "grok",
+            "--output",
+            report_path.to_str().unwrap(),
+        ])
+        .env("HOME", temp_home.path())
+        .env("USERPROFILE", temp_home.path())
+        .env("PATH", test_path)
+        .output()
+        .expect("execute validate with polling");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Verify typed JSON report counters
+    assert!(report_path.exists(), "report file must be generated");
+    let report_json = std::fs::read_to_string(&report_path).unwrap();
+    let report: TestValidationSuiteReport = serde_json::from_str(&report_json).unwrap();
+    let grok = report.adapters.get("grok").expect("grok adapter report");
+
+    // Assert: exactly 1 evaluated host source, not multiplied by 20 polls, and separate from self-test
+    assert_eq!(
+        grok.counters.sessions_evaluated, 1,
+        "sessions_evaluated must be exactly 1 despite repeated polling: {stdout}"
+    );
+    assert_eq!(
+        grok.counters.host_files.attempted, 1,
+        "host_files.attempted must be exactly 1: {stdout}"
+    );
+    assert_eq!(
+        grok.counters.host_files.verified, 1,
+        "host_files.verified must be 1"
+    );
+    assert_eq!(
+        grok.counters.host_files.anomalous, 1,
+        "host_files.anomalous must be 1"
+    );
+    assert_eq!(
+        grok.counters.anomalies_detected, 1,
+        "anomalies_detected must be exactly 1, NEVER multiplied by polling iterations: {stdout}"
+    );
+
+    // Verify stdout also reflects exactly 1 attempted and 1 anomalies
+    assert!(stdout.contains("1 attempted"));
+    assert!(stdout.contains("1 anomalies"));
+}

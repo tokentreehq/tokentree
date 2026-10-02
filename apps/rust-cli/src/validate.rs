@@ -630,27 +630,32 @@ fn validate_single_adapter(
     let db_path = temp_dir.path().join("validate.db");
     let mut ledger = Ledger::open(&db_path).context("open validation ledger")?;
 
-    let mut sessions_evaluated = 0u64;
-    let mut total_anomalies = 0u64;
-
     let (self_test_ok, fixture_anoms) = if let Some(custom) = &options.fixture {
-        sessions_evaluated += 1;
         let r = ingest_adapter_telemetry(adapter, &mut ledger, custom);
         (
             r.outcome == TelemetryImportOutcome::Verified
                 || r.outcome == TelemetryImportOutcome::DuplicateOnly,
             r.anomalies,
         )
-    } else {
-        sessions_evaluated += 1;
+    } else if options.self_test {
         let r = ingest_embedded_fixture(adapter, &mut ledger, temp_dir.path());
         (
             r.outcome == TelemetryImportOutcome::Verified
                 || r.outcome == TelemetryImportOutcome::DuplicateOnly,
             r.anomalies,
         )
+    } else {
+        // In default host mode or require-live mode: run self-test in an isolated sandbox ledger
+        // to keep embedded self-test counts and data completely separate from host validation!
+        let self_test_db = temp_dir.path().join("self_test.db");
+        let mut self_test_ledger = Ledger::open(&self_test_db).context("open self-test ledger")?;
+        let r = ingest_embedded_fixture(adapter, &mut self_test_ledger, temp_dir.path());
+        (
+            r.outcome == TelemetryImportOutcome::Verified
+                || r.outcome == TelemetryImportOutcome::DuplicateOnly,
+            r.anomalies,
+        )
     };
-    total_anomalies += fixture_anoms;
 
     let self_test_status = if self_test_ok {
         SelfTestStatus::Passed
@@ -678,6 +683,7 @@ fn validate_single_adapter(
     let initial_identities = snapshot_event_identities(adapter, session_dir.as_deref());
 
     // 4. Host Telemetry Validation (never let fixture success override host telemetry failure!)
+    let mut host_sources: BTreeMap<PathBuf, IngestResult> = BTreeMap::new();
     let mut host_files = HostTelemetryFiles::default();
     let mut fresh_event_observed = false;
     let wait_secs = if options.require_live {
@@ -727,25 +733,29 @@ fn validate_single_adapter(
                 break TelemetryStatus::NotFound;
             }
 
-            host_files = HostTelemetryFiles::default();
             for p in &found {
-                host_files.attempted += 1;
-                sessions_evaluated += 1;
                 let res = ingest_adapter_telemetry(adapter, &mut ledger, p);
-                match res.outcome {
-                    TelemetryImportOutcome::Verified => host_files.verified += 1,
-                    TelemetryImportOutcome::DuplicateOnly => host_files.duplicate_only += 1,
-                    TelemetryImportOutcome::Malformed => host_files.failed += 1,
-                    TelemetryImportOutcome::UnsupportedVersion => host_files.unsupported += 1,
-                    TelemetryImportOutcome::Inaccessible => host_files.failed += 1,
-                    TelemetryImportOutcome::Empty => host_files.empty += 1,
-                    TelemetryImportOutcome::Skipped => host_files.skipped += 1,
-                    TelemetryImportOutcome::Failed => host_files.failed += 1,
+                match host_sources.get_mut(p) {
+                    Some(entry) => {
+                        if res.outcome == TelemetryImportOutcome::Verified {
+                            entry.outcome = TelemetryImportOutcome::Verified;
+                        } else if res.outcome != TelemetryImportOutcome::DuplicateOnly {
+                            entry.outcome = res.outcome;
+                        }
+                        if res.anomalies > 0 {
+                            entry.anomalies = res.anomalies;
+                        }
+                        if res.latest_timestamp.is_some() {
+                            entry.latest_timestamp = res.latest_timestamp;
+                        }
+                        if res.latest_event_identity.is_some() {
+                            entry.latest_event_identity = res.latest_event_identity;
+                        }
+                    }
+                    None => {
+                        host_sources.insert(p.clone(), res);
+                    }
                 }
-                if res.anomalies > 0 {
-                    host_files.anomalous += 1;
-                }
-                total_anomalies += res.anomalies;
 
                 // Inspect observations to verify a newly created provider event identity
                 let current_events = match adapter {
@@ -791,6 +801,25 @@ fn validate_single_adapter(
                 }
             }
 
+            // Derive final counters from unique final outcomes
+            host_files = HostTelemetryFiles::default();
+            for state in host_sources.values() {
+                host_files.attempted += 1;
+                match state.outcome {
+                    TelemetryImportOutcome::Verified => host_files.verified += 1,
+                    TelemetryImportOutcome::DuplicateOnly => host_files.duplicate_only += 1,
+                    TelemetryImportOutcome::Malformed => host_files.failed += 1,
+                    TelemetryImportOutcome::UnsupportedVersion => host_files.unsupported += 1,
+                    TelemetryImportOutcome::Inaccessible => host_files.failed += 1,
+                    TelemetryImportOutcome::Empty => host_files.empty += 1,
+                    TelemetryImportOutcome::Skipped => host_files.skipped += 1,
+                    TelemetryImportOutcome::Failed => host_files.failed += 1,
+                }
+                if state.anomalies > 0 {
+                    host_files.anomalous += 1;
+                }
+            }
+
             if fresh_event_observed || std::time::Instant::now() >= deadline {
                 break if host_files.failed > 0 {
                     TelemetryStatus::Failed
@@ -807,6 +836,13 @@ fn validate_single_adapter(
 
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
+    };
+
+    let host_anomalies: u64 = host_sources.values().map(|s| s.anomalies).sum();
+    let (sessions_evaluated, total_anomalies) = if options.self_test || options.fixture.is_some() {
+        (1u64, fixture_anoms)
+    } else {
+        (host_files.attempted, host_anomalies)
     };
 
     if !options.self_test {
@@ -1613,10 +1649,17 @@ fn print_adapter_terminal_report(adapter: &str, report: &AdapterValidationReport
         }
     );
     println!("  Checks:");
-    println!(
-        "    Self-Test (Fixtures):  {} ({} tokens)",
-        report.checks.self_test_status, report.counters.total_tokens
-    );
+    if report.checks.telemetry_status == TelemetryStatus::NotRun {
+        println!(
+            "    Self-Test (Fixtures):  {} ({} tokens)",
+            report.checks.self_test_status, report.counters.total_tokens
+        );
+    } else {
+        println!(
+            "    Self-Test (Fixtures):  {}",
+            report.checks.self_test_status
+        );
+    }
     println!(
         "    Provider Status:       {}",
         report.checks.provider_status
