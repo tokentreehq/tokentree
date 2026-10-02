@@ -29,6 +29,9 @@ export function ingestObservations(db: DatabaseSync, input: readonly UsageObserv
       const sessionId=stableId('ses',`${item.adapter}:${item.providerSessionId}`);
       db.prepare(`INSERT OR IGNORE INTO sessions(id,adapter,provider_session_id,source_path,started_at)
         VALUES (?,?,?,?,?)`).run(sessionId,item.adapter,item.providerSessionId,item.sourcePath,item.sourceTimestamp ?? item.observedAt);
+      // source_kind contract: item.source must be one of SOURCE_KIND_VOCABULARY
+      // (@tokentreehq/core). Authority is MeasurementSource::as_str() in
+      // crates/tokentree-core/src/lib.rs. Never write adapter subtype strings here.
       const info=db.prepare(`INSERT OR IGNORE INTO usage_events(
         id,adapter,source_kind,source_event_id,source_process_id,source_sequence,session_id,prompt_id,turn_id,request_id,agent_id,parent_agent_id,source_timestamp,observed_at,ingested_at,model,service_tier,region,input_tokens,cached_input_tokens,cache_write_tokens,output_tokens,reasoning_tokens,provider_reported_cost_micros,source_path,source_offset,event_hash,adapter_version,parser_version
       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(

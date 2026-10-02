@@ -18,8 +18,8 @@ export interface AgentAdapter {
   watch?(callback: (event: UsageEvent) => void): Promise<Watcher>;
   capabilities(): AdapterCapabilities;
 }
-export { SOURCE_RANK, canonicalIdentity, deduplicateObservations, eventHash, hasMeasuredTokens, snapshotDelta, tokenCompleteness } from './measurement.js';
-export type { CompletenessInput, DedupeResult, MeasurementSource, TokenUsage, UsageObservation } from './measurement.js';
+export { SOURCE_KIND_VOCABULARY, SOURCE_RANK, canonicalIdentity, deduplicateObservations, eventHash, hasMeasuredTokens, snapshotDelta, tokenCompleteness } from './measurement.js';
+export type { CompletenessInput, DedupeResult, MeasurementSource, SourceKind, TokenUsage, UsageObservation } from './measurement.js';
 export { enqueueSpool } from './spool.js';
 export type { SpoolEnvelope } from './spool.js';
 export { resolveProject } from './project.js';

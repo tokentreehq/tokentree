@@ -22,6 +22,11 @@ claude plugin add tokentree@tokentreehq/tokentree
 
 Once installed, Claude Code automatically runs TokenTree's lightweight lifecycle hooks (`SessionStart`, `UserPromptSubmit`, `TaskCreated`, `TaskCompleted`, `SubagentStart`, `SessionEnd`).
 
+> **Note:** the plugin ships only the hook scripts — it does not bundle the
+> native `tokentree` binary. The hooks enqueue capture events; a `tokentree`
+> binary (from the npm launcher or a GitHub release) must be installed
+> separately to process them into the ledger.
+
 ---
 
 ## 2. Standalone CLI Installation
@@ -32,6 +37,15 @@ You can install the official `@tokentreehq/cli` binary wrapper via npm or downlo
 ```bash
 npm install -g @tokentreehq/cli
 ```
+
+`@tokentreehq/cli` is a launcher for the Rust measurement engine: it also needs
+the native `tokentree` binary for your platform. Download the matching
+`tokentree-<target>.tar.gz` (or `.zip` on Windows) from
+[GitHub Releases](https://github.com/tokentreehq/tokentree/releases), extract
+the `tokentree` binary into the package's `vendor/<target>/` directory
+(e.g. `…/node_modules/@tokentreehq/cli/vendor/x86_64-unknown-linux-gnu/`), or
+set `TOKENTREE_BIN=/path/to/tokentree`. If no binary is found, the launcher
+fails with instructions instead of silently degrading.
 
 ### Prebuilt Binary (GitHub Releases)
 Download the latest release archive from [https://github.com/tokentreehq/tokentree/releases](https://github.com/tokentreehq/tokentree/releases), extract `tokentree`, and move it into your `$PATH` (e.g., `/usr/local/bin` or `%USERPROFILE%\bin`).

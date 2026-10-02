@@ -44,6 +44,7 @@ This directory contains versioned sanitized fixtures derived from actual support
 - `case-c-detailed-equal-counter.jsonl`: Detailed events accompanied by an exact matching covering counter. Counter is suppressed.
 - `case-d-detailed-conflicting-counter.jsonl`: Detailed events accompanied by a conflicting counter. Counter is suppressed and an anomaly is recorded.
 - `case-e-repeated-counters.jsonl`: Identical repeated turn counters. Deduplication ensures single evaluation.
-- `case-f-cumulative-resets.jsonl`: Cumulative stream experiencing counter resets / negative deltas.
+- `case-f-cumulative-resets.jsonl`: Cumulative counters scoped per (session, turn): a counter restarting in a new turn is a fresh stream, not a reset anomaly.
+- `case-h-cumulative-reset-within-turn.jsonl`: Cumulative stream with a genuine counter reset inside one turn; the backward move is recorded as `negative_delta` and re-baselines.
 - `case-g-subagent-covering-counter.jsonl`: Subagent child and parent events covered by a turn summary counter.
 - `case-unknown-version.jsonl`: Schema specifying unsupported protocol version (`v999.0`). Flagged as degraded anomaly.
