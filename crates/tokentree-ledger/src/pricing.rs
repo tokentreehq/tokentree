@@ -34,7 +34,8 @@ pub fn apply_price_snapshot(
     let mut stmt = transaction.prepare(
         "SELECT id, model, coalesce(source_timestamp, observed_at),
                 input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, reasoning_tokens
-         FROM usage_events",
+         FROM usage_events
+         WHERE superseded_by IS NULL",
     )?;
 
     let event_rows = stmt

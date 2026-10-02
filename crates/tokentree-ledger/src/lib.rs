@@ -4,15 +4,16 @@ pub mod export;
 pub mod manual;
 pub mod pricing;
 pub mod prototype;
+pub mod repair;
 pub mod spool;
 pub mod tree;
 
 pub use audit::{LeakageAuditResult, audit_prompt_leakage};
 
 pub use corrections::{
-    add_note, attach_session, detach_session, ensure_session_attribution, merge_work_items,
-    move_work_item, reclassify_work_item, rename_work_item, split_work_item,
-    validate_group_invariant,
+    add_note, attach_session, detach_session, ensure_session_attribution,
+    ensure_session_attribution_for_source, merge_work_items, move_work_item, reclassify_work_item,
+    rename_work_item, split_work_item, validate_group_invariant,
 };
 pub use export::{csv_escape, export_csv, export_html, export_json, html_escape};
 pub use manual::{
@@ -20,6 +21,11 @@ pub use manual::{
 };
 pub use pricing::{PricingSummary, apply_price_snapshot};
 pub use prototype::{PrototypePreview, apply_prototype, preview_prototype};
+pub use repair::{
+    PRE_DELTA_FIX_PARSER_VERSIONS, SNAPSHOT_OVERCOUNT_REPAIR_KIND,
+    SNAPSHOT_OVERCOUNT_REPAIR_VERSION, SnapshotRepairOutcome, SnapshotRepairPlan,
+    apply_snapshot_overcount_repair, plan_snapshot_overcount_repair, restore_snapshot_repair,
+};
 pub use spool::HookWorkerSummary;
 pub use tree::{
     ProjectTree, UsageTotals, WorkTreeNode, format_totals, load_project_trees, query_ledger,
@@ -30,7 +36,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, params};
 use std::fs;
 use std::path::{Path, PathBuf};
-use tokentree_core::{UsageObservation, deduplicate, sha256_hex, source_kind};
+use tokentree_core::{UsageObservation, deduplicate, source_kind};
 
 const INITIAL_SCHEMA: &str = include_str!("../../../packages/database/migrations/0001_initial.sql");
 const SCHEMA_VERSION: i64 = 1;
@@ -46,6 +52,11 @@ pub struct IngestSummary {
     pub duplicates: u64,
     pub unavailable: u64,
     pub conflicts: u64,
+    /// Rows superseded by truth-ladder replacement in this batch: a higher-
+    /// precedence observation arrived for a request already recorded at a
+    /// lower precedence. The old row stays in the ledger (marked via
+    /// `usage_events.superseded_by`) and is excluded from aggregates.
+    pub superseded: u64,
 }
 
 impl Ledger {
@@ -191,6 +202,7 @@ pub fn reconcile(connection: &Connection) -> Result<ReconcileResult> {
             "SELECT count(*) FROM (
             SELECT request_id FROM usage_events
             WHERE request_id IS NOT NULL AND source_kind NOT IN ({})
+              AND superseded_by IS NULL
             GROUP BY request_id HAVING count(*) > 1
         )",
             source_kind::SNAPSHOT_DELTA_SQL_LIST
@@ -207,6 +219,7 @@ pub fn reconcile(connection: &Connection) -> Result<ReconcileResult> {
             "SELECT count(*) FROM (
             SELECT session_id, turn_id FROM usage_events
             WHERE source_kind IN ({lifecycle})
+              AND superseded_by IS NULL
             GROUP BY session_id, turn_id
             HAVING count(*) > 1
             UNION
@@ -216,6 +229,8 @@ pub fn reconcile(connection: &Connection) -> Result<ReconcileResult> {
                 AND ((e1.turn_id IS NOT NULL AND e1.turn_id = e2.turn_id) OR (e1.request_id IS NOT NULL AND e1.request_id = e2.request_id))
             WHERE e1.source_kind IN ({lifecycle})
               AND e2.source_kind NOT IN ({lifecycle}, {deltas})
+              AND e1.superseded_by IS NULL
+              AND e2.superseded_by IS NULL
         )",
             lifecycle = source_kind::LIFECYCLE_COUNTER_SQL_LIST,
             deltas = source_kind::SNAPSHOT_DELTA_SQL_LIST,
@@ -339,12 +354,9 @@ pub fn ingest_observations(
     Ok(summary)
 }
 
-/// Canonical session-ID derivation shared by ingest and the CLI import paths.
-/// Keep in exactly one place so attribution lookups can never drift from ingest.
-#[must_use]
-pub fn session_stable_id(adapter: &str, provider_session_id: &str) -> String {
-    stable_id("ses", &format!("{adapter}:{provider_session_id}"))
-}
+// Canonical session-ID derivation shared by ingest and the CLI import paths.
+// (Defined in tokentree-core; re-exported here for compatibility.)
+pub use tokentree_core::session_stable_id;
 
 /// Ingest observations inside an already-open transaction. Callers that need
 /// to bundle the ingest with further writes atomically (e.g. `stop_manual`)
@@ -399,51 +411,143 @@ pub fn ingest_observations_tx(
         let provider_cost = sql_integer(observation.provider_reported_cost_micros)?;
         let source_offset = i64::try_from(observation.source_offset)
             .context("source offset exceeds SQLite integer range")?;
-        let changed = transaction.execute(
-            "INSERT OR IGNORE INTO usage_events(
-              id,adapter,source_kind,source_event_id,session_id,turn_id,request_id,agent_id,parent_agent_id,source_timestamp,
-              observed_at,ingested_at,model,service_tier,region,input_tokens,cached_input_tokens,
-              cache_write_tokens,output_tokens,reasoning_tokens,provider_reported_cost_micros,
-              source_path,source_offset,event_hash,adapter_version,parser_version
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            params![
-                stable_id("evt", &observation.canonical_identity()),
-                observation.adapter,
-                // Canonical vocabulary choke point: never write raw
-                // provider-internal record types into source_kind.
-                tokentree_core::canonical_source_kind(observation),
-                observation.source_event_id,
-                session_id,
-                turn_db_id,
-                observation.request_id,
-                observation.agent_id,
-                observation.parent_agent_id,
-                observation.source_timestamp,
-                observation.observed_at,
-                observation.observed_at,
-                observation.model,
-                observation.service_tier,
-                observation.region,
-                input_tokens,
-                cached_input_tokens,
-                cache_write_tokens,
-                output_tokens,
-                reasoning_tokens,
-                provider_cost,
-                observation.source_path,
-                source_offset,
-                observation.event_hash(),
-                observation.adapter_version,
-                observation.parser_version,
-            ],
-        )?;
-        if changed == 1 {
-            summary.inserted = summary.inserted.saturating_add(1);
-            if !observation.usage.is_measured() {
-                summary.unavailable = summary.unavailable.saturating_add(1);
-            }
+        // Cross-batch truth-ladder replacement.
+        //
+        // Within one batch, `deduplicate()` already keeps the highest-precedence
+        // observation per identity. Across batches the ledger used to be
+        // first-write-wins: a transcript row ingested in batch 1 would shadow
+        // official telemetry for the same request arriving in batch 2,
+        // contradicting the documented truth ladder. Now, when the incoming
+        // observation's identity matches an ACTIVE row recorded at a LOWER
+        // precedence, the old row is marked superseded and the new row takes
+        // its place — atomically, in this transaction, so a crash can never
+        // leave a half-replaced pair behind.
+        //
+        // The ledger stays append-only: rows are never deleted or rewritten.
+        // The old row keeps every byte of measurement data; only its
+        // `superseded_by` tombstone is set (the one UPDATE the append-only
+        // triggers permit). Aggregates exclude superseded rows, so exactly
+        // one row per measured request is ever counted, and the old+new pair
+        // remains as an audit trail.
+        let identity = observation.canonical_identity();
+        let hash_new = tokentree_core::sha256_hex(identity.as_bytes());
+        // Backward compatibility (identity scheme v1): rows ingested before
+        // the H6 fix carry `sha256({adapter}:request:{request_id})` as their
+        // event hash. Looking both schemes up keeps re-imports duplicate-free
+        // with zero accounting drift. See IDENTITY_SCHEME_VERSION.
+        let hash_old = tokentree_core::sha256_hex(observation.canonical_identity_v1().as_bytes());
+        let rank_new = observation.source.rank();
+
+        // Active rows for this logical request under either identity scheme.
+        // `logical_event_hash` is the base-identity hash of the row that
+        // started the supersede chain; rows written before the column existed
+        // fall back to `event_hash`. Prefer the current-scheme match on ties.
+        let matched: Vec<(String, String)> = transaction
+            .prepare(
+                "SELECT id, source_kind FROM usage_events
+                 WHERE superseded_by IS NULL
+                   AND ((logical_event_hash IN (?1, ?2))
+                     OR (logical_event_hash IS NULL AND event_hash IN (?1, ?2)))
+                 ORDER BY CASE WHEN (logical_event_hash = ?1 OR (logical_event_hash IS NULL AND event_hash = ?1)) THEN 0 ELSE 1 END",
+            )?
+            .query_map(params![hash_new, hash_old], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<_, _>>()?;
+
+        // Insert one event row. Returns 1 when the row was new, 0 on conflict.
+        let insert_event_row = |id: &str, event_hash: &str, logical_hash: &str| -> Result<usize> {
+            transaction
+                    .execute(
+                    "INSERT OR IGNORE INTO usage_events(
+                      id,adapter,source_kind,source_event_id,session_id,turn_id,request_id,agent_id,parent_agent_id,source_timestamp,
+                      observed_at,ingested_at,model,service_tier,region,input_tokens,cached_input_tokens,
+                      cache_write_tokens,output_tokens,reasoning_tokens,provider_reported_cost_micros,
+                      source_path,source_offset,event_hash,adapter_version,parser_version,logical_event_hash
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    params![
+                        id,
+                        observation.adapter,
+                        // Canonical vocabulary choke point: never write raw
+                        // provider-internal record types into source_kind.
+                        tokentree_core::canonical_source_kind(observation),
+                        observation.source_event_id,
+                        session_id,
+                        turn_db_id,
+                        observation.request_id,
+                        observation.agent_id,
+                        observation.parent_agent_id,
+                        observation.source_timestamp,
+                        observation.observed_at,
+                        observation.observed_at,
+                        observation.model,
+                        observation.service_tier,
+                        observation.region,
+                        input_tokens,
+                        cached_input_tokens,
+                        cache_write_tokens,
+                        output_tokens,
+                        reasoning_tokens,
+                        provider_cost,
+                        observation.source_path,
+                        source_offset,
+                        event_hash,
+                        observation.adapter_version,
+                        observation.parser_version,
+                        logical_hash,
+                    ],
+                    )
+                    .map_err(anyhow::Error::from)
+        };
+
+        let mut inserted_rows = 0u64;
+        let mut superseded_rows = 0u64;
+        if matched.is_empty() {
+            // No active row for this logical request: plain insert. (If a
+            // SUPERSEDED row happens to hold this id, OR IGNORE keeps the
+            // active superseding row authoritative and we count a duplicate.)
+            inserted_rows +=
+                insert_event_row(&stable_id("evt", &identity), &hash_new, &hash_new)? as u64;
         } else {
+            for (old_id, old_kind) in &matched {
+                if rank_new > tokentree_core::rank_of_source_kind(old_kind) {
+                    // Deterministic supersede identity: replaying this same
+                    // observation derives the same row id, so replacement is
+                    // idempotent and never double-inserts.
+                    let supersede_identity = format!("{identity}\x00supersedes\x00{old_id}");
+                    let new_id = stable_id("evt", &supersede_identity);
+                    let new_hash = tokentree_core::sha256_hex(supersede_identity.as_bytes());
+                    if insert_event_row(&new_id, &new_hash, &hash_new)? == 1 {
+                        let marked = transaction.execute(
+                            "UPDATE usage_events SET superseded_by = ?1
+                             WHERE id = ?2 AND superseded_by IS NULL",
+                            params![new_id, old_id],
+                        )?;
+                        // `marked == 1` always holds: we selected the row as
+                        // active inside this same transaction, and the
+                        // trigger permits exactly this tombstone transition.
+                        debug_assert_eq!(marked, 1);
+                        if marked == 1 {
+                            inserted_rows += 1;
+                            superseded_rows += 1;
+                        }
+                    }
+                    // If the insert was ignored (id collision with an
+                    // unrelated row, e.g. the pathological (adapter,
+                    // source_kind, source_event_id) unique index), the old
+                    // row stays active: no partial replacement, no crash.
+                }
+            }
+        }
+        summary.inserted = summary.inserted.saturating_add(inserted_rows);
+        summary.superseded = summary.superseded.saturating_add(superseded_rows);
+        if inserted_rows == 0 {
+            // Same-or-lower precedence re-ingest: idempotent dedup, and the
+            // active row keeps its rank. A lower-precedence observation never
+            // displaces a higher-precedence one.
             summary.duplicates = summary.duplicates.saturating_add(1);
+        } else if !observation.usage.is_measured() {
+            summary.unavailable = summary.unavailable.saturating_add(1);
         }
     }
     Ok(summary)
@@ -534,7 +638,7 @@ pub fn aggregate_usage_with_policy(connection: &Connection) -> Result<AggregateU
 
     let is_subagent = "(ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id))";
     let is_covered_turn_counter = format!(
-        "(ue.source_kind IN ({turn_counters}) AND EXISTS (SELECT 1 FROM usage_events d WHERE d.session_id = ue.session_id AND d.turn_id IS NOT NULL AND d.turn_id = ue.turn_id AND d.source_kind NOT IN ({turn_counters}, {lifecycle})))",
+        "(ue.source_kind IN ({turn_counters}) AND EXISTS (SELECT 1 FROM usage_events d WHERE d.session_id = ue.session_id AND d.turn_id IS NOT NULL AND d.turn_id = ue.turn_id AND d.superseded_by IS NULL AND d.source_kind NOT IN ({turn_counters}, {lifecycle})))",
         turn_counters = source_kind::TURN_COUNTER_SQL_LIST,
         lifecycle = source_kind::LIFECYCLE_COUNTER_SQL_LIST,
     );
@@ -550,6 +654,7 @@ pub fn aggregate_usage_with_policy(connection: &Connection) -> Result<AggregateU
                  coalesce(sum(input_tokens),0),coalesce(sum(cached_input_tokens),0),coalesce(sum(cache_write_tokens),0),coalesce(sum(output_tokens),0),coalesce(sum(reasoning_tokens),0)
                  FROM usage_events ue
                  WHERE ue.source_kind NOT IN ({lifecycle})
+                   AND ue.superseded_by IS NULL
                    AND NOT {is_subagent}
                    AND NOT {is_covered_turn_counter}",
                 deltas = source_kind::SNAPSHOT_DELTA_SQL_LIST,
@@ -581,6 +686,7 @@ pub fn aggregate_usage_with_policy(connection: &Connection) -> Result<AggregateU
                  coalesce(sum(input_tokens),0),coalesce(sum(cached_input_tokens),0),coalesce(sum(cache_write_tokens),0),coalesce(sum(output_tokens),0),coalesce(sum(reasoning_tokens),0)
                  FROM usage_events ue
                  WHERE ue.source_kind NOT IN ({lifecycle})
+                   AND ue.superseded_by IS NULL
                    AND NOT {is_covered_turn_counter}",
                 deltas = source_kind::SNAPSHOT_DELTA_SQL_LIST,
                 lifecycle = source_kind::LIFECYCLE_COUNTER_SQL_LIST,
@@ -625,6 +731,7 @@ pub fn aggregate_usage_with_policy(connection: &Connection) -> Result<AggregateU
                  coalesce(sum(CASE WHEN {is_subagent} THEN 0 ELSE reasoning_tokens END), 0)
                  FROM usage_events ue
                  WHERE ue.source_kind NOT IN ({lifecycle})
+                   AND ue.superseded_by IS NULL
                    AND NOT {is_covered_turn_counter}",
                 deltas = source_kind::SNAPSHOT_DELTA_SQL_LIST,
                 lifecycle = source_kind::LIFECYCLE_COUNTER_SQL_LIST,
@@ -674,7 +781,8 @@ fn apply_migrations(connection: &Connection) -> Result<()> {
                 "ALTER TABLE ingestion_checkpoints ADD COLUMN adapter_state_json TEXT",
                 [],
             );
-            normalize_legacy_source_kinds(connection)?;
+            ensure_ledger_evolution(connection)?;
+            migrate_source_kind_vocabulary(connection)?;
             return Ok(());
         }
         bail!("unsupported or incomplete schema version {existing:?}");
@@ -685,8 +793,273 @@ fn apply_migrations(connection: &Connection) -> Result<()> {
         connection.execute(
             "INSERT INTO schema_metadata(schema_version,application_version,migration_state,created_at,updated_at) VALUES(1,'0.2.0','applied',datetime('now'),datetime('now'))", [],
         )?;
+        ensure_ledger_evolution(connection)?;
         connection.execute_batch("COMMIT;")?;
         Ok(())
+    })();
+    if result.is_err() {
+        let _ = connection.execute_batch("ROLLBACK;");
+        return result;
+    }
+    // Runs in its own transaction; on a fresh database this is a no-op that
+    // still records the version row for auditability. It must run outside the
+    // `BEGIN EXCLUSIVE` block above (SQLite forbids nested transactions).
+    migrate_source_kind_vocabulary(connection)?;
+    Ok(())
+}
+
+/// Append-only triggers for `usage_events`, with one narrow carve-out: the
+/// `superseded_by` tombstone may transition NULL -> non-NULL exactly once,
+/// with every other column unchanged. Truth-ladder replacement marks the old
+/// row instead of deleting it, so the audit trail survives while measurement
+/// data itself stays immutable.
+///
+/// This SQL is the single definition used everywhere the triggers are
+/// (re)created: fresh databases, the evolution step, and the vocabulary
+/// migration. The TypeScript side never updates `superseded_by`, so the
+/// carve-out is a no-op for it.
+const USAGE_EVENTS_TRIGGERS_SQL: &str = "
+CREATE TRIGGER usage_events_no_update BEFORE UPDATE ON usage_events
+WHEN NOT (
+  OLD.superseded_by IS NULL
+  AND NEW.superseded_by IS NOT NULL
+  AND NEW.id IS OLD.id
+  AND NEW.adapter IS OLD.adapter
+  AND NEW.source_kind IS OLD.source_kind
+  AND NEW.source_event_id IS OLD.source_event_id
+  AND NEW.source_process_id IS OLD.source_process_id
+  AND NEW.source_sequence IS OLD.source_sequence
+  AND NEW.session_id IS OLD.session_id
+  AND NEW.prompt_id IS OLD.prompt_id
+  AND NEW.turn_id IS OLD.turn_id
+  AND NEW.request_id IS OLD.request_id
+  AND NEW.agent_id IS OLD.agent_id
+  AND NEW.parent_agent_id IS OLD.parent_agent_id
+  AND NEW.parent_event_id IS OLD.parent_event_id
+  AND NEW.source_timestamp IS OLD.source_timestamp
+  AND NEW.observed_at IS OLD.observed_at
+  AND NEW.ingested_at IS OLD.ingested_at
+  AND NEW.model IS OLD.model
+  AND NEW.service_tier IS OLD.service_tier
+  AND NEW.region IS OLD.region
+  AND NEW.input_tokens IS OLD.input_tokens
+  AND NEW.cached_input_tokens IS OLD.cached_input_tokens
+  AND NEW.cache_write_tokens IS OLD.cache_write_tokens
+  AND NEW.output_tokens IS OLD.output_tokens
+  AND NEW.reasoning_tokens IS OLD.reasoning_tokens
+  AND NEW.provider_reported_cost_micros IS OLD.provider_reported_cost_micros
+  AND NEW.source_path IS OLD.source_path
+  AND NEW.source_offset IS OLD.source_offset
+  AND NEW.event_hash IS OLD.event_hash
+  AND NEW.adapter_version IS OLD.adapter_version
+  AND NEW.parser_version IS OLD.parser_version
+  AND NEW.logical_event_hash IS OLD.logical_event_hash
+)
+BEGIN SELECT RAISE(ABORT, 'usage_events are append-only'); END;
+CREATE TRIGGER usage_events_no_delete BEFORE DELETE ON usage_events
+BEGIN SELECT RAISE(ABORT, 'usage_events are append-only'); END;";
+
+/// Idempotent additive evolution of the ledger schema. Deliberately NOT a
+/// `schema_metadata` version bump: the schema is shared with the TypeScript
+/// side at version 1, and both binaries refuse databases whose version they
+/// do not recognize. New columns are nullable (old rows read as NULL, which
+/// the queries treat as "active, base identity"), new tables use
+/// `CREATE TABLE IF NOT EXISTS`, and the trigger replacement is a strict
+/// superset of the old append-only behavior for any writer that never touches
+/// `superseded_by`.
+fn ensure_ledger_evolution(connection: &Connection) -> Result<()> {
+    // `ALTER TABLE ... ADD COLUMN` fails when the column already exists;
+    // that is the expected steady state — ignore it.
+    let _ = connection.execute("ALTER TABLE usage_events ADD COLUMN superseded_by TEXT", []);
+    let _ = connection.execute(
+        "ALTER TABLE usage_events ADD COLUMN logical_event_hash TEXT",
+        [],
+    );
+    connection.execute_batch(
+        "CREATE INDEX IF NOT EXISTS usage_events_superseded ON usage_events(superseded_by);
+         CREATE INDEX IF NOT EXISTS usage_events_logical_hash ON usage_events(logical_event_hash)
+           WHERE logical_event_hash IS NOT NULL;
+         CREATE TABLE IF NOT EXISTS applied_migrations (
+           name TEXT PRIMARY KEY,
+           version INTEGER NOT NULL,
+           applied_at TEXT NOT NULL,
+           rows_affected INTEGER NOT NULL
+         ) STRICT;
+         CREATE TABLE IF NOT EXISTS source_kind_migration_backup (
+           event_id TEXT PRIMARY KEY,
+           old_source_kind TEXT NOT NULL,
+           new_source_kind TEXT NOT NULL,
+           migrated_at TEXT NOT NULL
+         ) STRICT;",
+    )?;
+    replace_usage_events_triggers(connection)?;
+    Ok(())
+}
+
+/// Install [`USAGE_EVENTS_TRIGGERS_SQL`], tolerating concurrent openers.
+///
+/// Two threads/processes opening the same database can interleave their
+/// DROP/CREATE pairs: A drops, B drops, A creates, B's CREATE then fails
+/// with "already exists". Every installer writes the identical definition,
+/// so retrying the whole DROP+CREATE pair converges: each iteration either
+/// installs the triggers cleanly or proves another installer is making
+/// progress toward the same end state.
+fn replace_usage_events_triggers(connection: &Connection) -> Result<()> {
+    for _ in 0..5 {
+        connection.execute_batch(
+            "DROP TRIGGER IF EXISTS usage_events_no_update;
+             DROP TRIGGER IF EXISTS usage_events_no_delete;",
+        )?;
+        match connection.execute_batch(USAGE_EVENTS_TRIGGERS_SQL) {
+            Ok(()) => return Ok(()),
+            Err(e) if format!("{e:?}").contains("already exists") => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    bail!("could not install usage_events triggers: lost repeated races with a concurrent opener");
+}
+
+// (Defined in tokentree-core; re-exported here for compatibility.)
+pub use tokentree_core::stable_id;
+
+/// Explicit allowlist of legacy `source_kind` values and their canonical
+/// replacements. These are the only values the migration rewrites:
+/// - `"provider_usage"`: the old Claude parser wrote the transcript record
+///   type as the kind; this record type meant ProviderFields.
+/// - `"assistant"`, `"user"`, `"summary"`: raw Claude transcript record types
+///   that the old parser wrote as the kind; every such row was a
+///   TranscriptRequest observation.
+/// - `"claude_transcript"`: the old direct-write default kind.
+///
+/// Any value NOT on this list is left untouched and logged as a
+/// `measurement_anomalies` row (`unmapped_source_kind`) for operator review.
+/// This is deliberately conservative: the previous blanket rewrite mapped
+/// *every* unrecognized value to `transcript_request`, which could silently
+/// mislabel future vocabulary.
+const SOURCE_KIND_ALLOWLIST: &[(&str, &str)] = &[
+    (
+        "provider_usage",
+        tokentree_core::source_kind::PROVIDER_FIELDS,
+    ),
+    ("assistant", tokentree_core::source_kind::TRANSCRIPT_REQUEST),
+    ("user", tokentree_core::source_kind::TRANSCRIPT_REQUEST),
+    ("summary", tokentree_core::source_kind::TRANSCRIPT_REQUEST),
+    (
+        "claude_transcript",
+        tokentree_core::source_kind::TRANSCRIPT_REQUEST,
+    ),
+];
+
+const SOURCE_KIND_MIGRATION_NAME: &str = "normalize_source_kind_vocabulary";
+const SOURCE_KIND_MIGRATION_VERSION: i64 = 1;
+
+/// Allowlisted, backup-protected, versioned `source_kind` vocabulary migration.
+///
+/// - **Allowlisted**: only the values in [`SOURCE_KIND_ALLOWLIST`] are
+///   rewritten; anything else is left in place and logged as an anomaly.
+/// - **Backup-protected**: every rewritten row is copied to
+///   `source_kind_migration_backup` (event id, old kind, new kind) before the
+///   UPDATE, so [`restore_source_kind_backup`] can reverse the migration.
+/// - **Versioned**: the run is recorded in `applied_migrations`; a second run
+///   is a no-op returning 0.
+///
+/// The whole migration (backup, rewrite, anomaly logging, version record)
+/// runs in a single transaction: a failure leaves the database exactly as it
+/// was. Returns the number of rows rewritten.
+pub fn migrate_source_kind_vocabulary(connection: &Connection) -> Result<u64> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS applied_migrations (
+           name TEXT PRIMARY KEY,
+           version INTEGER NOT NULL,
+           applied_at TEXT NOT NULL,
+           rows_affected INTEGER NOT NULL
+         ) STRICT;
+         CREATE TABLE IF NOT EXISTS source_kind_migration_backup (
+           event_id TEXT PRIMARY KEY,
+           old_source_kind TEXT NOT NULL,
+           new_source_kind TEXT NOT NULL,
+           migrated_at TEXT NOT NULL
+         ) STRICT;",
+    )?;
+    let already: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM applied_migrations WHERE name = ?1 AND version = ?2)",
+        params![SOURCE_KIND_MIGRATION_NAME, SOURCE_KIND_MIGRATION_VERSION],
+        |row| row.get(0),
+    )?;
+    if already {
+        return Ok(0);
+    }
+
+    connection.execute_batch("BEGIN IMMEDIATE;")?;
+    let result = (|| -> Result<u64> {
+        // The append-only triggers block UPDATE of source_kind, so drop them
+        // for the duration of this transaction; they are reinstalled (carve-out
+        // version) before COMMIT. The DROP itself is concurrency-safe
+        // (IF EXISTS); the reinstall below goes through the race-tolerant
+        // helper.
+        connection.execute_batch(
+            "DROP TRIGGER IF EXISTS usage_events_no_update;
+             DROP TRIGGER IF EXISTS usage_events_no_delete;",
+        )?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut rows_affected = 0u64;
+        for (legacy, canonical) in SOURCE_KIND_ALLOWLIST {
+            // Backup BEFORE the rewrite: one row per affected event.
+            let backed_up = connection.execute(
+                "INSERT INTO source_kind_migration_backup(event_id, old_source_kind, new_source_kind, migrated_at)
+                 SELECT id, source_kind, ?1, ?2 FROM usage_events WHERE source_kind = ?3",
+                params![canonical, now, legacy],
+            )?;
+            let updated = connection.execute(
+                "UPDATE usage_events SET source_kind = ?1 WHERE source_kind = ?2",
+                params![canonical, legacy],
+            )?;
+            debug_assert_eq!(backed_up, updated);
+            rows_affected += updated as u64;
+        }
+        // Values outside both the canonical vocabulary and the allowlist are
+        // NOT rewritten; log them for operator review instead.
+        let mut stmt = connection.prepare("SELECT DISTINCT source_kind FROM usage_events")?;
+        let kinds: Vec<String> = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        drop(stmt);
+        for kind in kinds {
+            if tokentree_core::source_kind::is_recognized(&kind) {
+                continue;
+            }
+            if SOURCE_KIND_ALLOWLIST
+                .iter()
+                .any(|(legacy, _)| *legacy == kind)
+            {
+                continue;
+            }
+            let detail = serde_json::json!({
+                "source_kind": kind,
+                "migration": SOURCE_KIND_MIGRATION_NAME,
+            })
+            .to_string();
+            connection.execute(
+                "INSERT OR IGNORE INTO measurement_anomalies(id, type, source_values_json, created_at)
+                 VALUES(?1, 'unmapped_source_kind', ?2, datetime('now'))",
+                params![
+                    stable_id("anom", &format!("unmapped_source_kind:{kind}")),
+                    detail
+                ],
+            )?;
+        }
+        replace_usage_events_triggers(connection)?;
+        connection.execute(
+            "INSERT INTO applied_migrations(name, version, applied_at, rows_affected)
+             VALUES(?1, ?2, datetime('now'), ?3)",
+            params![
+                SOURCE_KIND_MIGRATION_NAME,
+                SOURCE_KIND_MIGRATION_VERSION,
+                rows_affected as i64
+            ],
+        )?;
+        connection.execute_batch("COMMIT;")?;
+        Ok(rows_affected)
     })();
     if result.is_err() {
         let _ = connection.execute_batch("ROLLBACK;");
@@ -694,73 +1067,29 @@ fn apply_migrations(connection: &Connection) -> Result<()> {
     result
 }
 
-#[must_use]
-pub fn stable_id(prefix: &str, value: &str) -> String {
-    format!("{prefix}_{}", &sha256_hex(value.as_bytes())[..24])
-}
-
-/// Normalize pre-vocabulary `source_kind` values left by older Rust parsers.
-///
-/// MIGRATION CHOICE (deliberate): this is a lightweight, idempotent *data*
-/// migration run at open time, NOT a schema version bump. The schema is shared
-/// with the TypeScript side at version 1, and both binaries refuse to open a
-/// database whose `schema_metadata` version they do not recognize — bumping to
-/// 2 here would brick the DB for the other binary until it also bumps. The
-/// UPDATE below only touches rows whose value is outside the canonical
-/// vocabulary, so re-running it on an already-clean database is a no-op.
-///
-/// The `usage_events` append-only triggers are dropped and recreated inside
-/// the same transaction around the fix. This is a one-time vocabulary
-/// migration (mapping each legacy value to its true canonical meaning), not
-/// a measurement rewrite: no token counts, timestamps, or identities change.
-///
-/// Legacy values and their mapping:
-/// * `"provider_usage"` (old Claude parser subtype) -> `"provider_fields"`.
-/// * Raw Claude transcript record types (`"assistant"`, `"user"`, `"summary"`,
-///   ...) and the old direct-write default `"claude_transcript"` ->
-///   `"transcript_request"` (every one of those rows was a TranscriptRequest
-///   record; the special `provider_usage` record type is handled explicitly).
-fn normalize_legacy_source_kinds(connection: &Connection) -> Result<()> {
-    let mut stmt = connection.prepare("SELECT DISTINCT source_kind FROM usage_events")?;
-    let kinds: Vec<String> = stmt
-        .query_map([], |row| row.get(0))?
-        .collect::<Result<_, _>>()?;
-    drop(stmt);
-    let legacy: Vec<(String, &'static str)> = kinds
-        .into_iter()
-        .filter(|kind| !source_kind::is_recognized(kind))
-        .map(|kind| {
-            let canonical = if kind == "provider_usage" {
-                source_kind::PROVIDER_FIELDS
-            } else {
-                source_kind::TRANSCRIPT_REQUEST
-            };
-            (kind, canonical)
-        })
-        .collect();
-    if legacy.is_empty() {
-        return Ok(());
-    }
+/// Reverse [`migrate_source_kind_vocabulary`] using the backup table.
+/// Restores every backed-up row's original `source_kind` in a single
+/// transaction and returns the number of rows restored. The backup table is
+/// kept so the restore itself remains auditable (and repeatable).
+pub fn restore_source_kind_backup(connection: &Connection) -> Result<u64> {
     connection.execute_batch("BEGIN IMMEDIATE;")?;
-    let result = (|| -> Result<()> {
+    let result = (|| -> Result<u64> {
+        // Drop (not replace): the UPDATE below rewrites source_kind, which
+        // even the carve-out trigger forbids. Triggers are reinstalled after.
         connection.execute_batch(
-            "DROP TRIGGER usage_events_no_update;
-             DROP TRIGGER usage_events_no_delete;",
+            "DROP TRIGGER IF EXISTS usage_events_no_update;
+             DROP TRIGGER IF EXISTS usage_events_no_delete;",
         )?;
-        for (kind, canonical) in &legacy {
-            connection.execute(
-                "UPDATE usage_events SET source_kind = ?1 WHERE source_kind = ?2",
-                params![canonical, kind],
-            )?;
-        }
-        connection.execute_batch(
-            "CREATE TRIGGER usage_events_no_update BEFORE UPDATE ON usage_events
-             BEGIN SELECT RAISE(ABORT, 'usage_events are append-only'); END;
-             CREATE TRIGGER usage_events_no_delete BEFORE DELETE ON usage_events
-             BEGIN SELECT RAISE(ABORT, 'usage_events are append-only'); END;",
+        let restored = connection.execute(
+            "UPDATE usage_events
+             SET source_kind = (SELECT old_source_kind FROM source_kind_migration_backup b
+                                WHERE b.event_id = usage_events.id)
+             WHERE id IN (SELECT event_id FROM source_kind_migration_backup)",
+            [],
         )?;
+        replace_usage_events_triggers(connection)?;
         connection.execute_batch("COMMIT;")?;
-        Ok(())
+        Ok(restored as u64)
     })();
     if result.is_err() {
         let _ = connection.execute_batch("ROLLBACK;");
