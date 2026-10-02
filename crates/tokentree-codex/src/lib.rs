@@ -9,7 +9,10 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use tokentree_core::{MeasurementSource, TokenUsage, UsageObservation, deduplicate};
+use tokentree_core::{
+    MeasurementSource, TokenUsage, UsageObservation, canonical_source_kind, deduplicate,
+    source_kind,
+};
 use walkdir::WalkDir;
 
 pub const ADAPTER_VERSION: &str = "0.2.0-rust";
@@ -114,10 +117,12 @@ pub fn parse_reader<R: BufRead>(
     let mut cumulative_counters: HashMap<String, TokenUsage> = initial_state.cumulative_counters;
     let mut turn_detailed_tokens: HashMap<String, TokenUsage> = initial_state.turn_detailed_tokens;
 
-    let mut line_buf = String::new();
+    // Read raw bytes per line so one invalid-UTF-8 line can be skipped with
+    // exact offset accounting instead of abandoning the rest of the file.
+    let mut raw_buf = Vec::new();
     loop {
-        line_buf.clear();
-        let bytes_read = match reader.read_line(&mut line_buf) {
+        raw_buf.clear();
+        let bytes_read = match reader.read_until(b'\n', &mut raw_buf) {
             Ok(n) => n,
             Err(_) => {
                 stats.malformed += 1;
@@ -128,7 +133,7 @@ pub fn parse_reader<R: BufRead>(
                     turn_id: active_turn_id.clone(),
                     source_path: path.display().to_string(),
                     source_offset: offset,
-                    details: serde_json::json!({ "error": "invalid utf-8 line" }),
+                    details: serde_json::json!({ "error": "io error reading line" }),
                 });
                 break;
             }
@@ -140,6 +145,23 @@ pub fn parse_reader<R: BufRead>(
 
         let line_offset = offset;
         offset += bytes_read as u64;
+
+        let line_buf = match String::from_utf8(std::mem::take(&mut raw_buf)) {
+            Ok(line) => line,
+            Err(_) => {
+                stats.malformed += 1;
+                stats.anomalies += 1;
+                anomalies.push(CodexAnomaly {
+                    anomaly_type: "malformed_record".to_string(),
+                    session_id: active_session_id.clone(),
+                    turn_id: active_turn_id.clone(),
+                    source_path: path.display().to_string(),
+                    source_offset: line_offset,
+                    details: serde_json::json!({ "error": "invalid utf-8 line" }),
+                });
+                continue;
+            }
+        };
 
         let trimmed = line_buf.trim();
         if trimmed.is_empty() {
@@ -227,16 +249,15 @@ pub fn parse_reader<R: BufRead>(
         }
 
         if is_hook_boundary_end(&record_type) {
-            if record_type == "turn/completed"
-                || record_type == "turn_complete"
-                || record_type == "turn/end"
-            {
-                active_turn_id = None;
-            } else if record_type == "session/completed" {
+            if record_type == "session/completed" {
                 active_session_id = None;
                 active_turn_id = None;
                 active_agent_id = None;
                 active_parent_agent_id = None;
+            } else {
+                // Any turn-end boundary clears the active turn so later events
+                // are not misattributed to a dead turn.
+                active_turn_id = None;
             }
         }
 
@@ -367,8 +388,12 @@ pub fn parse_reader<R: BufRead>(
                 .map(str::to_owned)
         });
 
+        // Cumulative counters are keyed per (session, turn, model, agent) stream so
+        // counters from different streams can never contaminate each other.
         let stream_key = format!(
-            "{}:{}",
+            "{}:{}:{}:{}",
+            session_id,
+            turn_id.as_deref().unwrap_or_default(),
             string(&record, &["model"]).unwrap_or_default(),
             agent_id.as_deref().unwrap_or("root")
         );
@@ -455,20 +480,20 @@ pub fn parse_reader<R: BufRead>(
                 || record_type == "turn_summary"
                 || record.get("turn_counter").is_some()
             {
-                "codex_turn_counter".to_string()
+                source_kind::CODEX_TURN_COUNTER.to_string()
             } else if record_type == "thread/tokenUsage/updated"
                 || record_type == "turn/tokenUsage/updated"
                 || record_type == "token_usage"
             {
-                "codex_app_server".to_string()
+                source_kind::CODEX_APP_SERVER.to_string()
             } else {
-                "codex_rollout".to_string()
+                source_kind::CODEX_ROLLOUT.to_string()
             }
         });
 
-        let source = if source_kind == "codex_turn_counter" {
+        let source = if source_kind == source_kind::CODEX_TURN_COUNTER {
             MeasurementSource::SnapshotDelta
-        } else if source_kind == "codex_app_server" {
+        } else if source_kind == source_kind::CODEX_APP_SERVER {
             MeasurementSource::OfficialTelemetry
         } else {
             MeasurementSource::TranscriptRequest
@@ -520,7 +545,7 @@ pub fn parse_reader<R: BufRead>(
     for obs in raw_observations {
         if let Some(turn) = &obs.turn_id {
             let key = (obs.provider_session_id.clone(), turn.clone());
-            if obs.source_subtype.as_deref() == Some("codex_turn_counter") {
+            if obs.source_subtype.as_deref() == Some(source_kind::CODEX_TURN_COUNTER) {
                 turn_counter_map.entry(key).or_default().push(obs);
             } else {
                 turn_detailed_map.entry(key).or_default().push(obs);
@@ -785,37 +810,45 @@ pub fn import_codex_file(connection: &mut Connection, path: &Path) -> Result<Cod
         });
     }
 
-    // Read only complete lines up to the last '\n'
-    file.seek(SeekFrom::Start(start_offset))?;
-    let remaining_bytes = (current_size - start_offset) as usize;
-    let mut read_buf = vec![0_u8; remaining_bytes];
-    file.read_exact(&mut read_buf)?;
-
-    // Find the last newline position
-    let valid_len = match read_buf.iter().rposition(|&b| b == b'\n') {
-        Some(pos) => pos + 1,
-        None => {
-            // Partial final line without newline: do not commit, wait for completion
-            return Ok(CodexImportResult {
-                inserted: 0,
-                duplicates: 0,
-                malformed: 0,
-                unsupported: 0,
-                anomalies: 0,
-                anomaly_types: Vec::new(),
-                latest_event_identity: None,
-                latest_authoritative_timestamp: None,
-                start_offset,
-                end_offset: start_offset,
-            });
+    // Find the offset just past the last '\n' in [start_offset, current_size),
+    // scanning backwards in bounded chunks so the unread tail is never
+    // loaded into memory at once. Only complete lines are parsed; a partial
+    // final line is left for the next import.
+    const SCAN_CHUNK: u64 = 64 * 1024;
+    let mut valid_end: Option<u64> = None;
+    let mut scan_pos = current_size;
+    let mut chunk = vec![0_u8; SCAN_CHUNK as usize];
+    while scan_pos > start_offset && valid_end.is_none() {
+        let chunk_start = scan_pos.saturating_sub(SCAN_CHUNK).max(start_offset);
+        let chunk_len = (scan_pos - chunk_start) as usize;
+        file.seek(SeekFrom::Start(chunk_start))?;
+        file.read_exact(&mut chunk[..chunk_len])?;
+        if let Some(pos) = chunk[..chunk_len].iter().rposition(|&b| b == b'\n') {
+            valid_end = Some(chunk_start + pos as u64 + 1);
         }
+        scan_pos = chunk_start;
+    }
+
+    let Some(end_offset) = valid_end else {
+        // Partial final line without newline: do not commit, wait for completion
+        return Ok(CodexImportResult {
+            inserted: 0,
+            duplicates: 0,
+            malformed: 0,
+            unsupported: 0,
+            anomalies: 0,
+            anomaly_types: Vec::new(),
+            latest_event_identity: None,
+            latest_authoritative_timestamp: None,
+            start_offset,
+            end_offset: start_offset,
+        });
     };
+    let valid_len = end_offset - start_offset;
 
-    let slice_to_parse = &read_buf[..valid_len];
-    let end_offset = start_offset + valid_len as u64;
-
+    file.seek(SeekFrom::Start(start_offset))?;
     let parse_res = parse_reader(
-        BufReader::new(slice_to_parse),
+        BufReader::new(file.by_ref().take(valid_len)),
         path,
         start_offset,
         initial_state,
@@ -872,7 +905,7 @@ pub fn import_codex_file(connection: &mut Connection, path: &Path) -> Result<Cod
             params![
                 format!("evt_{}", &evt_hash[..16]),
                 obs.adapter,
-                obs.source_subtype.as_deref().unwrap_or(obs.source.as_str()),
+                canonical_source_kind(obs),
                 obs.source_event_id,
                 session_id,
                 turn_db_id,
@@ -1050,7 +1083,12 @@ fn is_hook_boundary_start(record_type: &str) -> bool {
 fn is_hook_boundary_end(record_type: &str) -> bool {
     matches!(
         record_type,
-        "turn/completed" | "turn_complete" | "turn/end" | "session/completed"
+        "turn/completed"
+            | "turn_complete"
+            | "turn/complete"
+            | "turn_end"
+            | "turn/end"
+            | "session/completed"
     )
 }
 

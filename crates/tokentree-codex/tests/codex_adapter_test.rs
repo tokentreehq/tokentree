@@ -160,3 +160,107 @@ fn test_codex_discover_sessions() {
         "must find jsonl files in codex directory"
     );
 }
+
+#[test]
+fn test_turn_end_variants_clear_active_turn() {
+    // C1: "turn/complete" (via method/event key) and "turn_end" (via type key)
+    // are real Codex record names (see fixtures README) and must clear the
+    // active turn so later events are not misattributed to a dead turn.
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("turn_variants.jsonl");
+    let content = concat!(
+        "{\"type\":\"turn/started\",\"turn_id\":\"t1\",\"session_id\":\"s1\"}\n",
+        "{\"method\":\"thread/tokenUsage/updated\",\"params\":{\"threadId\":\"s1\",\"turnId\":\"t1\",\"tokenUsage\":{\"inputTokens\":10,\"outputTokens\":5}}}\n",
+        "{\"method\":\"turn/complete\",\"params\":{\"threadId\":\"s1\",\"turnId\":\"t1\"}}\n",
+        "{\"type\":\"turn/started\",\"turn_id\":\"t2\",\"session_id\":\"s1\"}\n",
+        "{\"type\":\"turn_end\",\"turn_id\":\"t2\",\"session_id\":\"s1\"}\n",
+        // No turn_id and no live turn: must NOT inherit t1 or t2.
+        "{\"type\":\"thread/tokenUsage/updated\",\"session_id\":\"s1\",\"token_usage\":{\"input_tokens\":7,\"output_tokens\":3}}\n",
+    );
+    std::fs::write(&path, content).unwrap();
+
+    let result = parse_session(&path).expect("parse must succeed");
+    let orphan = result
+        .observations
+        .iter()
+        .find(|o| o.usage.input_tokens == Some(7))
+        .expect("orphan event must parse");
+    assert_eq!(
+        orphan.turn_id, None,
+        "events after turn/complete and turn_end must not inherit the dead turn"
+    );
+    assert_eq!(result.stats.malformed, 0);
+}
+
+#[test]
+fn test_cumulative_counters_are_scoped_to_session_and_turn() {
+    // H5: counters keyed by {model}:{agent} alone let one session's cumulative
+    // state contaminate another's. Keys must include session and turn.
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("scoped_counters.jsonl");
+    let content = concat!(
+        "{\"type\":\"thread/tokenUsage/updated\",\"is_cumulative\":true,\"request_id\":\"a1\",\"session_id\":\"sA\",\"turn_id\":\"tA\",\"model\":\"o3-mini\",\"cumulative_token_usage\":{\"input_tokens\":100,\"output_tokens\":40}}\n",
+        "{\"type\":\"thread/tokenUsage/updated\",\"is_cumulative\":true,\"request_id\":\"b1\",\"session_id\":\"sB\",\"turn_id\":\"tB\",\"model\":\"o3-mini\",\"cumulative_token_usage\":{\"input_tokens\":100,\"output_tokens\":40}}\n",
+        "{\"type\":\"thread/tokenUsage/updated\",\"is_cumulative\":true,\"request_id\":\"a2\",\"session_id\":\"sA\",\"turn_id\":\"tA\",\"model\":\"o3-mini\",\"cumulative_token_usage\":{\"input_tokens\":150,\"output_tokens\":60}}\n",
+    );
+    std::fs::write(&path, content).unwrap();
+
+    let result = parse_session(&path).expect("parse must succeed");
+    let usage_of = |id: &str| {
+        result
+            .observations
+            .iter()
+            .find(|o| o.request_id.as_deref() == Some(id))
+            .unwrap_or_else(|| panic!("{id} must parse"))
+            .usage
+            .clone()
+    };
+    // First-seen cumulative per stream is the baseline (emitted as-is).
+    assert_eq!(usage_of("a1").input_tokens, Some(100));
+    // sB must NOT diff against sA's counter: with the old key this was Some(0).
+    assert_eq!(usage_of("b1").input_tokens, Some(100));
+    assert_eq!(usage_of("b1").output_tokens, Some(40));
+    // sA's second counter diffs only against sA's baseline.
+    assert_eq!(usage_of("a2").input_tokens, Some(50));
+    assert_eq!(usage_of("a2").output_tokens, Some(20));
+}
+
+#[test]
+fn test_invalid_utf8_line_is_skipped_without_dropping_rest_of_file() {
+    // H7: one bad line must not permanently skip the remainder of the file.
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("bad_utf8.jsonl");
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"{\"type\":\"thread/tokenUsage/updated\",\"request_id\":\"u1\",\"session_id\":\"s1\",\"token_usage\":{\"input_tokens\":10,\"output_tokens\":5}}\n");
+    bytes.extend_from_slice(
+        b"{\"type\":\"thread/tokenUsage/updated\",\"request_id\":\"bad\",\"broken\":\xff\xfe}\n",
+    );
+    bytes.extend_from_slice(b"{\"type\":\"thread/tokenUsage/updated\",\"request_id\":\"u2\",\"session_id\":\"s1\",\"token_usage\":{\"input_tokens\":20,\"output_tokens\":8}}\n");
+    std::fs::write(&path, &bytes).unwrap();
+
+    let result = parse_session(&path).expect("parse must succeed");
+    assert_eq!(result.stats.malformed, 1, "bad line must be counted once");
+    assert!(
+        result
+            .observations
+            .iter()
+            .any(|o| o.request_id.as_deref() == Some("u1")),
+        "line before the bad line must parse"
+    );
+    let after = result
+        .observations
+        .iter()
+        .find(|o| o.request_id.as_deref() == Some("u2"))
+        .expect("line after the bad line must still parse");
+    assert_eq!(after.usage.input_tokens, Some(20));
+    // Offset tracking must account for the skipped bad line exactly.
+    let bad_line_len =
+        b"{\"type\":\"thread/tokenUsage/updated\",\"request_id\":\"bad\",\"broken\":\xff\xfe}\n"
+            .len() as u64;
+    let first_line_len = b"{\"type\":\"thread/tokenUsage/updated\",\"request_id\":\"u1\",\"session_id\":\"s1\",\"token_usage\":{\"input_tokens\":10,\"output_tokens\":5}}\n".len() as u64;
+    assert_eq!(after.source_offset, first_line_len + bad_line_len);
+    assert!(
+        result.final_state.active_session_id.as_deref() == Some("s1"),
+        "parser state must survive the bad line"
+    );
+}
