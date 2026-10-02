@@ -13,7 +13,7 @@ use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use tokentree_claude::{discover_sessions, parse_session};
-use tokentree_core::{PriceSnapshot, token_completeness};
+use tokentree_core::{MeasurementSource, PriceSnapshot, token_completeness};
 use tokentree_ledger::{
     Ledger, ManualCounts, ManualStartInput, add_note, apply_prototype, attach_session,
     detach_session, ensure_session_attribution, ensure_session_attribution_for_source, export_csv,
@@ -54,6 +54,16 @@ enum RepairAction {
         /// restores the most recent run.
         #[arg(long, value_name = "RUN_ID")]
         restore: Option<Option<String>>,
+    },
+    /// Reverse the source_kind vocabulary migration using its backup table.
+    /// Backs up nothing further; the migration backup is kept auditable.
+    RestoreSourceKindBackup {
+        /// Preview how many rows would be restored without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Required to actually modify the ledger (ignored with --dry-run).
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -169,6 +179,12 @@ enum Command {
         source: String,
         #[arg(long)]
         target: String,
+        /// Preview what would change without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Required to actually modify the ledger (ignored with --dry-run).
+        #[arg(long)]
+        yes: bool,
     },
     Split {
         #[arg(long)]
@@ -177,6 +193,12 @@ enum Command {
         title: String,
         #[arg(long, value_delimiter = ',')]
         spans: Vec<String>,
+        /// Preview what would change without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Required to actually modify the ledger (ignored with --dry-run).
+        #[arg(long)]
+        yes: bool,
     },
     Classify,
     Reconcile,
@@ -330,12 +352,19 @@ fn run() -> Result<()> {
         Command::Note { text, task } => note(&home, &text, task.as_deref()),
         Command::Rename { task, title } => rename(&home, &task, &title),
         Command::Move { task, parent } => move_item(&home, &task, parent.as_deref()),
-        Command::Merge { source, target } => merge(&home, &source, &target),
+        Command::Merge {
+            source,
+            target,
+            dry_run,
+            yes,
+        } => merge(&home, &source, &target, dry_run, yes),
         Command::Split {
             source,
             title,
             spans,
-        } => split(&home, &source, &title, &spans),
+            dry_run,
+            yes,
+        } => split(&home, &source, &title, &spans, dry_run, yes),
         Command::Classify => classify(&home),
         Command::Reconcile => reconcile_cmd(&home),
         Command::MigratePrototype {
@@ -349,6 +378,9 @@ fn run() -> Result<()> {
                 yes,
                 restore,
             } => repair_snapshot_overcount(&home, dry_run, yes, restore),
+            RepairAction::RestoreSourceKindBackup { dry_run, yes } => {
+                repair_restore_source_kind_backup(&home, dry_run, yes)
+            }
         },
         Command::OtlpServe { address } => {
             // H2: the loopback receiver requires a per-run bearer secret so a
@@ -530,6 +562,41 @@ fn import_claude(home: &Path, root: PathBuf) -> Result<()> {
             .iter()
             .map(|obs| (obs.adapter.clone(), obs.provider_session_id.clone()))
             .collect();
+        // Snapshot generation-mix warning: if the ledger already holds
+        // snapshot_delta rows for a session written by a different parser
+        // generation than this import, the old cumulative rows and the new
+        // delta rows cannot dedup — totals silently double-count. Warn
+        // loudly; do NOT block the import.
+        {
+            let mut snap_sessions: HashSet<String> = HashSet::new();
+            let mut incoming_version: Option<&str> = None;
+            for obs in parsed
+                .observations
+                .iter()
+                .filter(|o| o.source == MeasurementSource::SnapshotDelta)
+            {
+                snap_sessions.insert(session_stable_id(&obs.adapter, &obs.provider_session_id));
+                incoming_version = Some(obs.parser_version.as_str());
+            }
+            if let Some(version) = incoming_version {
+                let ids: Vec<String> = snap_sessions.into_iter().collect();
+                let conflicts = tokentree_ledger::snapshot_generation_conflicts(
+                    ledger.connection(),
+                    &ids,
+                    version,
+                )?;
+                for session_id in conflicts {
+                    eprintln!(
+                        "WARNING: session {session_id} already has snapshot_delta rows \
+                         from a different parser generation (importing: {version}). \
+                         Old cumulative rows and new delta rows cannot dedup by identity, \
+                         so re-importing will double-count this session. \
+                         Run `tokentree repair snapshot-overcount --dry-run` to inspect \
+                         instead of re-importing the file."
+                    );
+                }
+            }
+        }
         let summary = ledger.ingest(parsed.observations)?;
         inserted += summary.inserted;
         duplicates += summary.duplicates;
@@ -804,7 +871,29 @@ fn move_item(home: &Path, task: &str, parent: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn merge(home: &Path, source: &str, target: &str) -> Result<()> {
+fn merge(home: &Path, source: &str, target: &str, dry_run: bool, yes: bool) -> Result<()> {
+    use tokentree_ledger::plan_merge_work_items;
+    if dry_run {
+        let ledger = ledger(home)?;
+        let plan = plan_merge_work_items(ledger.connection(), source, target)?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "dry_run": true,
+                "source": plan.source_id,
+                "target": plan.target_id,
+                "attribution_groups": plan.attribution_groups,
+                "child_work_items": plan.child_work_items,
+                "notes": plan.notes,
+            }))?
+        );
+        return Ok(());
+    }
+    if !yes {
+        bail!(
+            "refusing to modify the ledger without --yes; use --dry-run to preview the merge first"
+        );
+    }
     let mut ledger = ledger(home)?;
     let reattributed = merge_work_items(ledger.connection_mut(), source, target)?;
     println!(
@@ -816,7 +905,34 @@ fn merge(home: &Path, source: &str, target: &str) -> Result<()> {
     Ok(())
 }
 
-fn split(home: &Path, source: &str, title: &str, spans: &[String]) -> Result<()> {
+fn split(
+    home: &Path,
+    source: &str,
+    title: &str,
+    spans: &[String],
+    dry_run: bool,
+    yes: bool,
+) -> Result<()> {
+    use tokentree_ledger::plan_split_work_item;
+    if dry_run {
+        let ledger = ledger(home)?;
+        let plan = plan_split_work_item(ledger.connection(), source, title, spans)?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "dry_run": true,
+                "source": plan.source_id,
+                "new_title": plan.new_title,
+                "spans": plan.spans,
+            }))?
+        );
+        return Ok(());
+    }
+    if !yes {
+        bail!(
+            "refusing to modify the ledger without --yes; use --dry-run to preview the split first"
+        );
+    }
     let mut ledger = ledger(home)?;
     let new_id = split_work_item(ledger.connection_mut(), source, title, spans)?;
     println!(
@@ -918,6 +1034,51 @@ fn repair_snapshot_overcount(
             }))?
         );
     }
+    Ok(())
+}
+
+fn repair_restore_source_kind_backup(home: &Path, dry_run: bool, yes: bool) -> Result<()> {
+    use tokentree_ledger::{count_source_kind_backup_rows, restore_source_kind_backup};
+    if dry_run {
+        let ledger = ledger(home)?;
+        let rows = count_source_kind_backup_rows(ledger.connection())?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "dry_run": true,
+                "rows": rows,
+            }))?
+        );
+        return Ok(());
+    }
+    if !yes {
+        bail!(
+            "refusing to modify the ledger without --yes; use --dry-run to preview the restore first"
+        );
+    }
+    let backed_up = {
+        let ledger = ledger(home)?;
+        count_source_kind_backup_rows(ledger.connection())?
+    };
+    if backed_up == 0 {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "restored": false,
+                "reason": "no source_kind migration backup found; nothing to do",
+            }))?
+        );
+        return Ok(());
+    }
+    let mut ledger = ledger(home)?;
+    let restored = restore_source_kind_backup(ledger.connection_mut())?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "restored": true,
+            "rows_restored": restored,
+        }))?
+    );
     Ok(())
 }
 
