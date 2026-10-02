@@ -311,8 +311,9 @@ jobs:
           set -euo pipefail
           cd npm-stage
           tarball=$(npm pack --silent)
-          tar -tf "$tarball" | grep -q 'package/dist/main.js'
-          tar -tf "$tarball" | grep -q 'package/vendor/x86_64-unknown-linux-gnu/tokentree'
+          tar -tf "$tarball" > tarball-contents.txt
+          grep -q 'package/dist/main.js' tarball-contents.txt
+          grep -q 'package/vendor/x86_64-unknown-linux-gnu/tokentree' tarball-contents.txt
           prefix="$RUNNER_TEMP/tokentree-npm-smoke"
           npm install --global --prefix "$prefix" "./$tarball"
           TOKENTREE_HOME="$RUNNER_TEMP/tokentree-npm-home" "$prefix/bin/tokentree" --version
