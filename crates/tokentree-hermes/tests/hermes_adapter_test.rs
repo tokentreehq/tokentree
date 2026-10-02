@@ -893,6 +893,285 @@ fn test_hermes_restart_preserves_row_checkpoints_and_reconciliation() {
     }
 }
 
+#[test]
+fn test_hermes_epoch_reset_to_zero_then_growth() {
+    let dir = tempdir().unwrap();
+    let state_db_path = dir.path().join("hermes_reset_zero.db");
+
+    {
+        let conn = rusqlite::Connection::open(&state_db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT);
+             CREATE TABLE session_model_usage (
+                 session_id TEXT NOT NULL, model TEXT NOT NULL, billing_provider TEXT DEFAULT '',
+                 task TEXT DEFAULT '', api_call_count INTEGER DEFAULT 1, input_tokens INTEGER DEFAULT 0,
+                 output_tokens INTEGER DEFAULT 0, cache_read_tokens INTEGER DEFAULT 0,
+                 cache_write_tokens INTEGER DEFAULT 0, reasoning_tokens INTEGER DEFAULT 0,
+                 estimated_cost_usd REAL, actual_cost_usd REAL, cost_status TEXT, cost_source TEXT,
+                 first_seen REAL, last_seen REAL, PRIMARY KEY (session_id, model, task)
+             );
+             INSERT INTO sessions VALUES ('ses_rz', NULL);
+             INSERT INTO session_model_usage (session_id, model, task, input_tokens, output_tokens, estimated_cost_usd, first_seen, last_seen)
+             VALUES ('ses_rz', 'openai/gpt-4o', '', 1000, 100, 0.010, 10.0, 10.0);",
+        ).unwrap();
+    }
+
+    let ledger_path = dir.path().join("ledger.db");
+    let mut ledger = Ledger::open(&ledger_path).unwrap();
+
+    // 1. Initial ingestion
+    let res1 = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
+    assert_eq!(res1.inserted, 1);
+    assert_eq!(res1.anomalies, 0);
+
+    // 2. Unexpected reset to zero
+    {
+        let conn = rusqlite::Connection::open(&state_db_path).unwrap();
+        conn.execute(
+            "UPDATE session_model_usage SET input_tokens = 0, output_tokens = 0, last_seen = 20.0 WHERE session_id = 'ses_rz'",
+            [],
+        ).unwrap();
+    }
+
+    let res2 = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
+    assert_eq!(
+        res2.inserted, 0,
+        "reset-to-zero snapshot must not emit delta usage"
+    );
+    assert_eq!(
+        res2.anomalies, 1,
+        "must record token_category_regression anomaly"
+    );
+
+    // 3. Future growth from new baseline (300 in, 30 out)
+    {
+        let conn = rusqlite::Connection::open(&state_db_path).unwrap();
+        conn.execute(
+            "UPDATE session_model_usage SET input_tokens = 300, output_tokens = 30, last_seen = 30.0 WHERE session_id = 'ses_rz'",
+            [],
+        ).unwrap();
+    }
+
+    let res3 = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
+    assert_eq!(res3.inserted, 1, "growth from new baseline must emit delta");
+    assert_eq!(res3.anomalies, 0);
+
+    // Verify supplemental event ID contains epoch 1 and sequence 1
+    let delta_event_id: String = ledger.connection().query_row(
+        "SELECT source_event_id FROM usage_events WHERE source_kind = 'hermes_snapshot_delta' ORDER BY observed_at DESC LIMIT 1",
+        [],
+        |r| r.get(0),
+    ).unwrap();
+    assert!(
+        delta_event_id.contains(":te1ts1:"),
+        "event ID must reflect token epoch 1 sequence 1, got {delta_event_id}"
+    );
+
+    // Total tokens: (1000 + 100) + (300 + 30) = 1430
+    let total_tokens: i64 = ledger.connection().query_row(
+        "SELECT sum(coalesce(input_tokens, 0) + coalesce(output_tokens, 0)) FROM usage_events WHERE adapter = 'hermes'",
+        [],
+        |r| r.get(0),
+    ).unwrap();
+    assert_eq!(total_tokens, 1430);
+}
+
+#[test]
+fn test_hermes_epoch_partial_reset_then_growth() {
+    let dir = tempdir().unwrap();
+    let state_db_path = dir.path().join("hermes_partial_reset.db");
+
+    {
+        let conn = rusqlite::Connection::open(&state_db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT);
+             CREATE TABLE session_model_usage (
+                 session_id TEXT NOT NULL, model TEXT NOT NULL, billing_provider TEXT DEFAULT '',
+                 task TEXT DEFAULT '', api_call_count INTEGER DEFAULT 1, input_tokens INTEGER DEFAULT 0,
+                 output_tokens INTEGER DEFAULT 0, cache_read_tokens INTEGER DEFAULT 0,
+                 cache_write_tokens INTEGER DEFAULT 0, reasoning_tokens INTEGER DEFAULT 0,
+                 estimated_cost_usd REAL, actual_cost_usd REAL, cost_status TEXT, cost_source TEXT,
+                 first_seen REAL, last_seen REAL, PRIMARY KEY (session_id, model, task)
+             );
+             INSERT INTO sessions VALUES ('ses_pr', NULL);
+             INSERT INTO session_model_usage (session_id, model, task, input_tokens, output_tokens, estimated_cost_usd, first_seen, last_seen)
+             VALUES ('ses_pr', 'openai/gpt-4o', '', 1000, 200, 0.010, 10.0, 10.0);",
+        ).unwrap();
+    }
+
+    let ledger_path = dir.path().join("ledger.db");
+    let mut ledger = Ledger::open(&ledger_path).unwrap();
+
+    let res1 = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
+    assert_eq!(res1.inserted, 1);
+
+    // Partial reset: input tokens regressed from 1000 down to 600, output grew to 250
+    {
+        let conn = rusqlite::Connection::open(&state_db_path).unwrap();
+        conn.execute(
+            "UPDATE session_model_usage SET input_tokens = 600, output_tokens = 250, last_seen = 20.0 WHERE session_id = 'ses_pr'",
+            [],
+        ).unwrap();
+    }
+
+    let res2 = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
+    assert_eq!(
+        res2.inserted, 0,
+        "partial regression must not emit usage delta"
+    );
+    assert_eq!(res2.anomalies, 1, "must record token_category_regression");
+
+    // Growth from new baseline: input 800 (delta +200), output 300 (delta +50)
+    {
+        let conn = rusqlite::Connection::open(&state_db_path).unwrap();
+        conn.execute(
+            "UPDATE session_model_usage SET input_tokens = 800, output_tokens = 300, last_seen = 30.0 WHERE session_id = 'ses_pr'",
+            [],
+        ).unwrap();
+    }
+
+    let res3 = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
+    assert_eq!(res3.inserted, 1, "growth from new baseline must emit delta");
+
+    // Ingested delta should be exactly 200 in, 50 out
+    let (delta_in, delta_out): (i64, i64) = ledger.connection().query_row(
+        "SELECT input_tokens, output_tokens FROM usage_events WHERE source_kind = 'hermes_snapshot_delta' ORDER BY observed_at DESC LIMIT 1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    ).unwrap();
+    assert_eq!(delta_in, 200);
+    assert_eq!(delta_out, 50);
+}
+
+#[test]
+fn test_hermes_epoch_cost_disappearance_and_return() {
+    let dir = tempdir().unwrap();
+    let state_db_path = dir.path().join("hermes_cost_disappear.db");
+
+    {
+        let conn = rusqlite::Connection::open(&state_db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT);
+             CREATE TABLE session_model_usage (
+                 session_id TEXT NOT NULL, model TEXT NOT NULL, billing_provider TEXT DEFAULT '',
+                 task TEXT DEFAULT '', api_call_count INTEGER DEFAULT 1, input_tokens INTEGER DEFAULT 0,
+                 output_tokens INTEGER DEFAULT 0, cache_read_tokens INTEGER DEFAULT 0,
+                 cache_write_tokens INTEGER DEFAULT 0, reasoning_tokens INTEGER DEFAULT 0,
+                 estimated_cost_usd REAL, actual_cost_usd REAL, cost_status TEXT, cost_source TEXT,
+                 first_seen REAL, last_seen REAL, PRIMARY KEY (session_id, model, task)
+             );
+             INSERT INTO sessions VALUES ('ses_cd', NULL);
+             INSERT INTO session_model_usage (session_id, model, task, input_tokens, output_tokens, actual_cost_usd, first_seen, last_seen)
+             VALUES ('ses_cd', 'openai/gpt-4o', '', 1000, 100, 0.010, 10.0, 10.0);",
+        ).unwrap();
+    }
+
+    let ledger_path = dir.path().join("ledger.db");
+    let mut ledger = Ledger::open(&ledger_path).unwrap();
+
+    let res1 = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
+    assert_eq!(res1.inserted, 1);
+
+    // Cost disappears: actual_cost_usd and estimated_cost_usd become NULL
+    {
+        let conn = rusqlite::Connection::open(&state_db_path).unwrap();
+        conn.execute(
+            "UPDATE session_model_usage SET actual_cost_usd = NULL, estimated_cost_usd = NULL, last_seen = 20.0 WHERE session_id = 'ses_cd'",
+            [],
+        ).unwrap();
+    }
+
+    let res2 = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
+    assert_eq!(
+        res2.anomalies, 1,
+        "cost disappearance must emit provider_cost_regression anomaly"
+    );
+
+    // Cost returns and grows to $0.018 (18,000 micros)
+    {
+        let conn = rusqlite::Connection::open(&state_db_path).unwrap();
+        conn.execute(
+            "UPDATE session_model_usage SET actual_cost_usd = 0.018, last_seen = 30.0 WHERE session_id = 'ses_cd'",
+            [],
+        ).unwrap();
+    }
+
+    let res3 = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
+    assert_eq!(res3.inserted, 1, "cost return/growth must emit delta");
+    let delta_cost: i64 = ledger.connection().query_row(
+        "SELECT provider_reported_cost_micros FROM usage_events WHERE source_kind = 'hermes_snapshot_delta' ORDER BY observed_at DESC LIMIT 1",
+        [],
+        |r| r.get(0),
+    ).unwrap();
+    assert_eq!(delta_cost, 18000);
+}
+
+#[test]
+fn test_hermes_epoch_replay_and_anomaly_idempotence() {
+    let dir = tempdir().unwrap();
+    let state_db_path = dir.path().join("hermes_idempotence.db");
+
+    {
+        let conn = rusqlite::Connection::open(&state_db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT);
+             CREATE TABLE session_model_usage (
+                 session_id TEXT NOT NULL, model TEXT NOT NULL, billing_provider TEXT DEFAULT '',
+                 task TEXT DEFAULT '', api_call_count INTEGER DEFAULT 1, input_tokens INTEGER DEFAULT 0,
+                 output_tokens INTEGER DEFAULT 0, cache_read_tokens INTEGER DEFAULT 0,
+                 cache_write_tokens INTEGER DEFAULT 0, reasoning_tokens INTEGER DEFAULT 0,
+                 estimated_cost_usd REAL, actual_cost_usd REAL, cost_status TEXT, cost_source TEXT,
+                 first_seen REAL, last_seen REAL, PRIMARY KEY (session_id, model, task)
+             );
+             INSERT INTO sessions VALUES ('ses_idemp', NULL);
+             INSERT INTO session_model_usage (session_id, model, task, input_tokens, output_tokens, estimated_cost_usd, first_seen, last_seen)
+             VALUES ('ses_idemp', 'openai/gpt-4o', '', 1000, 100, 0.010, 10.0, 10.0);",
+        ).unwrap();
+    }
+
+    let ledger_path = dir.path().join("ledger.db");
+    let mut ledger = Ledger::open(&ledger_path).unwrap();
+
+    let res1 = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
+    assert_eq!(res1.inserted, 1);
+
+    // Induce regression
+    {
+        let conn = rusqlite::Connection::open(&state_db_path).unwrap();
+        conn.execute(
+            "UPDATE session_model_usage SET input_tokens = 500 WHERE session_id = 'ses_idemp'",
+            [],
+        )
+        .unwrap();
+    }
+
+    let res2 = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
+    assert_eq!(res2.anomalies, 1);
+
+    let count_before: i64 = ledger
+        .connection()
+        .query_row("SELECT count(*) FROM measurement_anomalies", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(count_before, 1);
+
+    // Replay exact same state
+    let res3 = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
+    assert_eq!(res3.inserted, 0);
+
+    let count_after: i64 = ledger
+        .connection()
+        .query_row("SELECT count(*) FROM measurement_anomalies", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        count_after, 1,
+        "anomaly insertion must remain strictly idempotent on replay"
+    );
+}
+
 fn parse_session_file(path: &Path) -> anyhow::Result<ParseResult> {
     let mut file = std::fs::File::open(path)?;
     let mut content = String::new();

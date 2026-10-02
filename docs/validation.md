@@ -44,6 +44,9 @@ tokentree validate --all
 # Enforce that all providers are installed and live-verified on this host
 tokentree validate --require-live --all
 
+# Wait up to 30 seconds for a newly created live provider event
+tokentree validate --require-live --wait 30 grok
+
 # Export a versioned allowlisted JSON report with typed schema validation
 tokentree validate --self-test --all --output ./validation-report.json
 
@@ -167,6 +170,7 @@ Executes TokenTree's automated privacy scanner against the ledger database:
 ### Stage 8: Live Capture State (`live_capture_status`)
 Records whether live generation or hook capture capability is active on this host:
 - **Freshness Requirement**: `live_capture_status` becomes `verified` ONLY when a fresh provider event or session created after validation start time is observed. Historical telemetry files satisfy only `telemetry_status` and will NEVER satisfy `--require-live`.
+- **Usable Live Polling (`--wait <seconds>`)**: Pre-snapshots stable provider event and session identities before polling begins. Continuously inspects newly created events against authoritative internal timestamps (with bounded 30s clock-skew tolerance) until a fresh event is observed or deadline expires. File `mtime` modification alone, touched old files, and copied historical files are strictly rejected.
 - **Default HEALTHY Requirements**: Default `HEALTHY` requires provider available, required configuration verified, real host telemetry verified, and all integrity/reconciliation/privacy checks verified.
 - **Degraded Semantics**: CLI installation alone without host telemetry, or configuration `not_found` for providers requiring configuration, produces `degraded` or `unavailable`, never `healthy`.
 - Reports `unavailable` if the tool is not installed, unauthenticated, or has no fresh live capture.

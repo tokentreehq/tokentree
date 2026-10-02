@@ -48,6 +48,8 @@ enum Command {
         self_test: bool,
         #[arg(long)]
         require_live: bool,
+        #[arg(long, value_name = "SECONDS")]
+        wait: Option<u64>,
         #[arg(long, value_name = "PATH")]
         fixture: Option<PathBuf>,
         #[arg(long, value_name = "PATH")]
@@ -210,6 +212,7 @@ fn run() -> Result<()> {
             all,
             self_test,
             require_live,
+            wait,
             fixture,
             output,
             local_details,
@@ -219,6 +222,7 @@ fn run() -> Result<()> {
                 all,
                 self_test,
                 require_live,
+                wait,
                 fixture,
                 output,
                 local_details,

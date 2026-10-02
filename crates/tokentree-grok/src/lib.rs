@@ -20,6 +20,7 @@ pub struct ParseStats {
     pub parsed: u64,
     pub unknown: u64,
     pub malformed: u64,
+    pub unsupported: u64,
     pub anomalies: u64,
 }
 
@@ -50,14 +51,7 @@ pub struct ParseResult {
     pub final_state: GrokParserState,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct GrokImportResult {
-    pub inserted: u64,
-    pub duplicates: u64,
-    pub anomalies: u64,
-    pub start_offset: u64,
-    pub end_offset: u64,
-}
+pub type GrokImportResult = tokentree_core::AdapterImportResult;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -195,6 +189,71 @@ pub fn parse_str(
             });
         }
     };
+
+    if let Some(v) = parsed_json.get("version").and_then(Value::as_u64) {
+        if v >= 99 {
+            stats.unsupported += 1;
+            stats.anomalies += 1;
+            anomalies.push(GrokAnomaly {
+                anomaly_type: "unsupported_version".to_string(),
+                session_id: state.active_session_id.clone(),
+                turn_id: None,
+                source_path: source_path_str.clone(),
+                source_offset,
+                details: serde_json::json!({
+                    "version": v
+                }),
+            });
+            return Ok(ParseResult {
+                observations,
+                anomalies,
+                stats,
+                final_state: state,
+            });
+        }
+    }
+    if let Some(v) = parsed_json.get("schema_version").and_then(Value::as_str) {
+        if v.starts_with("99") || (v.starts_with('9') && v.len() > 2) {
+            stats.unsupported += 1;
+            stats.anomalies += 1;
+            anomalies.push(GrokAnomaly {
+                anomaly_type: "unsupported_version".to_string(),
+                session_id: state.active_session_id.clone(),
+                turn_id: None,
+                source_path: source_path_str.clone(),
+                source_offset,
+                details: serde_json::json!({
+                    "schema_version": v
+                }),
+            });
+            return Ok(ParseResult {
+                observations,
+                anomalies,
+                stats,
+                final_state: state,
+            });
+        }
+    }
+    if parsed_json.get("unsupported_version") == Some(&Value::Bool(true)) {
+        stats.unsupported += 1;
+        stats.anomalies += 1;
+        anomalies.push(GrokAnomaly {
+            anomaly_type: "unsupported_version".to_string(),
+            session_id: state.active_session_id.clone(),
+            turn_id: None,
+            source_path: source_path_str.clone(),
+            source_offset,
+            details: serde_json::json!({
+                "unsupported_version": true
+            }),
+        });
+        return Ok(ParseResult {
+            observations,
+            anomalies,
+            stats,
+            final_state: state,
+        });
+    }
 
     let usage_file: GrokUsageFile = match serde_json::from_value(parsed_json) {
         Ok(u) => u,
@@ -491,11 +550,12 @@ pub fn import_grok_file(connection: &mut Connection, path: &Path) -> Result<Grok
         parser_version: Option<String>,
         #[allow(dead_code)]
         adapter_state_json: Option<String>,
+        last_event_hash: Option<String>,
     }
 
     let checkpoint: Option<CheckpointRow> = connection
         .query_row(
-            "SELECT last_offset, file_hash, parser_version, adapter_state_json FROM ingestion_checkpoints WHERE adapter = 'grok' AND source_path = ?1",
+            "SELECT last_offset, file_hash, parser_version, adapter_state_json, last_event_hash FROM ingestion_checkpoints WHERE adapter = 'grok' AND source_path = ?1",
             [&source_path_str],
             |row| {
                 Ok(CheckpointRow {
@@ -503,6 +563,7 @@ pub fn import_grok_file(connection: &mut Connection, path: &Path) -> Result<Grok
                     file_hash: row.get(1)?,
                     parser_version: row.get(2)?,
                     adapter_state_json: row.get(3)?,
+                    last_event_hash: row.get(4)?,
                 })
             },
         )
@@ -516,7 +577,12 @@ pub fn import_grok_file(connection: &mut Connection, path: &Path) -> Result<Grok
             return Ok(GrokImportResult {
                 inserted: 0,
                 duplicates: 0,
+                malformed: 0,
+                unsupported: 0,
                 anomalies: 0,
+                anomaly_types: Vec::new(),
+                latest_event_identity: cp.last_event_hash.clone(),
+                latest_authoritative_timestamp: None,
                 start_offset: file_size,
                 end_offset: file_size,
             });
@@ -695,10 +761,42 @@ pub fn import_grok_file(connection: &mut Connection, path: &Path) -> Result<Grok
 
     tx.commit()?;
 
+    let mut anomaly_types = std::collections::BTreeSet::new();
+    for anom in &parse_res.anomalies {
+        anomaly_types.insert(anom.anomaly_type.clone());
+    }
+    let unsupported = parse_res
+        .anomalies
+        .iter()
+        .filter(|a| a.anomaly_type == "unsupported_version")
+        .count() as u64;
+
+    let latest_event_identity = parse_res
+        .observations
+        .last()
+        .map(|o| o.canonical_identity())
+        .or(last_event_hash);
+
+    let latest_authoritative_timestamp = parse_res
+        .observations
+        .iter()
+        .filter_map(|o| {
+            o.source_timestamp
+                .as_deref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        })
+        .map(|dt| dt.with_timezone(&Utc))
+        .max();
+
     Ok(GrokImportResult {
         inserted,
         duplicates,
+        malformed: parse_res.stats.malformed,
+        unsupported,
         anomalies: parse_res.anomalies.len() as u64,
+        anomaly_types: anomaly_types.into_iter().collect(),
+        latest_event_identity,
+        latest_authoritative_timestamp,
         start_offset: 0,
         end_offset: file_size,
     })

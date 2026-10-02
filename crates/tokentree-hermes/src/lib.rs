@@ -19,6 +19,7 @@ pub struct ParseStats {
     pub parsed: u64,
     pub unknown: u64,
     pub malformed: u64,
+    pub unsupported: u64,
     pub anomalies: u64,
 }
 
@@ -40,7 +41,16 @@ pub struct HermesRowCheckpoint {
     pub cache_write_tokens: u64,
     pub reasoning_tokens: u64,
     pub cumulative_cost_micros: Option<u64>,
+    #[serde(default)]
     pub delta_sequence: u64,
+    #[serde(default)]
+    pub token_epoch: u64,
+    #[serde(default)]
+    pub token_sequence: u64,
+    #[serde(default)]
+    pub cost_epoch: u64,
+    #[serde(default)]
+    pub cost_sequence: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -60,15 +70,7 @@ pub struct ParseResult {
     pub final_state: HermesParserState,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct HermesImportResult {
-    pub inserted: u64,
-    pub duplicates: u64,
-    pub anomalies: u64,
-    pub malformed: u64,
-    pub start_offset: u64,
-    pub end_offset: u64,
-}
+pub type HermesImportResult = tokentree_core::AdapterImportResult;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HermesCostClassification {
@@ -283,6 +285,71 @@ pub fn parse_json_usage_str(
             });
         }
     };
+
+    if let Some(v) = parsed_json.get("version").and_then(Value::as_u64) {
+        if v >= 99 {
+            stats.unsupported += 1;
+            stats.anomalies += 1;
+            anomalies.push(HermesAnomaly {
+                anomaly_type: "unsupported_version".to_string(),
+                session_id: state.active_session_id.clone(),
+                turn_id: None,
+                source_path: source_path_str.clone(),
+                source_offset,
+                details: serde_json::json!({
+                    "version": v
+                }),
+            });
+            return Ok(ParseResult {
+                observations,
+                anomalies,
+                stats,
+                final_state: state,
+            });
+        }
+    }
+    if let Some(v) = parsed_json.get("schema_version").and_then(Value::as_str) {
+        if v.starts_with("99") || (v.starts_with('9') && v.len() > 2) {
+            stats.unsupported += 1;
+            stats.anomalies += 1;
+            anomalies.push(HermesAnomaly {
+                anomaly_type: "unsupported_version".to_string(),
+                session_id: state.active_session_id.clone(),
+                turn_id: None,
+                source_path: source_path_str.clone(),
+                source_offset,
+                details: serde_json::json!({
+                    "schema_version": v
+                }),
+            });
+            return Ok(ParseResult {
+                observations,
+                anomalies,
+                stats,
+                final_state: state,
+            });
+        }
+    }
+    if parsed_json.get("unsupported_version") == Some(&Value::Bool(true)) {
+        stats.unsupported += 1;
+        stats.anomalies += 1;
+        anomalies.push(HermesAnomaly {
+            anomaly_type: "unsupported_version".to_string(),
+            session_id: state.active_session_id.clone(),
+            turn_id: None,
+            source_path: source_path_str.clone(),
+            source_offset,
+            details: serde_json::json!({
+                "unsupported_version": true
+            }),
+        });
+        return Ok(ParseResult {
+            observations,
+            anomalies,
+            stats,
+            final_state: state,
+        });
+    }
 
     let usage_file: HermesUsageFile = match serde_json::from_value(parsed_json) {
         Ok(u) => u,
@@ -501,6 +568,17 @@ pub fn parse_json_usage_str(
     })
 }
 
+pub fn parse_session(path: &Path) -> Result<ParseResult> {
+    let is_sqlite = path.extension().is_some_and(|ext| ext == "db");
+    if is_sqlite {
+        parse_hermes_state_db(path, None)
+    } else {
+        let content =
+            fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        parse_json_usage_str(&content, path, 0, HermesParserState::default())
+    }
+}
+
 pub fn parse_hermes_state_db(db_path: &Path, since_timestamp: Option<f64>) -> Result<ParseResult> {
     let mut conn = Connection::open_with_flags(
         db_path,
@@ -516,8 +594,32 @@ pub fn parse_hermes_state_db(db_path: &Path, since_timestamp: Option<f64>) -> Re
     let anomalies = Vec::new();
     let mut stats = ParseStats::default();
     let mut max_seen_ts: Option<f64> = since_timestamp;
-
     let source_path_str = db_path.to_string_lossy().to_string();
+
+    let user_version: u32 = read_tx
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap_or(0);
+    if user_version >= 9999 {
+        stats.unsupported += 1;
+        stats.anomalies += 1;
+        let mut anoms = Vec::new();
+        anoms.push(HermesAnomaly {
+            anomaly_type: "unsupported_version".to_string(),
+            session_id: None,
+            turn_id: None,
+            source_path: source_path_str,
+            source_offset: 0,
+            details: serde_json::json!({
+                "user_version": user_version
+            }),
+        });
+        return Ok(ParseResult {
+            observations,
+            anomalies: anoms,
+            stats,
+            final_state: HermesParserState::default(),
+        });
+    }
 
     // Query parent session mapping from `sessions` table if it exists
     let mut parent_map: HashMap<String, String> = HashMap::new();
@@ -815,8 +917,12 @@ pub fn import_hermes_file(connection: &mut Connection, path: &Path) -> Result<He
                 return Ok(HermesImportResult {
                     inserted: 0,
                     duplicates: 0,
-                    anomalies: 0,
                     malformed: 0,
+                    unsupported: 0,
+                    anomalies: 0,
+                    anomaly_types: Vec::new(),
+                    latest_event_identity: None,
+                    latest_authoritative_timestamp: None,
                     start_offset: file_size,
                     end_offset: file_size,
                 });
@@ -896,6 +1002,10 @@ pub fn import_hermes_file(connection: &mut Connection, path: &Path) -> Result<He
                         reasoning_tokens: cur_reas,
                         cumulative_cost_micros: cur_cost,
                         delta_sequence: 0,
+                        token_epoch: 0,
+                        token_sequence: 0,
+                        cost_epoch: 0,
+                        cost_sequence: 0,
                     },
                 );
                 Some(obs.clone())
@@ -908,13 +1018,24 @@ pub fn import_hermes_file(connection: &mut Connection, path: &Path) -> Result<He
                     || cur_cw < prev.cache_write_tokens
                     || cur_reas < prev.reasoning_tokens;
 
-                // Detect cost regression: cur_cost < prev_cost
+                // Detect cost regression: cur_cost < prev_cost, or cost disappeared
                 let has_cost_regression = match (prev.cumulative_cost_micros, cur_cost) {
                     (Some(p), Some(c)) => c < p,
+                    (Some(_), None) => true,
                     _ => false,
                 };
 
-                if has_token_regression {
+                let (
+                    token_epoch,
+                    token_sequence,
+                    delta_in,
+                    delta_out,
+                    delta_cr,
+                    delta_cw,
+                    delta_reas,
+                    tokens_increased,
+                ) = if has_token_regression {
+                    let new_epoch = prev.token_epoch + 1;
                     extra_anomalies.push(HermesAnomaly {
                         anomaly_type: "token_category_regression".to_string(),
                         session_id: Some(obs.provider_session_id.clone()),
@@ -923,6 +1044,8 @@ pub fn import_hermes_file(connection: &mut Connection, path: &Path) -> Result<He
                         source_offset: obs.source_offset,
                         details: serde_json::json!({
                             "row_key": row_key,
+                            "previous_epoch": prev.token_epoch,
+                            "new_epoch": new_epoch,
                             "previous": {
                                 "input_tokens": prev.input_tokens,
                                 "output_tokens": prev.output_tokens,
@@ -939,10 +1062,26 @@ pub fn import_hermes_file(connection: &mut Connection, path: &Path) -> Result<He
                             }
                         }),
                     });
-                    // Do not clamp or overcount; retain previous checkpoint
-                    next_checkpoints.insert(row_key.clone(), prev.clone());
-                    None
-                } else if has_cost_regression {
+                    // Establish new epoch with baseline at current values; reset snapshot not counted as delta
+                    (new_epoch, 0, 0, 0, 0, 0, 0, false)
+                } else {
+                    let d_in = cur_in - prev.input_tokens;
+                    let d_out = cur_out - prev.output_tokens;
+                    let d_cr = cur_cr - prev.cache_read_tokens;
+                    let d_cw = cur_cw - prev.cache_write_tokens;
+                    let d_reas = cur_reas - prev.reasoning_tokens;
+                    let inc = (d_in + d_out + d_cr + d_cw + d_reas) > 0;
+                    let seq = if inc {
+                        prev.token_sequence + 1
+                    } else {
+                        prev.token_sequence
+                    };
+                    (prev.token_epoch, seq, d_in, d_out, d_cr, d_cw, d_reas, inc)
+                };
+
+                let (cost_epoch, cost_sequence, delta_cost, cost_increased) = if has_cost_regression
+                {
+                    let new_epoch = prev.cost_epoch + 1;
                     extra_anomalies.push(HermesAnomaly {
                         anomaly_type: "provider_cost_regression".to_string(),
                         session_id: Some(obs.provider_session_id.clone()),
@@ -951,67 +1090,65 @@ pub fn import_hermes_file(connection: &mut Connection, path: &Path) -> Result<He
                         source_offset: obs.source_offset,
                         details: serde_json::json!({
                             "row_key": row_key,
+                            "previous_cost_epoch": prev.cost_epoch,
+                            "new_cost_epoch": new_epoch,
                             "previous_cost_micros": prev.cumulative_cost_micros,
                             "current_cost_micros": cur_cost,
                         }),
                     });
-                    // Do not clamp or overcount; retain previous checkpoint
-                    next_checkpoints.insert(row_key.clone(), prev.clone());
-                    None
+                    // Establish new epoch with baseline at current cost; reset snapshot not counted as delta
+                    (new_epoch, 0, None, false)
                 } else {
-                    let delta_in = cur_in - prev.input_tokens;
-                    let delta_out = cur_out - prev.output_tokens;
-                    let delta_cr = cur_cr - prev.cache_read_tokens;
-                    let delta_cw = cur_cw - prev.cache_write_tokens;
-                    let delta_reas = cur_reas - prev.reasoning_tokens;
-                    let tokens_increased =
-                        (delta_in + delta_out + delta_cr + delta_cw + delta_reas) > 0;
-
-                    let delta_cost: Option<u64> = match (cur_cost, prev.cumulative_cost_micros) {
-                        (Some(c), Some(p)) => Some(c - p),
+                    let d_cost = match (cur_cost, prev.cumulative_cost_micros) {
+                        (Some(c), Some(p)) if c > p => Some(c - p),
                         (Some(c), None) => Some(c),
                         _ => None,
                     };
-                    let cost_increased = delta_cost.is_some_and(|c| c > 0);
-
-                    if tokens_increased || cost_increased {
-                        let next_seq = prev.delta_sequence + 1;
-                        let mut delta_obs = obs.clone();
-                        delta_obs.source = tokentree_core::MeasurementSource::SnapshotDelta;
-                        delta_obs.source_subtype = Some("hermes_snapshot_delta".to_string());
-                        // Preserve canonical request ID across base and deltas
-                        delta_obs.request_id = obs.request_id.clone();
-                        // Supplemental unique source event ID
-                        delta_obs.source_event_id = Some(format!("{}:delta:{}", row_key, next_seq));
-                        delta_obs.usage = TokenUsage {
-                            input_tokens: Some(delta_in),
-                            output_tokens: Some(delta_out),
-                            cached_input_tokens: Some(delta_cr),
-                            cache_write_tokens: Some(delta_cw),
-                            reasoning_tokens: Some(delta_reas),
-                        };
-                        // Never clone full cumulative cost into deltas
-                        delta_obs.provider_reported_cost_micros = delta_cost;
-
-                        next_checkpoints.insert(
-                            row_key.clone(),
-                            HermesRowCheckpoint {
-                                input_tokens: cur_in,
-                                output_tokens: cur_out,
-                                cache_read_tokens: cur_cr,
-                                cache_write_tokens: cur_cw,
-                                reasoning_tokens: cur_reas,
-                                cumulative_cost_micros: cur_cost,
-                                delta_sequence: next_seq,
-                            },
-                        );
-
-                        Some(delta_obs)
+                    let inc = d_cost.is_some_and(|c| c > 0);
+                    let seq = if inc {
+                        prev.cost_sequence + 1
                     } else {
-                        // Unchanged / duplicate row
-                        next_checkpoints.insert(row_key.clone(), prev.clone());
-                        None
-                    }
+                        prev.cost_sequence
+                    };
+                    (prev.cost_epoch, seq, d_cost, inc)
+                };
+
+                next_checkpoints.insert(
+                    row_key.clone(),
+                    HermesRowCheckpoint {
+                        input_tokens: cur_in,
+                        output_tokens: cur_out,
+                        cache_read_tokens: cur_cr,
+                        cache_write_tokens: cur_cw,
+                        reasoning_tokens: cur_reas,
+                        cumulative_cost_micros: cur_cost,
+                        delta_sequence: token_sequence.max(cost_sequence),
+                        token_epoch,
+                        token_sequence,
+                        cost_epoch,
+                        cost_sequence,
+                    },
+                );
+
+                if tokens_increased || cost_increased {
+                    let mut delta_obs = obs.clone();
+                    delta_obs.source = tokentree_core::MeasurementSource::SnapshotDelta;
+                    delta_obs.source_subtype = Some("hermes_snapshot_delta".to_string());
+                    delta_obs.request_id = obs.request_id.clone();
+                    delta_obs.source_event_id = Some(format!(
+                        "{row_key}:delta:te{token_epoch}ts{token_sequence}:ce{cost_epoch}cs{cost_sequence}"
+                    ));
+                    delta_obs.usage = TokenUsage {
+                        input_tokens: Some(delta_in),
+                        output_tokens: Some(delta_out),
+                        cached_input_tokens: Some(delta_cr),
+                        cache_write_tokens: Some(delta_cw),
+                        reasoning_tokens: Some(delta_reas),
+                    };
+                    delta_obs.provider_reported_cost_micros = delta_cost;
+                    Some(delta_obs)
+                } else {
+                    None
                 }
             }
         };
@@ -1081,9 +1218,29 @@ pub fn import_hermes_file(connection: &mut Connection, path: &Path) -> Result<He
             &anom.source_path
         };
         let stable_file_id = hex::encode(&Sha256::digest(file_id.as_bytes())[..8]);
+        let session_part = anom.session_id.as_deref().unwrap_or("");
+        let turn_part = anom.turn_id.as_deref().unwrap_or("");
+        let row_key_part = anom
+            .details
+            .get("row_key")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let epoch_part = anom
+            .details
+            .get("new_epoch")
+            .or_else(|| anom.details.get("new_cost_epoch"))
+            .map(|v| v.to_string())
+            .unwrap_or_default();
         let raw_key = format!(
-            "hermes:{}:{}:{}:{}",
-            stable_file_id, anom.source_offset, anom.anomaly_type, PARSER_VERSION
+            "hermes:{}:{}:{}:{}:{}:{}:{}:{}",
+            stable_file_id,
+            anom.source_offset,
+            session_part,
+            turn_part,
+            row_key_part,
+            epoch_part,
+            anom.anomaly_type,
+            PARSER_VERSION
         );
         let anom_id = format!(
             "anom_{}",
@@ -1150,11 +1307,42 @@ pub fn import_hermes_file(connection: &mut Connection, path: &Path) -> Result<He
 
     tx.commit()?;
 
+    let mut anomaly_types = std::collections::BTreeSet::new();
+    for anom in &parse_res.anomalies {
+        anomaly_types.insert(anom.anomaly_type.clone());
+    }
+    let unsupported = parse_res
+        .anomalies
+        .iter()
+        .filter(|a| a.anomaly_type == "unsupported_version")
+        .count() as u64;
+
+    let latest_event_identity = parse_res
+        .observations
+        .last()
+        .map(|o| o.canonical_identity())
+        .or(last_event_hash);
+
+    let latest_authoritative_timestamp = parse_res
+        .observations
+        .iter()
+        .filter_map(|o| {
+            o.source_timestamp
+                .as_deref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        })
+        .map(|dt| dt.with_timezone(&Utc))
+        .max();
+
     Ok(HermesImportResult {
         inserted,
         duplicates,
-        anomalies: parse_res.anomalies.len() as u64,
         malformed: parse_res.stats.malformed,
+        unsupported,
+        anomalies: parse_res.anomalies.len() as u64,
+        anomaly_types: anomaly_types.into_iter().collect(),
+        latest_event_identity,
+        latest_authoritative_timestamp,
         start_offset: 0,
         end_offset: file_size,
     })

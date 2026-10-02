@@ -1,0 +1,1 @@
+{"version": 999, "type": "synthetic_usage", "request_id": "req_unk_claude", "model": "claude-unknown-99", "usage": {"input_tokens": 100, "output_tokens": 50}}

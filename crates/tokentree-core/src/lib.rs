@@ -73,6 +73,20 @@ impl TokenUsage {
     }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AdapterImportResult {
+    pub inserted: u64,
+    pub duplicates: u64,
+    pub malformed: u64,
+    pub unsupported: u64,
+    pub anomalies: u64,
+    pub anomaly_types: Vec<String>,
+    pub latest_event_identity: Option<String>,
+    pub latest_authoritative_timestamp: Option<chrono::DateTime<chrono::Utc>>,
+    pub start_offset: u64,
+    pub end_offset: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UsageObservation {
     pub adapter: String,
