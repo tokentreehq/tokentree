@@ -42,6 +42,8 @@ pub struct HermesRowCheckpoint {
     pub reasoning_tokens: u64,
     pub cumulative_cost_micros: Option<u64>,
     #[serde(default)]
+    pub cost_available: bool,
+    #[serde(default)]
     pub delta_sequence: u64,
     #[serde(default)]
     pub token_epoch: u64,
@@ -992,6 +994,7 @@ pub fn import_hermes_file(connection: &mut Connection, path: &Path) -> Result<He
         let target_obs: Option<UsageObservation> = match prev_state.row_checkpoints.get(&row_key) {
             None => {
                 // First time seeing this source row: base observation
+                let cost_available = cur_cost.is_some();
                 next_checkpoints.insert(
                     row_key.clone(),
                     HermesRowCheckpoint {
@@ -1001,6 +1004,7 @@ pub fn import_hermes_file(connection: &mut Connection, path: &Path) -> Result<He
                         cache_write_tokens: cur_cw,
                         reasoning_tokens: cur_reas,
                         cumulative_cost_micros: cur_cost,
+                        cost_available,
                         delta_sequence: 0,
                         token_epoch: 0,
                         token_sequence: 0,
@@ -1017,13 +1021,6 @@ pub fn import_hermes_file(connection: &mut Connection, path: &Path) -> Result<He
                     || cur_cr < prev.cache_read_tokens
                     || cur_cw < prev.cache_write_tokens
                     || cur_reas < prev.reasoning_tokens;
-
-                // Detect cost regression: cur_cost < prev_cost, or cost disappeared
-                let has_cost_regression = match (prev.cumulative_cost_micros, cur_cost) {
-                    (Some(p), Some(c)) => c < p,
-                    (Some(_), None) => true,
-                    _ => false,
-                };
 
                 let (
                     token_epoch,
@@ -1079,38 +1076,93 @@ pub fn import_hermes_file(connection: &mut Connection, path: &Path) -> Result<He
                     (prev.token_epoch, seq, d_in, d_out, d_cr, d_cw, d_reas, inc)
                 };
 
-                let (cost_epoch, cost_sequence, delta_cost, cost_increased) = if has_cost_regression
-                {
-                    let new_epoch = prev.cost_epoch + 1;
-                    extra_anomalies.push(HermesAnomaly {
-                        anomaly_type: "provider_cost_regression".to_string(),
-                        session_id: Some(obs.provider_session_id.clone()),
-                        turn_id: obs.turn_id.clone(),
-                        source_path: source_path_str.clone(),
-                        source_offset: obs.source_offset,
-                        details: serde_json::json!({
-                            "row_key": row_key,
-                            "previous_cost_epoch": prev.cost_epoch,
-                            "new_cost_epoch": new_epoch,
-                            "previous_cost_micros": prev.cumulative_cost_micros,
-                            "current_cost_micros": cur_cost,
-                        }),
-                    });
-                    // Establish new epoch with baseline at current cost; reset snapshot not counted as delta
-                    (new_epoch, 0, None, false)
-                } else {
-                    let d_cost = match (cur_cost, prev.cumulative_cost_micros) {
-                        (Some(c), Some(p)) if c > p => Some(c - p),
-                        (Some(c), None) => Some(c),
-                        _ => None,
-                    };
-                    let inc = d_cost.is_some_and(|c| c > 0);
-                    let seq = if inc {
-                        prev.cost_sequence + 1
-                    } else {
-                        prev.cost_sequence
-                    };
-                    (prev.cost_epoch, seq, d_cost, inc)
+                let prev_available = prev.cost_available;
+                let last_known_cost = prev.cumulative_cost_micros;
+
+                let (
+                    cost_epoch,
+                    cost_sequence,
+                    next_cum_cost,
+                    next_available,
+                    delta_cost,
+                    cost_increased,
+                ) = match cur_cost {
+                    None => {
+                        // Current snapshot reports NULL / unavailable
+                        if prev_available {
+                            // Transition to unavailable: emit one deterministic missing-cost anomaly
+                            extra_anomalies.push(HermesAnomaly {
+                                anomaly_type: "provider_cost_missing".to_string(),
+                                session_id: Some(obs.provider_session_id.clone()),
+                                turn_id: obs.turn_id.clone(),
+                                source_path: source_path_str.clone(),
+                                source_offset: obs.source_offset,
+                                details: serde_json::json!({
+                                    "row_key": row_key,
+                                    "cost_epoch": prev.cost_epoch,
+                                    "last_known_cost_micros": last_known_cost,
+                                    "current_cost_micros": null,
+                                }),
+                            });
+                        }
+                        // Never discard the last known cumulative cost baseline!
+                        // Repeated missing snapshots are idempotent because next_available is false.
+                        (
+                            prev.cost_epoch,
+                            prev.cost_sequence,
+                            last_known_cost,
+                            false,
+                            None,
+                            false,
+                        )
+                    }
+                    Some(cur) => {
+                        // Current snapshot reports a numeric cost
+                        match last_known_cost {
+                            Some(known) if cur > known => {
+                                // Cost returned / grew above last known value: emit ONLY the difference!
+                                let d_cost = cur - known;
+                                let seq = prev.cost_sequence + 1;
+                                (prev.cost_epoch, seq, Some(cur), true, Some(d_cost), true)
+                            }
+                            Some(known) if cur < known => {
+                                // Returned below last known value: treat as numeric reset (anomaly, new epoch, no reset delta)
+                                let new_epoch = prev.cost_epoch + 1;
+                                extra_anomalies.push(HermesAnomaly {
+                                    anomaly_type: "provider_cost_regression".to_string(),
+                                    session_id: Some(obs.provider_session_id.clone()),
+                                    turn_id: obs.turn_id.clone(),
+                                    source_path: source_path_str.clone(),
+                                    source_offset: obs.source_offset,
+                                    details: serde_json::json!({
+                                        "row_key": row_key,
+                                        "previous_cost_epoch": prev.cost_epoch,
+                                        "new_cost_epoch": new_epoch,
+                                        "previous_cost_micros": known,
+                                        "current_cost_micros": cur,
+                                    }),
+                                });
+                                // Establish new epoch with baseline at current cost; no reset delta
+                                (new_epoch, 0, Some(cur), true, None, false)
+                            }
+                            Some(_known) => {
+                                // cur == known: no change in cost
+                                (
+                                    prev.cost_epoch,
+                                    prev.cost_sequence,
+                                    Some(cur),
+                                    true,
+                                    None,
+                                    false,
+                                )
+                            }
+                            None => {
+                                // Cost was never known before: first appearance
+                                let seq = prev.cost_sequence + 1;
+                                (prev.cost_epoch, seq, Some(cur), true, Some(cur), true)
+                            }
+                        }
+                    }
                 };
 
                 next_checkpoints.insert(
@@ -1121,7 +1173,8 @@ pub fn import_hermes_file(connection: &mut Connection, path: &Path) -> Result<He
                         cache_read_tokens: cur_cr,
                         cache_write_tokens: cur_cw,
                         reasoning_tokens: cur_reas,
-                        cumulative_cost_micros: cur_cost,
+                        cumulative_cost_micros: next_cum_cost,
+                        cost_available: next_available,
                         delta_sequence: token_sequence.max(cost_sequence),
                         token_epoch,
                         token_sequence,
@@ -1229,6 +1282,7 @@ pub fn import_hermes_file(connection: &mut Connection, path: &Path) -> Result<He
             .details
             .get("new_epoch")
             .or_else(|| anom.details.get("new_cost_epoch"))
+            .or_else(|| anom.details.get("cost_epoch"))
             .map(|v| v.to_string())
             .unwrap_or_default();
         let raw_key = format!(

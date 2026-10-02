@@ -1084,7 +1084,31 @@ fn test_hermes_epoch_cost_disappearance_and_return() {
     let res2 = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
     assert_eq!(
         res2.anomalies, 1,
-        "cost disappearance must emit provider_cost_regression anomaly"
+        "cost disappearance must emit missing-cost anomaly"
+    );
+    assert_eq!(res2.inserted, 0, "disappeared cost must not emit delta");
+    assert!(
+        res2.anomaly_types
+            .contains(&"provider_cost_missing".to_string())
+    );
+
+    // Repeated missing snapshot must be idempotent: 0 inserted, 0 new anomalies
+    let res2_repeat = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
+    assert_eq!(
+        res2_repeat.anomalies, 0,
+        "repeated missing snapshot must not re-emit anomaly"
+    );
+    assert_eq!(res2_repeat.inserted, 0);
+
+    let db_anoms: i64 = ledger
+        .connection()
+        .query_row("SELECT count(*) FROM measurement_anomalies", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        db_anoms, 1,
+        "only 1 anomaly recorded across repeated missing snapshots"
     );
 
     // Cost returns and grows to $0.018 (18,000 micros)
@@ -1103,7 +1127,205 @@ fn test_hermes_epoch_cost_disappearance_and_return() {
         [],
         |r| r.get(0),
     ).unwrap();
-    assert_eq!(delta_cost, 18000);
+    // When cost returns above last known value (10,000 micros), emit ONLY the difference: 18,000 - 10,000 = 8,000 micros!
+    assert_eq!(
+        delta_cost, 8000,
+        "delta must be exactly difference above last known cumulative cost (8,000 micros)"
+    );
+
+    let total_cost: i64 = ledger
+        .connection()
+        .query_row(
+            "SELECT sum(provider_reported_cost_micros) FROM usage_events WHERE adapter = 'hermes'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        total_cost, 18000,
+        "total cost in ledger must accurately sum to 18,000 micros"
+    );
+}
+
+#[test]
+fn test_hermes_epoch_cost_return_below_last_known_is_numeric_reset() {
+    let dir = tempdir().unwrap();
+    let state_db_path = dir.path().join("hermes_cost_reset_below.db");
+
+    {
+        let conn = rusqlite::Connection::open(&state_db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT);
+             CREATE TABLE session_model_usage (
+                 session_id TEXT NOT NULL, model TEXT NOT NULL, billing_provider TEXT DEFAULT '',
+                 task TEXT DEFAULT '', api_call_count INTEGER DEFAULT 1, input_tokens INTEGER DEFAULT 0,
+                 output_tokens INTEGER DEFAULT 0, cache_read_tokens INTEGER DEFAULT 0,
+                 cache_write_tokens INTEGER DEFAULT 0, reasoning_tokens INTEGER DEFAULT 0,
+                 estimated_cost_usd REAL, actual_cost_usd REAL, cost_status TEXT, cost_source TEXT,
+                 first_seen REAL, last_seen REAL, PRIMARY KEY (session_id, model, task)
+             );
+             INSERT INTO sessions VALUES ('ses_crb', NULL);
+             INSERT INTO session_model_usage (session_id, model, task, input_tokens, output_tokens, actual_cost_usd, first_seen, last_seen)
+             VALUES ('ses_crb', 'openai/gpt-4o', '', 1000, 100, 0.010, 10.0, 10.0);",
+        ).unwrap();
+    }
+
+    let ledger_path = dir.path().join("ledger.db");
+    let mut ledger = Ledger::open(&ledger_path).unwrap();
+
+    let res1 = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
+    assert_eq!(res1.inserted, 1);
+
+    // Cost disappears (NULL)
+    {
+        let conn = rusqlite::Connection::open(&state_db_path).unwrap();
+        conn.execute(
+            "UPDATE session_model_usage SET actual_cost_usd = NULL, last_seen = 20.0 WHERE session_id = 'ses_crb'",
+            [],
+        ).unwrap();
+    }
+    let res2 = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
+    assert_eq!(res2.anomalies, 1);
+    assert_eq!(res2.inserted, 0);
+
+    // Cost returns below last known value: $0.006 (6,000 < 10,000)
+    {
+        let conn = rusqlite::Connection::open(&state_db_path).unwrap();
+        conn.execute(
+            "UPDATE session_model_usage SET actual_cost_usd = 0.006, last_seen = 30.0 WHERE session_id = 'ses_crb'",
+            [],
+        ).unwrap();
+    }
+    let res3 = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
+    assert_eq!(
+        res3.inserted, 0,
+        "return below last known value must not emit reset delta"
+    );
+    assert_eq!(
+        res3.anomalies, 1,
+        "return below last known value must emit provider_cost_regression"
+    );
+    assert!(
+        res3.anomaly_types
+            .contains(&"provider_cost_regression".to_string())
+    );
+
+    // Growth from new baseline: $0.009 (9,000 micros -> delta +3,000)
+    {
+        let conn = rusqlite::Connection::open(&state_db_path).unwrap();
+        conn.execute(
+            "UPDATE session_model_usage SET actual_cost_usd = 0.009, last_seen = 40.0 WHERE session_id = 'ses_crb'",
+            [],
+        ).unwrap();
+    }
+    let res4 = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
+    assert_eq!(res4.inserted, 1, "growth from new baseline must emit delta");
+    let delta_cost: i64 = ledger.connection().query_row(
+        "SELECT provider_reported_cost_micros FROM usage_events WHERE source_kind = 'hermes_snapshot_delta' ORDER BY observed_at DESC LIMIT 1",
+        [],
+        |r| r.get(0),
+    ).unwrap();
+    assert_eq!(delta_cost, 3000);
+
+    let delta_event_id: String = ledger.connection().query_row(
+        "SELECT source_event_id FROM usage_events WHERE source_kind = 'hermes_snapshot_delta' ORDER BY observed_at DESC LIMIT 1",
+        [],
+        |r| r.get(0),
+    ).unwrap();
+    assert!(
+        delta_event_id.contains(":ce1cs1"),
+        "event identity must reflect cost epoch 1 sequence 1, got {delta_event_id}"
+    );
+}
+
+#[test]
+fn test_hermes_cost_disappearance_restart_and_replay() {
+    let dir = tempdir().unwrap();
+    let state_db_path = dir.path().join("hermes_cost_restart.db");
+
+    {
+        let conn = rusqlite::Connection::open(&state_db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT);
+             CREATE TABLE session_model_usage (
+                 session_id TEXT NOT NULL, model TEXT NOT NULL, billing_provider TEXT DEFAULT '',
+                 task TEXT DEFAULT '', api_call_count INTEGER DEFAULT 1, input_tokens INTEGER DEFAULT 0,
+                 output_tokens INTEGER DEFAULT 0, cache_read_tokens INTEGER DEFAULT 0,
+                 cache_write_tokens INTEGER DEFAULT 0, reasoning_tokens INTEGER DEFAULT 0,
+                 estimated_cost_usd REAL, actual_cost_usd REAL, cost_status TEXT, cost_source TEXT,
+                 first_seen REAL, last_seen REAL, PRIMARY KEY (session_id, model, task)
+             );
+             INSERT INTO sessions VALUES ('ses_rst', NULL);
+             INSERT INTO session_model_usage (session_id, model, task, input_tokens, output_tokens, actual_cost_usd, first_seen, last_seen)
+             VALUES ('ses_rst', 'openai/gpt-4o', '', 1000, 100, 0.010, 10.0, 10.0);",
+        ).unwrap();
+    }
+
+    let ledger_path = dir.path().join("ledger.db");
+    {
+        let mut ledger = Ledger::open(&ledger_path).unwrap();
+        let res1 = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
+        assert_eq!(res1.inserted, 1);
+
+        // Make cost disappear
+        let conn = rusqlite::Connection::open(&state_db_path).unwrap();
+        conn.execute(
+            "UPDATE session_model_usage SET actual_cost_usd = NULL, last_seen = 20.0 WHERE session_id = 'ses_rst'",
+            [],
+        ).unwrap();
+
+        let res2 = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
+        assert_eq!(res2.anomalies, 1);
+        assert_eq!(res2.inserted, 0);
+
+        // Replay on same ledger instance: strictly idempotent
+        let res2_replay = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
+        assert_eq!(res2_replay.anomalies, 0);
+        assert_eq!(res2_replay.inserted, 0);
+    } // Ledger closes here
+
+    // Simulate process restart: re-open ledger from disk
+    {
+        let mut ledger = Ledger::open(&ledger_path).unwrap();
+
+        // Replay again after restart: state was persisted in checkpoint table
+        let res2_after_restart =
+            import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
+        assert_eq!(res2_after_restart.anomalies, 0);
+        assert_eq!(res2_after_restart.inserted, 0);
+
+        // Cost returns as 18,000 micros ($0.018)
+        let conn = rusqlite::Connection::open(&state_db_path).unwrap();
+        conn.execute(
+            "UPDATE session_model_usage SET actual_cost_usd = 0.018, last_seen = 30.0 WHERE session_id = 'ses_rst'",
+            [],
+        ).unwrap();
+
+        let res3 = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
+        assert_eq!(res3.inserted, 1);
+
+        let delta_cost: i64 = ledger.connection().query_row(
+            "SELECT provider_reported_cost_micros FROM usage_events WHERE source_kind = 'hermes_snapshot_delta' ORDER BY observed_at DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(
+            delta_cost, 8000,
+            "delta cost after restart must be exactly 8,000 micros"
+        );
+
+        // Replay of cost return must be idempotent
+        let res3_replay = import_hermes_file(ledger.connection_mut(), &state_db_path).unwrap();
+        assert_eq!(res3_replay.inserted, 0);
+        assert_eq!(res3_replay.anomalies, 0);
+
+        let total_cost: i64 = ledger.connection().query_row(
+            "SELECT sum(provider_reported_cost_micros) FROM usage_events WHERE adapter = 'hermes'",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(total_cost, 18000);
+    }
 }
 
 #[test]

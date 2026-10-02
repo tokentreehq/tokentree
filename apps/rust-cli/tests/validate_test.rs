@@ -809,3 +809,158 @@ fn test_validate_require_live_clock_skew_tolerance() {
     assert!(stdout.contains("Live Capture:          verified"));
     assert!(stdout.contains("Overall Status: HEALTHY"));
 }
+
+fn setup_mock_cli_path(bin_dir: &std::path::Path, name: &str) -> std::ffi::OsString {
+    std::fs::create_dir_all(bin_dir).unwrap();
+    #[cfg(windows)]
+    {
+        let script = bin_dir.join(format!("{name}.cmd"));
+        std::fs::write(&script, "@echo off\r\n").unwrap();
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let script = bin_dir.join(name);
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+    }
+
+    let mut paths =
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect::<Vec<_>>();
+    paths.insert(0, bin_dir.to_path_buf());
+    std::env::join_paths(paths).unwrap()
+}
+
+#[test]
+fn test_validate_require_live_directory_creation_during_wait() {
+    let temp_home = tempdir().unwrap();
+    let mock_bin = temp_home.path().join("mock_bin");
+    let test_path = setup_mock_cli_path(&mock_bin, "grok");
+
+    // Initially, .grok directory does NOT exist at all!
+    let grok_dir = temp_home.path().join(".grok");
+    assert!(!grok_dir.exists());
+
+    let home_clone = temp_home.path().to_path_buf();
+    let handle = std::thread::spawn(move || {
+        // Sleep 1500ms so validate starts and enters live polling loop on the absent directory
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+
+        // Create directory and config during the wait
+        let ses_dir = home_clone
+            .join(".grok")
+            .join("sessions")
+            .join("ses_created");
+        std::fs::create_dir_all(&ses_dir).unwrap();
+        std::fs::write(home_clone.join(".grok").join("config.json"), "{}").unwrap();
+
+        let fresh_ts = chrono::Utc::now().to_rfc3339();
+        let fresh_content = format!(
+            r#"{{
+            "sessionId": "ses_created",
+            "updatedAt": "{fresh_ts}",
+            "session": {{ "inputTokens": 300, "outputTokens": 60, "primaryModelId": "grok-4" }},
+            "turns": [{{ "turnNumber": 1, "endedAt": "{fresh_ts}", "inputTokens": 300, "outputTokens": 60, "primaryModelId": "grok-4" }}]
+        }}"#
+        );
+        std::fs::write(ses_dir.join("usage.json"), fresh_content).unwrap();
+    });
+
+    let output = std::process::Command::new(bin_path())
+        .args(["validate", "--require-live", "--wait", "5", "grok"])
+        .env("HOME", temp_home.path())
+        .env("USERPROFILE", temp_home.path())
+        .env("PATH", test_path)
+        .output()
+        .expect("execute validate");
+
+    handle.join().unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "validation must detect directory creation and exit 0: {stdout}"
+    );
+    assert!(stdout.contains("Live Capture:          verified"));
+    assert!(stdout.contains("Overall Status: HEALTHY"));
+}
+
+#[test]
+fn test_validate_require_live_first_session_in_empty_directory() {
+    let temp_home = tempdir().unwrap();
+    let mock_bin = temp_home.path().join("mock_bin");
+    let test_path = setup_mock_cli_path(&mock_bin, "grok");
+
+    // Initially, .grok/sessions exists but is EMPTY (no sessions inside)
+    let sessions_dir = temp_home.path().join(".grok").join("sessions");
+    std::fs::create_dir_all(&sessions_dir).unwrap();
+    std::fs::write(temp_home.path().join(".grok").join("config.json"), "{}").unwrap();
+
+    let home_clone = temp_home.path().to_path_buf();
+    let handle = std::thread::spawn(move || {
+        // Sleep 1500ms so validate starts polling the empty sessions directory
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+
+        let ses_dir = home_clone.join(".grok").join("sessions").join("ses_first");
+        std::fs::create_dir_all(&ses_dir).unwrap();
+        let fresh_ts = chrono::Utc::now().to_rfc3339();
+        let fresh_content = format!(
+            r#"{{
+            "sessionId": "ses_first",
+            "updatedAt": "{fresh_ts}",
+            "session": {{ "inputTokens": 200, "outputTokens": 40, "primaryModelId": "grok-4" }},
+            "turns": [{{ "turnNumber": 1, "endedAt": "{fresh_ts}", "inputTokens": 200, "outputTokens": 40, "primaryModelId": "grok-4" }}]
+        }}"#
+        );
+        std::fs::write(ses_dir.join("usage.json"), fresh_content).unwrap();
+    });
+
+    let output = std::process::Command::new(bin_path())
+        .args(["validate", "--require-live", "--wait", "5", "grok"])
+        .env("HOME", temp_home.path())
+        .env("USERPROFILE", temp_home.path())
+        .env("PATH", test_path)
+        .output()
+        .expect("execute validate");
+
+    handle.join().unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "validation must detect first session in empty directory and exit 0: {stdout}"
+    );
+    assert!(stdout.contains("Live Capture:          verified"));
+    assert!(stdout.contains("Overall Status: HEALTHY"));
+}
+
+#[test]
+fn test_validate_require_live_installed_cli_timeout_without_telemetry() {
+    let temp_home = tempdir().unwrap();
+    let mock_bin = temp_home.path().join("mock_bin");
+    let test_path = setup_mock_cli_path(&mock_bin, "grok");
+
+    // Grok CLI is installed via mock_bin, but no telemetry directory or files exist
+    let output = std::process::Command::new(bin_path())
+        .args(["validate", "--require-live", "--wait", "1", "grok"])
+        .env("HOME", temp_home.path())
+        .env("USERPROFILE", temp_home.path())
+        .env("PATH", test_path)
+        .output()
+        .expect("execute validate");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "timeout without telemetry must exit with code 1"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("CLI Installed:         yes"));
+    assert!(stdout.contains("Host Telemetry:        not_found"));
+    assert!(stdout.contains("Live Capture:          failed"));
+    assert!(stdout.contains("Overall Status: FAILED"));
+}

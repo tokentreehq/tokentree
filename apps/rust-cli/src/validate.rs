@@ -620,18 +620,10 @@ fn validate_single_adapter(
     };
 
     let cli_installed = which_cli(cli_name);
-    let sessions_discovered = session_dir
+    let mut sessions_discovered = session_dir
         .as_ref()
         .is_some_and(|p| p.exists() && has_any_telemetry(p));
-    let config_present = config_path.as_ref().is_some_and(|p| p.exists());
-    let capture_available = cli_installed || sessions_discovered;
-
-    let capabilities = AdapterCapabilities {
-        cli_installed,
-        sessions_discovered,
-        config_present,
-        capture_available,
-    };
+    let mut config_present = config_path.as_ref().is_some_and(|p| p.exists());
 
     // 1. Adapter Parser Self-Test on versioned regression fixture
     let temp_dir = tempdir().context("create temporary validation ledger directory")?;
@@ -667,7 +659,7 @@ fn validate_single_adapter(
     };
 
     // 2. Provider Installation & Discovery Check
-    let provider_status = if options.self_test {
+    let mut provider_status = if options.self_test {
         ProviderStatus::Unavailable
     } else if cli_installed || sessions_discovered {
         ProviderStatus::Available
@@ -676,7 +668,7 @@ fn validate_single_adapter(
     };
 
     // 3. Configuration Check
-    let configuration_status = if options.self_test {
+    let mut configuration_status = if options.self_test {
         CheckStatus::NotRun
     } else {
         verify_configuration(adapter, config_path.as_deref())
@@ -695,13 +687,38 @@ fn validate_single_adapter(
     };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
 
+    let should_poll_live = options.require_live && (cli_installed || sessions_discovered);
+
     let telemetry_status = if options.self_test || options.fixture.is_some() {
         TelemetryStatus::NotRun
-    } else if !sessions_discovered {
+    } else if (!options.require_live && !sessions_discovered)
+        || (options.require_live && !should_poll_live)
+    {
         TelemetryStatus::NotFound
     } else {
         loop {
-            let found = discover_sample_sessions(adapter, session_dir.as_ref().unwrap());
+            // Recheck directory existence and telemetry discovery every polling interval
+            if let Some(s_dir) = &session_dir {
+                if s_dir.exists() && has_any_telemetry(s_dir) {
+                    sessions_discovered = true;
+                }
+            }
+            if let Some(c_dir) = &config_path {
+                if c_dir.exists() {
+                    config_present = true;
+                }
+            }
+
+            let found = if let Some(s_dir) = &session_dir {
+                if s_dir.exists() {
+                    discover_sample_sessions(adapter, s_dir)
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+
             if found.is_empty() {
                 if std::time::Instant::now() < deadline {
                     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -767,6 +784,7 @@ fn validate_single_adapter(
                             };
                             if is_fresh {
                                 fresh_event_observed = true;
+                                sessions_discovered = true;
                             }
                         }
                     }
@@ -789,6 +807,22 @@ fn validate_single_adapter(
 
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
+    };
+
+    if !options.self_test {
+        configuration_status = verify_configuration(adapter, config_path.as_deref());
+        provider_status = if cli_installed || sessions_discovered {
+            ProviderStatus::Available
+        } else {
+            ProviderStatus::Unavailable
+        };
+    }
+
+    let capabilities = AdapterCapabilities {
+        cli_installed,
+        sessions_discovered,
+        config_present,
+        capture_available: cli_installed || sessions_discovered,
     };
 
     // 5. Ledger Invariant & Integrity Checks
