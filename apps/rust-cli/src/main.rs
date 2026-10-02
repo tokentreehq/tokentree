@@ -641,6 +641,12 @@ fn report(home: &Path, project_filter: Option<&str>) -> Result<()> {
         "requests: {} measured {} unavailable {} anomalous {}",
         usage.requests, usage.measured, usage.unavailable, usage.anomalous
     );
+    if usage.vocabulary_notices > 0 {
+        println!(
+            "vocabulary notices: {} unmapped source kinds (informational, not counted against completeness)",
+            usage.vocabulary_notices
+        );
+    }
     println!(
         "tokens: input {} cache-read {} cache-write {} output {} reasoning {}",
         usage.input, usage.cache_read, usage.cache_write, usage.output, usage.reasoning
