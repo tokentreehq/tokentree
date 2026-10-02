@@ -7,6 +7,7 @@ use chrono::Utc;
 use clap::{Parser, Subcommand};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::SocketAddr;
@@ -15,9 +16,10 @@ use tokentree_claude::{discover_sessions, parse_session};
 use tokentree_core::{PriceSnapshot, token_completeness};
 use tokentree_ledger::{
     Ledger, ManualCounts, ManualStartInput, add_note, apply_prototype, attach_session,
-    detach_session, export_csv, export_html, export_json, load_project_trees, merge_work_items,
-    move_work_item, preview_prototype, query_ledger, rename_work_item, render_project_trees,
-    split_work_item, start_manual, stop_manual,
+    detach_session, ensure_session_attribution, export_csv, export_html, export_json,
+    load_project_trees, merge_work_items, move_work_item, preview_prototype, query_ledger,
+    rename_work_item, render_project_trees, session_stable_id, split_work_item, start_manual,
+    stop_manual,
 };
 
 const DISCLAIMER: &str = "Amounts are list-price estimates from public per-token rates unless labeled otherwise. They are not your provider invoice, prepaid credit balance, or subscription allowance.";
@@ -319,12 +321,27 @@ fn run() -> Result<()> {
             apply,
         } => migrate_prototype(&home, source, preview, apply),
         Command::OtlpServe { address } => {
+            // H2: the loopback receiver requires a per-run bearer secret so a
+            // malicious local process cannot append poisoned rows to the
+            // append-only ledger. Pin via TOKENTREE_OTLP_TOKEN for automation.
+            let auth = match std::env::var("TOKENTREE_OTLP_TOKEN") {
+                Ok(token) if !token.trim().is_empty() => tokentree_otel::OtlpAuth {
+                    bearer_token: token,
+                },
+                _ => tokentree_otel::OtlpAuth::generate(),
+            };
             println!("TokenTree OTLP receiver: http://{address}/v1/logs");
+            println!("Bearer token (required on every ingest request):");
+            println!("  {}\n", auth.bearer_token);
+            println!("Point the sender at this endpoint with:");
+            println!("  export OTEL_EXPORTER_OTLP_PROTOCOL=http/json");
+            println!("  export OTEL_EXPORTER_OTLP_ENDPOINT=http://{address}");
             println!(
-                "Set OTEL_EXPORTER_OTLP_PROTOCOL=http/json and point Claude Code logs to this loopback endpoint."
+                "  export OTEL_EXPORTER_OTLP_HEADERS=\"Authorization=Bearer {}\"",
+                auth.bearer_token
             );
             let ledger = ledger(&home)?;
-            tokio::runtime::Runtime::new()?.block_on(tokentree_otel::serve(address, ledger))
+            tokio::runtime::Runtime::new()?.block_on(tokentree_otel::serve(address, ledger, auth))
         }
     }
 }
@@ -477,9 +494,24 @@ fn import_claude(home: &Path, root: PathBuf) -> Result<()> {
         let parsed = parse_session(path)?;
         unknown += parsed.stats.unknown;
         malformed += parsed.stats.malformed;
+        // Collect session identities before ingest moves the observations.
+        let session_keys: HashSet<(String, String)> = parsed
+            .observations
+            .iter()
+            .map(|obs| (obs.adapter.clone(), obs.provider_session_id.clone()))
+            .collect();
         let summary = ledger.ingest(parsed.observations)?;
         inserted += summary.inserted;
         duplicates += summary.duplicates;
+        // Mirror the TypeScript import flow: every imported session gets a
+        // default project/work-item attribution so reports render trees
+        // instead of "No projects".
+        for (adapter, provider_session_id) in &session_keys {
+            ensure_session_attribution(
+                ledger.connection_mut(),
+                &session_stable_id(adapter, provider_session_id),
+            )?;
+        }
     }
     println!(
         "{}",

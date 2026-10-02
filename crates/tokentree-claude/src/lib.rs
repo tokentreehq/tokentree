@@ -6,7 +6,7 @@ use sha2::Digest;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use tokentree_core::{MeasurementSource, TokenUsage, UsageObservation};
+use tokentree_core::{MeasurementSource, TokenUsage, UsageObservation, canonical_source_kind};
 use walkdir::WalkDir;
 
 pub const ADAPTER_VERSION: &str = "0.2.0-rust";
@@ -18,6 +18,7 @@ pub struct ParseStats {
     pub unknown: u64,
     pub malformed: u64,
     pub unsupported: u64,
+    pub negative_deltas: u64,
 }
 
 #[derive(Debug)]
@@ -51,6 +52,11 @@ pub fn parse_session(path: &Path) -> Result<ParseResult> {
     let mut observations = Vec::new();
     let mut stats = ParseStats::default();
     let mut offset = 0_u64;
+    // Cumulative baselines keyed per session: usage_snapshot records carry
+    // cumulative counters, and only the delta since the previous snapshot for
+    // the same session is a real measurement.
+    let mut prior_snapshots: std::collections::HashMap<String, TokenUsage> =
+        std::collections::HashMap::new();
 
     for line in BufReader::new(file).lines() {
         let line = match line {
@@ -114,7 +120,8 @@ pub fn parse_session(path: &Path) -> Result<ParseResult> {
                     "cache_write_tokens",
                     "cacheWriteTokens",
                 ],
-            ),
+            )
+            .or_else(|| nested_cache_creation_tokens(usage_value)),
             output_tokens: count(usage_value, &["output_tokens", "outputTokens"]),
             reasoning_tokens: count(usage_value, &["reasoning_tokens", "reasoningTokens"]).or_else(
                 || {
@@ -129,65 +136,143 @@ pub fn parse_session(path: &Path) -> Result<ParseResult> {
             continue;
         }
         let record_type = string(&record, &["type"]).unwrap_or_default();
+        let session_id = string(&record, &["session_id", "sessionId"])
+            .unwrap_or_else(|| fallback_session.into());
+
+        // usage_snapshot records are cumulative counters, not deltas: emit only
+        // the delta against the previous snapshot for the same session.
+        if record_type == "usage_snapshot" {
+            if let Some(prior) = prior_snapshots.get(&session_id) {
+                match snapshot_delta(prior, &usage) {
+                    Some(delta) => {
+                        observations.push(build_observation(
+                            &record,
+                            &record_type,
+                            session_id.clone(),
+                            MeasurementSource::SnapshotDelta,
+                            delta,
+                            path,
+                            line_offset,
+                        ));
+                        stats.parsed += 1;
+                    }
+                    None => {
+                        // Counter reset or reorder: baseline moved backwards.
+                        // Do not emit; the new baseline becomes the reference.
+                        stats.negative_deltas += 1;
+                    }
+                }
+                prior_snapshots.insert(session_id, usage);
+            } else {
+                // First snapshot for this session: establishes the baseline,
+                // emits nothing (there is no earlier counter to diff against).
+                prior_snapshots.insert(session_id, usage);
+            }
+            continue;
+        }
+
         let source = match record_type.as_str() {
             "otel_api_request" => MeasurementSource::OfficialTelemetry,
             "provider_usage" => MeasurementSource::ProviderFields,
             _ => MeasurementSource::TranscriptRequest,
         };
-        let observed_at = Utc::now().to_rfc3339();
-        observations.push(UsageObservation {
-            adapter: "claude".into(),
+        observations.push(build_observation(
+            &record,
+            &record_type,
+            session_id,
             source,
-            source_subtype: if record_type.is_empty() {
-                None
-            } else {
-                Some(record_type)
-            },
-            source_event_id: string(&record, &["event_id", "uuid"]),
-            provider_session_id: string(&record, &["session_id", "sessionId"])
-                .unwrap_or_else(|| fallback_session.into()),
-            request_id: string(&record, &["request_id", "requestId"]).or_else(|| {
-                record
-                    .pointer("/message/id")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            }),
-            turn_id: string(&record, &["turn_id", "prompt_id", "promptId"]),
-            agent_id: string(&record, &["agent_id", "agentId"]),
-            parent_agent_id: string(&record, &["parent_agent_id", "parentAgentId"]),
-            source_timestamp: string(&record, &["timestamp"]),
-            observed_at,
-            model: string(&record, &["model"]).or_else(|| {
-                record
-                    .pointer("/message/model")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            }),
-            service_tier: string(&record, &["service_tier"]).or_else(|| {
-                usage_value
-                    .get("service_tier")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            }),
-            region: string(&record, &["region"]).or_else(|| {
-                usage_value
-                    .get("inference_geo")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            }),
             usage,
-            provider_reported_cost_micros: record.get("cost_micros").and_then(Value::as_u64),
-            source_path: path.display().to_string(),
-            source_offset: line_offset,
-            adapter_version: ADAPTER_VERSION.into(),
-            parser_version: PARSER_VERSION.into(),
-        });
+            path,
+            line_offset,
+        ));
         stats.parsed += 1;
     }
     Ok(ParseResult {
         observations,
         stats,
     })
+}
+
+/// Diff a cumulative usage snapshot against the previous cumulative for the
+/// same session. Returns `None` when any counter moved backwards (reset or
+/// reorder); a field that is missing on either side stays missing.
+fn snapshot_delta(before: &TokenUsage, after: &TokenUsage) -> Option<TokenUsage> {
+    let diff = |b: Option<u64>, a: Option<u64>| -> Option<Option<u64>> {
+        match (b, a) {
+            (Some(b), Some(a)) => a.checked_sub(b).map(Some),
+            _ => Some(None),
+        }
+    };
+    Some(TokenUsage {
+        input_tokens: diff(before.input_tokens, after.input_tokens)?,
+        cached_input_tokens: diff(before.cached_input_tokens, after.cached_input_tokens)?,
+        cache_write_tokens: diff(before.cache_write_tokens, after.cache_write_tokens)?,
+        output_tokens: diff(before.output_tokens, after.output_tokens)?,
+        reasoning_tokens: diff(before.reasoning_tokens, after.reasoning_tokens)?,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_observation(
+    record: &Value,
+    _record_type: &str,
+    session_id: String,
+    source: MeasurementSource,
+    usage: TokenUsage,
+    path: &Path,
+    line_offset: u64,
+) -> UsageObservation {
+    let usage_value = record
+        .get("usage")
+        .or_else(|| record.pointer("/message/usage"));
+    let observed_at = Utc::now().to_rfc3339();
+    UsageObservation {
+        adapter: "claude".into(),
+        source,
+        // source_subtype is intentionally unset: the raw transcript record
+        // "type" (e.g. "assistant", "user") is provider-internal and NOT part
+        // of the cross-language source_kind vocabulary. Writing it would make
+        // Rust-ingested rows disagree with TypeScript-ingested rows for the
+        // same observation (see tokentree_core::source_kind).
+        source_subtype: None,
+        source_event_id: string(record, &["event_id", "uuid"]),
+        provider_session_id: session_id,
+        request_id: string(record, &["request_id", "requestId"]).or_else(|| {
+            record
+                .pointer("/message/id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        }),
+        turn_id: string(record, &["turn_id", "prompt_id", "promptId"]),
+        agent_id: string(record, &["agent_id", "agentId"]),
+        parent_agent_id: string(record, &["parent_agent_id", "parentAgentId"]),
+        source_timestamp: string(record, &["timestamp"]),
+        observed_at,
+        model: string(record, &["model"]).or_else(|| {
+            record
+                .pointer("/message/model")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        }),
+        service_tier: string(record, &["service_tier"]).or_else(|| {
+            usage_value
+                .and_then(|v| v.get("service_tier"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        }),
+        region: string(record, &["region"]).or_else(|| {
+            usage_value
+                .and_then(|v| v.get("inference_geo"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        }),
+        usage,
+        provider_reported_cost_micros: record.get("cost_micros").and_then(Value::as_u64),
+        source_path: path.display().to_string(),
+        source_offset: line_offset,
+        adapter_version: ADAPTER_VERSION.into(),
+        parser_version: PARSER_VERSION.into(),
+    }
 }
 
 fn string(value: &Value, keys: &[&str]) -> Option<String> {
@@ -197,6 +282,23 @@ fn string(value: &Value, keys: &[&str]) -> Option<String> {
 fn count(value: &Value, keys: &[&str]) -> Option<u64> {
     keys.iter()
         .find_map(|key| value.get(*key).and_then(Value::as_u64))
+}
+
+/// Real Claude transcripts nest cache-creation counters under
+/// `usage.cache_creation` (e.g. `ephemeral_1h_input_tokens`,
+/// `ephemeral_5m_input_tokens`). Sum the present fields; report a measurement
+/// only when at least one nested field exists.
+fn nested_cache_creation_tokens(usage_value: &Value) -> Option<u64> {
+    let creation = usage_value.get("cache_creation")?;
+    let mut total = 0_u64;
+    let mut present = false;
+    for key in ["ephemeral_1h_input_tokens", "ephemeral_5m_input_tokens"] {
+        if let Some(v) = creation.get(key).and_then(Value::as_u64) {
+            present = true;
+            total = total.saturating_add(v);
+        }
+    }
+    present.then_some(total)
 }
 
 pub fn import_claude_file(
@@ -306,7 +408,7 @@ pub fn import_claude_file(
             rusqlite::params![
                 format!("evt_{}", &evt_hash[..16]),
                 obs.adapter,
-                obs.source_subtype.as_deref().unwrap_or("claude_transcript"),
+                canonical_source_kind(obs),
                 obs.source_event_id,
                 session_id,
                 turn_db_id,
@@ -378,6 +480,9 @@ pub fn import_claude_file(
     if parse_res.stats.malformed > 0 {
         anomaly_types.push("malformed_record".to_string());
     }
+    if parse_res.stats.negative_deltas > 0 {
+        anomaly_types.push("negative_delta".to_string());
+    }
 
     Ok(tokentree_core::AdapterImportResult {
         inserted,
@@ -411,5 +516,88 @@ mod tests {
         assert_eq!(row.usage.input_tokens, Some(10));
         assert_eq!(row.usage.output_tokens, Some(5));
         assert!(result.stats.unknown > 0);
+    }
+
+    #[test]
+    fn usage_snapshots_become_per_session_deltas() {
+        // C4: cumulative usage_snapshot records must be diffed per session,
+        // not summed as if they were deltas.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("snapshots.jsonl");
+        let content = concat!(
+            "{\"type\":\"usage_snapshot\",\"session_id\":\"s1\",\"usage\":{\"input_tokens\":100,\"output_tokens\":40}}\n",
+            "{\"type\":\"usage_snapshot\",\"session_id\":\"s2\",\"usage\":{\"input_tokens\":50,\"output_tokens\":20}}\n",
+            "{\"type\":\"usage_snapshot\",\"session_id\":\"s1\",\"usage\":{\"input_tokens\":150,\"output_tokens\":60}}\n",
+            "{\"type\":\"usage_snapshot\",\"session_id\":\"s2\",\"usage\":{\"input_tokens\":90,\"output_tokens\":35}}\n",
+        );
+        std::fs::write(&path, content).unwrap();
+
+        let result = parse_session(&path).unwrap();
+        // Two baselines emit nothing; two deltas are emitted.
+        assert_eq!(result.stats.parsed, 2);
+        assert_eq!(result.stats.negative_deltas, 0);
+
+        let delta_s1 = result
+            .observations
+            .iter()
+            .find(|o| o.provider_session_id == "s1")
+            .expect("s1 delta emitted");
+        assert_eq!(delta_s1.usage.input_tokens, Some(50));
+        assert_eq!(delta_s1.usage.output_tokens, Some(20));
+        assert_eq!(delta_s1.source, MeasurementSource::SnapshotDelta);
+
+        let delta_s2 = result
+            .observations
+            .iter()
+            .find(|o| o.provider_session_id == "s2")
+            .expect("s2 delta emitted");
+        // s2 must diff against s2's own baseline, not s1's.
+        assert_eq!(delta_s2.usage.input_tokens, Some(40));
+        assert_eq!(delta_s2.usage.output_tokens, Some(15));
+    }
+
+    #[test]
+    fn negative_snapshot_delta_is_anomaly_not_observation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("reset.jsonl");
+        let content = concat!(
+            "{\"type\":\"usage_snapshot\",\"session_id\":\"s1\",\"usage\":{\"input_tokens\":100,\"output_tokens\":40}}\n",
+            "{\"type\":\"usage_snapshot\",\"session_id\":\"s1\",\"usage\":{\"input_tokens\":30,\"output_tokens\":10}}\n",
+            "{\"type\":\"usage_snapshot\",\"session_id\":\"s1\",\"usage\":{\"input_tokens\":60,\"output_tokens\":25}}\n",
+        );
+        std::fs::write(&path, content).unwrap();
+
+        let result = parse_session(&path).unwrap();
+        assert_eq!(result.stats.negative_deltas, 1);
+        // Only the post-reset delta is emitted, diffed against the reset baseline.
+        assert_eq!(result.stats.parsed, 1);
+        let delta = &result.observations[0];
+        assert_eq!(delta.usage.input_tokens, Some(30));
+        assert_eq!(delta.usage.output_tokens, Some(15));
+    }
+
+    #[test]
+    fn nested_cache_creation_fields_are_parsed() {
+        // H9: real transcripts nest cache creation under usage.cache_creation.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cache.jsonl");
+        let content = "{\"type\":\"assistant\",\"session_id\":\"s1\",\"message\":{\"usage\":{\"input_tokens\":100,\"output_tokens\":10,\"cache_creation\":{\"ephemeral_1h_input_tokens\":500,\"ephemeral_5m_input_tokens\":250}}}}\n";
+        std::fs::write(&path, content).unwrap();
+
+        let result = parse_session(&path).unwrap();
+        let obs = result.observations.first().expect("one observation");
+        assert_eq!(obs.usage.cache_write_tokens, Some(750));
+    }
+
+    #[test]
+    fn flat_cache_creation_key_takes_precedence_over_nested() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cache_flat.jsonl");
+        let content = "{\"type\":\"assistant\",\"session_id\":\"s1\",\"message\":{\"usage\":{\"input_tokens\":100,\"cache_creation_input_tokens\":42,\"cache_creation\":{\"ephemeral_1h_input_tokens\":500}}}}\n";
+        std::fs::write(&path, content).unwrap();
+
+        let result = parse_session(&path).unwrap();
+        let obs = result.observations.first().expect("one observation");
+        assert_eq!(obs.usage.cache_write_tokens, Some(42));
     }
 }
