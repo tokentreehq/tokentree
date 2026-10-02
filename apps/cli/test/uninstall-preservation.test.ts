@@ -43,6 +43,11 @@ describe('Criterion 18: Real isolated npm install and uninstall data preservatio
         XDG_CONFIG_HOME: isolatedXdgConfig,
         npm_config_prefix: isolatedPrefix,
         TOKENTREE_HOME: isolatedTokenTreeHome,
+        // The isolated prefix has no native binary, so the launcher would
+        // fail fast (audit C8). This test exercises npm install/uninstall
+        // data preservation, not binary discovery — opt into the TypeScript
+        // reference engine explicitly.
+        TOKENTREE_FORCE_JS: '1',
       };
 
       // 2. Install packed tarball globally into isolated prefix
