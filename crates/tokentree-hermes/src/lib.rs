@@ -437,7 +437,7 @@ pub fn parse_json_usage_str(
     } else {
         (
             MeasurementSource::ProviderFields,
-            "hermes_oneshot_usage".to_string(),
+            source_kind::HERMES_ONESHOT_USAGE.to_string(),
         )
     };
 

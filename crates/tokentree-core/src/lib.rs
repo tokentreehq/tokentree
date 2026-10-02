@@ -168,6 +168,7 @@ pub mod source_kind {
     pub const GROK_SESSION_USAGE: &str = "grok_session_usage";
     pub const HERMES_FAILED_RUN: &str = "hermes_failed_run";
     pub const HERMES_UNMEASURED: &str = "hermes_unmeasured";
+    pub const HERMES_ONESHOT_USAGE: &str = "hermes_oneshot_usage";
     pub const HERMES_SESSION_MODEL_USAGE: &str = "hermes_session_model_usage";
 
     // Ledger-originated kinds.
@@ -224,6 +225,7 @@ pub mod source_kind {
                 | GROK_SESSION_USAGE
                 | HERMES_FAILED_RUN
                 | HERMES_UNMEASURED
+                | HERMES_ONESHOT_USAGE
                 | HERMES_SESSION_MODEL_USAGE
                 | MANUAL_STOP
                 | PROTOTYPE_JSON
