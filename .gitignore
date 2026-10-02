@@ -6,3 +6,4 @@ coverage/
 *.db-wal
 .DS_Store
 target/
+*.tgz

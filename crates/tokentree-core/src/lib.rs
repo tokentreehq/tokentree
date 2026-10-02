@@ -73,6 +73,20 @@ impl TokenUsage {
     }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AdapterImportResult {
+    pub inserted: u64,
+    pub duplicates: u64,
+    pub malformed: u64,
+    pub unsupported: u64,
+    pub anomalies: u64,
+    pub anomaly_types: Vec<String>,
+    pub latest_event_identity: Option<String>,
+    pub latest_authoritative_timestamp: Option<chrono::DateTime<chrono::Utc>>,
+    pub start_offset: u64,
+    pub end_offset: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UsageObservation {
     pub adapter: String,
@@ -103,6 +117,11 @@ pub struct UsageObservation {
 impl UsageObservation {
     #[must_use]
     pub fn canonical_identity(&self) -> String {
+        if self.source == MeasurementSource::SnapshotDelta {
+            if let Some(event) = &self.source_event_id {
+                return format!("{}:delta:{event}", self.adapter);
+            }
+        }
         if let Some(request) = &self.request_id {
             return format!("{}:request:{request}", self.adapter);
         }

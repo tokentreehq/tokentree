@@ -1,0 +1,30 @@
+{
+  "sessionId": "grok_no_cost_123",
+  "updatedAt": "2026-09-22T04:16:15.000Z",
+  "session": {
+    "inputTokens": 500,
+    "outputTokens": 200,
+    "cachedReadTokens": 100,
+    "cacheCreationTokens": 0,
+    "reasoningTokens": 50,
+    "totalTokens": 700,
+    "modelCalls": 1,
+    "turnCount": 1,
+    "primaryModelId": "grok-4.7-build"
+  },
+  "turns": [
+    {
+      "turnNumber": 1,
+      "endedAt": "2026-09-22T04:16:15.000Z",
+      "inputTokens": 500,
+      "outputTokens": 200,
+      "cachedReadTokens": 100,
+      "cacheCreationTokens": 0,
+      "reasoningTokens": 50,
+      "totalTokens": 700,
+      "modelCalls": 1,
+      "turnCount": 1,
+      "primaryModelId": "grok-4.7-build"
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "version": 999,
+  "input_tokens": 1000,
+  "output_tokens": 500,
+  "model": "future/hermes-model-99",
+  "provider": "openrouter",
+  "session_id": "hermes_unknown_version_99",
+  "completed": true,
+  "failed": false
+}

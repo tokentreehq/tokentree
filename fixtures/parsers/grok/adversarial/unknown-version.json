@@ -1,0 +1,10 @@
+{
+  "version": 999,
+  "sessionId": "grok_unknown_version_99",
+  "updatedAt": "2026-09-22T04:16:15.000Z",
+  "session": {
+    "inputTokens": 500,
+    "outputTokens": 200,
+    "primaryModelId": "grok-future-99"
+  }
+}

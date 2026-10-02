@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 mod dashboard;
+mod validate;
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
@@ -38,6 +39,24 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Doctor,
+    Validate {
+        #[arg(value_name = "ADAPTER")]
+        adapter: Option<String>,
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        self_test: bool,
+        #[arg(long)]
+        require_live: bool,
+        #[arg(long, value_name = "SECONDS")]
+        wait: Option<u64>,
+        #[arg(long, value_name = "PATH")]
+        fixture: Option<PathBuf>,
+        #[arg(long, value_name = "PATH")]
+        output: Option<PathBuf>,
+        #[arg(long)]
+        local_details: bool,
+    },
     Import {
         #[command(subcommand)]
         source: ImportSource,
@@ -160,6 +179,8 @@ enum Command {
 enum ImportSource {
     Claude { path: Option<PathBuf> },
     Codex { path: Option<PathBuf> },
+    Grok { path: Option<PathBuf> },
+    Hermes { path: Option<PathBuf> },
 }
 
 fn main() {
@@ -186,12 +207,43 @@ fn run() -> Result<()> {
     match command {
         Command::HookEnqueue => enqueue_hook(&home),
         Command::Doctor => doctor(&home),
+        Command::Validate {
+            adapter,
+            all,
+            self_test,
+            require_live,
+            wait,
+            fixture,
+            output,
+            local_details,
+        } => {
+            let exit_code = validate::run_validation(validate::ValidateOptions {
+                adapter,
+                all,
+                self_test,
+                require_live,
+                wait,
+                fixture,
+                output,
+                local_details,
+            })?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+            Ok(())
+        }
         Command::Import {
             source: ImportSource::Claude { path },
         } => import_claude(&home, path.unwrap_or_else(default_claude_path)),
         Command::Import {
             source: ImportSource::Codex { path },
         } => import_codex(&home, path.unwrap_or_else(default_codex_path)),
+        Command::Import {
+            source: ImportSource::Grok { path },
+        } => import_grok(&home, path.unwrap_or_else(default_grok_path)),
+        Command::Import {
+            source: ImportSource::Hermes { path },
+        } => import_hermes(&home, path.unwrap_or_else(default_hermes_path)),
         Command::Report {
             text,
             html,
@@ -295,6 +347,27 @@ fn default_codex_path() -> PathBuf {
         .join(".codex/sessions")
 }
 
+fn default_grok_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".grok/sessions")
+}
+
+fn default_hermes_path() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(local_appdata) = std::env::var_os("LOCALAPPDATA") {
+            let path = PathBuf::from(local_appdata).join("hermes");
+            if path.exists() {
+                return path;
+            }
+        }
+    }
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".hermes")
+}
+
 fn ledger(home: &Path) -> Result<Ledger> {
     Ledger::open(home.join("ledger.db"))
 }
@@ -313,9 +386,13 @@ fn doctor(home: &Path) -> Result<()> {
     let ledger = ledger(home)?;
     let claude = default_claude_path();
     let codex = default_codex_path();
+    let grok = default_grok_path();
+    let hermes = default_hermes_path();
     println!("database: {}", ledger.path().display());
     println!("Claude transcripts: {}", claude.display());
     println!("Codex sessions: {}", codex.display());
+    println!("Grok sessions: {}", grok.display());
+    println!("Hermes state/sessions: {}", hermes.display());
     println!("TokenTree home: {}", home.display());
     println!(
         "Claude capture mode: {}",
@@ -329,6 +406,22 @@ fn doctor(home: &Path) -> Result<()> {
         "Codex capture mode: {}",
         if codex.exists() {
             "rollout/app-server logs"
+        } else {
+            "manual/unavailable"
+        }
+    );
+    println!(
+        "Grok capture mode: {}",
+        if grok.exists() {
+            "usage.json telemetry"
+        } else {
+            "manual/unavailable"
+        }
+    );
+    println!(
+        "Hermes capture mode: {}",
+        if hermes.exists() {
+            "state.db / usage-file reports"
         } else {
             "manual/unavailable"
         }
@@ -414,6 +507,50 @@ fn import_codex(home: &Path, root: PathBuf) -> Result<()> {
         "{}",
         serde_json::to_string_pretty(&json!({
             "sessions": sessions.len(), "inserted": inserted, "duplicates": duplicates,
+            "anomalies": anomalies,
+        }))?
+    );
+    Ok(())
+}
+
+fn import_grok(home: &Path, root: PathBuf) -> Result<()> {
+    let sessions = tokentree_grok::discover_sessions(&root);
+    let mut ledger = ledger(home)?;
+    let mut inserted = 0;
+    let mut duplicates = 0;
+    let mut anomalies = 0;
+    for path in &sessions {
+        let res = tokentree_grok::import_grok_file(ledger.connection_mut(), path)?;
+        inserted += res.inserted;
+        duplicates += res.duplicates;
+        anomalies += res.anomalies;
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "sessions": sessions.len(), "inserted": inserted, "duplicates": duplicates,
+            "anomalies": anomalies,
+        }))?
+    );
+    Ok(())
+}
+
+fn import_hermes(home: &Path, root: PathBuf) -> Result<()> {
+    let sessions = tokentree_hermes::discover_sessions(&root);
+    let mut ledger = ledger(home)?;
+    let mut inserted = 0;
+    let mut duplicates = 0;
+    let mut anomalies = 0;
+    for path in &sessions {
+        let res = tokentree_hermes::import_hermes_file(ledger.connection_mut(), path)?;
+        inserted += res.inserted;
+        duplicates += res.duplicates;
+        anomalies += res.anomalies;
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "sources": sessions.len(), "inserted": inserted, "duplicates": duplicates,
             "anomalies": anomalies,
         }))?
     );

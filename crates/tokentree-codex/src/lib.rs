@@ -66,14 +66,7 @@ pub struct ParseResult {
     pub final_state: CodexParserState,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct CodexImportResult {
-    pub inserted: u64,
-    pub duplicates: u64,
-    pub anomalies: u64,
-    pub start_offset: u64,
-    pub end_offset: u64,
-}
+pub type CodexImportResult = tokentree_core::AdapterImportResult;
 
 #[must_use]
 pub fn discover_sessions(root: &Path) -> Vec<PathBuf> {
@@ -781,7 +774,12 @@ pub fn import_codex_file(connection: &mut Connection, path: &Path) -> Result<Cod
         return Ok(CodexImportResult {
             inserted: 0,
             duplicates: 0,
+            malformed: 0,
+            unsupported: 0,
             anomalies: 0,
+            anomaly_types: Vec::new(),
+            latest_event_identity: None,
+            latest_authoritative_timestamp: None,
             start_offset,
             end_offset: start_offset,
         });
@@ -801,7 +799,12 @@ pub fn import_codex_file(connection: &mut Connection, path: &Path) -> Result<Cod
             return Ok(CodexImportResult {
                 inserted: 0,
                 duplicates: 0,
+                malformed: 0,
+                unsupported: 0,
                 anomalies: 0,
+                anomaly_types: Vec::new(),
+                latest_event_identity: None,
+                latest_authoritative_timestamp: None,
                 start_offset,
                 end_offset: start_offset,
             });
@@ -990,10 +993,42 @@ pub fn import_codex_file(connection: &mut Connection, path: &Path) -> Result<Cod
 
     tx.commit()?;
 
+    let mut anomaly_types = std::collections::BTreeSet::new();
+    for anom in &parse_res.anomalies {
+        anomaly_types.insert(anom.anomaly_type.clone());
+    }
+    let unsupported = parse_res
+        .anomalies
+        .iter()
+        .filter(|a| a.anomaly_type == "unsupported_version")
+        .count() as u64;
+
+    let latest_event_identity = parse_res
+        .observations
+        .last()
+        .map(|o| o.canonical_identity())
+        .or(last_event_hash);
+
+    let latest_authoritative_timestamp = parse_res
+        .observations
+        .iter()
+        .filter_map(|o| {
+            o.source_timestamp
+                .as_deref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        })
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .max();
+
     Ok(CodexImportResult {
         inserted,
         duplicates,
+        malformed: parse_res.stats.malformed,
+        unsupported,
         anomalies: parse_res.anomalies.len() as u64,
+        anomaly_types: anomaly_types.into_iter().collect(),
+        latest_event_identity,
+        latest_authoritative_timestamp,
         start_offset,
         end_offset,
     })

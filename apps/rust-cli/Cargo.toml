@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "tokentree"
 path = "src/main.rs"
@@ -22,11 +25,15 @@ sha2.workspace = true
 tokentree-claude = { path = "../../crates/tokentree-claude" }
 tokentree-codex = { path = "../../crates/tokentree-codex" }
 tokentree-core = { path = "../../crates/tokentree-core" }
+tokentree-grok = { path = "../../crates/tokentree-grok" }
+tokentree-hermes = { path = "../../crates/tokentree-hermes" }
 tokentree-ledger = { path = "../../crates/tokentree-ledger" }
 tokentree-otel = { path = "../../crates/tokentree-otel" }
 tokio.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 tower.workspace = true
 http-body-util.workspace = true
+rusqlite.workspace = true
