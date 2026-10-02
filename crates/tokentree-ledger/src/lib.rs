@@ -11,9 +11,10 @@ pub mod tree;
 pub use audit::{LeakageAuditResult, audit_prompt_leakage};
 
 pub use corrections::{
-    add_note, attach_session, detach_session, ensure_session_attribution,
-    ensure_session_attribution_for_source, merge_work_items, move_work_item, reclassify_work_item,
-    rename_work_item, split_work_item, validate_group_invariant,
+    MergePlan, SplitPlan, add_note, attach_session, detach_session, ensure_session_attribution,
+    ensure_session_attribution_for_source, merge_work_items, move_work_item, plan_merge_work_items,
+    plan_split_work_item, reclassify_work_item, rename_work_item, split_work_item,
+    validate_group_invariant,
 };
 pub use export::{csv_escape, export_csv, export_html, export_json, html_escape};
 pub use manual::{
@@ -25,6 +26,7 @@ pub use repair::{
     PRE_DELTA_FIX_PARSER_VERSIONS, SNAPSHOT_OVERCOUNT_REPAIR_KIND,
     SNAPSHOT_OVERCOUNT_REPAIR_VERSION, SnapshotRepairOutcome, SnapshotRepairPlan,
     apply_snapshot_overcount_repair, plan_snapshot_overcount_repair, restore_snapshot_repair,
+    snapshot_generation_conflicts,
 };
 pub use spool::HookWorkerSummary;
 pub use tree::{
@@ -608,6 +610,9 @@ pub struct AggregateUsage {
     pub measured: u64,
     pub unavailable: u64,
     pub anomalous: u64,
+    /// Vocabulary/migration notices (e.g. `unmapped_source_kind`).
+    /// Informational only — NOT counted against completeness.
+    pub vocabulary_notices: u64,
     pub input: u64,
     pub cache_read: u64,
     pub cache_write: u64,
@@ -615,6 +620,19 @@ pub struct AggregateUsage {
     pub reasoning: u64,
     /// True when subagent capability is unknown and totals may be inaccurate
     pub completeness_degraded: bool,
+}
+
+/// Anomaly types that are vocabulary/migration notices rather than
+/// measurement gaps. A custom `source_kind` seen during migration is
+/// operator information, not missing data — it must not depress the
+/// completeness percentage.
+pub const VOCABULARY_NOTICE_TYPES: &[&str] = &["unmapped_source_kind"];
+
+/// True when an anomaly `type` is an informational vocabulary/migration
+/// notice rather than a measurement-quality problem.
+#[must_use]
+pub fn is_vocabulary_notice(anomaly_type: &str) -> bool {
+    VOCABULARY_NOTICE_TYPES.contains(&anomaly_type)
 }
 
 /// Compute aggregate usage, applying the subagent accounting policy.
@@ -627,14 +645,25 @@ pub struct AggregateUsage {
 pub fn aggregate_usage_with_policy(connection: &Connection) -> Result<AggregateUsage> {
     let policy = resolve_subagent_policy(connection);
 
-    let anomalous: u64 = connection
-        .query_row(
-            "SELECT count(*) FROM measurement_anomalies WHERE resolved_at IS NULL",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .unwrap_or(0)
-        .max(0) as u64;
+    // Vocabulary/migration notices are informational, not measurement gaps:
+    // they are counted separately and excluded from the completeness math.
+    let notice_list = VOCABULARY_NOTICE_TYPES
+        .iter()
+        .map(|t| format!("'{t}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let count_anomalies = |notice_only: bool| -> Result<u64> {
+        let query = format!(
+            "SELECT count(*) FROM measurement_anomalies WHERE resolved_at IS NULL AND type {}IN ({notice_list})",
+            if notice_only { "" } else { "NOT " },
+        );
+        Ok(connection
+            .query_row(&query, [], |row| row.get::<_, i64>(0))
+            .unwrap_or(0)
+            .max(0) as u64)
+    };
+    let anomalous: u64 = count_anomalies(false)?;
+    let vocabulary_notices: u64 = count_anomalies(true)?;
 
     let is_subagent = "(ue.parent_agent_id IS NOT NULL OR ue.source_kind LIKE '%subagent%' OR ue.session_id IN (SELECT s.id FROM sessions s WHERE s.root_session_id IS NOT NULL AND s.root_session_id <> s.id))";
     let is_covered_turn_counter = format!(
@@ -667,6 +696,7 @@ pub fn aggregate_usage_with_policy(connection: &Connection) -> Result<AggregateU
                         measured: row.get::<_, i64>(1)? as u64,
                         unavailable: row.get::<_, i64>(2)? as u64,
                         anomalous,
+                        vocabulary_notices,
                         input: row.get::<_, i64>(3)? as u64,
                         cache_read: row.get::<_, i64>(4)? as u64,
                         cache_write: row.get::<_, i64>(5)? as u64,
@@ -698,6 +728,7 @@ pub fn aggregate_usage_with_policy(connection: &Connection) -> Result<AggregateU
                         measured: row.get::<_, i64>(1)? as u64,
                         unavailable: row.get::<_, i64>(2)? as u64,
                         anomalous,
+                        vocabulary_notices,
                         input: row.get::<_, i64>(3)? as u64,
                         cache_read: row.get::<_, i64>(4)? as u64,
                         cache_write: row.get::<_, i64>(5)? as u64,
@@ -743,6 +774,7 @@ pub fn aggregate_usage_with_policy(connection: &Connection) -> Result<AggregateU
                         measured: row.get::<_, i64>(1)? as u64,
                         unavailable: row.get::<_, i64>(2)? as u64,
                         anomalous,
+                        vocabulary_notices,
                         input: row.get::<_, i64>(3)? as u64,
                         cache_read: row.get::<_, i64>(4)? as u64,
                         cache_write: row.get::<_, i64>(5)? as u64,
@@ -1095,6 +1127,26 @@ pub fn restore_source_kind_backup(connection: &Connection) -> Result<u64> {
         let _ = connection.execute_batch("ROLLBACK;");
     }
     result
+}
+
+/// Number of rows currently held in the `source_kind_migration_backup`
+/// table (0 when the migration never ran). Used by `--dry-run` previews and
+/// by the CLI to report a no-op instead of erroring on an empty backup.
+pub fn count_source_kind_backup_rows(connection: &Connection) -> Result<u64> {
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'source_kind_migration_backup')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Ok(0);
+    }
+    let count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM source_kind_migration_backup",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count.max(0) as u64)
 }
 
 #[cfg(unix)]

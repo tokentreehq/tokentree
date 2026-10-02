@@ -10,8 +10,8 @@ use tokentree_core::{
     MeasurementSource, TokenUsage, UsageObservation, canonical_source_kind, sha256_hex, source_kind,
 };
 use tokentree_ledger::{
-    Ledger, ingest_observations_tx, migrate_source_kind_vocabulary, restore_source_kind_backup,
-    session_stable_id, stable_id,
+    Ledger, count_source_kind_backup_rows, ingest_observations_tx, migrate_source_kind_vocabulary,
+    restore_source_kind_backup, session_stable_id, stable_id,
 };
 
 fn obs(
@@ -757,5 +757,35 @@ fn migration_records_zero_row_version_on_clean_db() {
     assert_eq!(
         row,
         Some(("normalize_source_kind_vocabulary".to_string(), 1, 0))
+    );
+}
+
+#[test]
+fn count_source_kind_backup_rows_tracks_migration() {
+    let mut ledger = Ledger::open_memory().unwrap();
+    // Fresh ledger: migration ran at init but rewrote nothing.
+    assert_eq!(
+        count_source_kind_backup_rows(ledger.connection()).unwrap(),
+        0
+    );
+
+    clear_migration_version(&mut ledger);
+    insert_raw_event(&mut ledger, "a", "assistant");
+    insert_raw_event(&mut ledger, "p", "provider_usage");
+    insert_raw_event(&mut ledger, "x", "banana");
+
+    let rewritten = migrate_source_kind_vocabulary(ledger.connection_mut()).unwrap();
+    assert_eq!(rewritten, 2);
+    assert_eq!(
+        count_source_kind_backup_rows(ledger.connection()).unwrap(),
+        2
+    );
+
+    // Restore keeps the backup table (auditable), so the count is unchanged.
+    let restored = restore_source_kind_backup(ledger.connection_mut()).unwrap();
+    assert_eq!(restored, 2);
+    assert_eq!(
+        count_source_kind_backup_rows(ledger.connection()).unwrap(),
+        2
     );
 }
