@@ -38,14 +38,16 @@ You can install the official `@tokentreehq/cli` binary wrapper via npm or downlo
 npm install -g @tokentreehq/cli
 ```
 
-`@tokentreehq/cli` is a launcher for the Rust measurement engine: it also needs
-the native `tokentree` binary for your platform. Download the matching
-`tokentree-<target>.tar.gz` (or `.zip` on Windows) from
-[GitHub Releases](https://github.com/tokentreehq/tokentree/releases), extract
-the `tokentree` binary into the package's `vendor/<target>/` directory
-(e.g. `…/node_modules/@tokentreehq/cli/vendor/x86_64-unknown-linux-gnu/`), or
-set `TOKENTREE_BIN=/path/to/tokentree`. If no binary is found, the launcher
-fails with instructions instead of silently degrading.
+`@tokentreehq/cli` ships the prebuilt native `tokentree` binary for every
+supported platform inside the package (`vendor/<target>/`), so the install
+works out of the box — including offline — with no post-install download.
+The launcher (`dist/main.js`) picks the binary matching your platform and
+delegates to it; the bundled checksums (`vendor/SHA256SUMS.txt`) are verified
+during the release build.
+
+If you need to override the binary (custom build, dev checkout), set
+`TOKENTREE_BIN=/path/to/tokentree`. If no binary is found for your platform,
+the launcher fails with instructions instead of silently degrading.
 
 ### Prebuilt Binary (GitHub Releases)
 Download the latest release archive from [https://github.com/tokentreehq/tokentree/releases](https://github.com/tokentreehq/tokentree/releases), extract `tokentree`, and move it into your `$PATH` (e.g., `/usr/local/bin` or `%USERPROFILE%\bin`).

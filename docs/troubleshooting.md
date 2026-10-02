@@ -58,3 +58,27 @@ If an import is interrupted, rerun:
 tokentree import claude
 ```
 TokenTree resumes from the exact byte offset without creating duplicate events.
+
+---
+
+## 4. Repairing Historical Snapshot Overcounting
+
+Databases created before the C4 fix store Claude `usage_snapshot` rows as full
+cumulatives instead of per-session deltas, inflating historical totals.
+`tokentree repair snapshot-overcount` recomputes the deltas in place:
+
+```bash
+# Preview what would change (writes nothing):
+tokentree repair snapshot-overcount --dry-run
+
+# Apply the repair (backs up every touched row first):
+tokentree repair snapshot-overcount --yes
+
+# Undo a repair run (restores the most recent backup by default):
+tokentree repair snapshot-overcount --restore
+```
+
+Safety properties: every affected row is copied to `snapshot_repair_backups`
+before any write; the repair is idempotent (completion is recorded in
+`maintenance_log`, so re-running is a no-op); all writes happen inside a
+single transaction. Only rows written by pre-fix parsers are touched.

@@ -166,8 +166,19 @@ fn c2_legacy_source_kinds_normalized_on_open() {
             )
             .unwrap();
     }
-    // Reopen: the idempotent migration runs.
+    // Reopen: the versioned migration runs (the version row is cleared first
+    // to simulate a database written before the migration existed; without
+    // that, reopen is a deliberate no-op).
     {
+        let ledger = Ledger::open(&db_path).unwrap();
+        ledger
+            .connection()
+            .execute(
+                "DELETE FROM applied_migrations WHERE name = 'normalize_source_kind_vocabulary'",
+                [],
+            )
+            .unwrap();
+        drop(ledger);
         let ledger = Ledger::open(&db_path).unwrap();
         let kinds: std::collections::HashMap<String, String> = ledger
             .connection()
