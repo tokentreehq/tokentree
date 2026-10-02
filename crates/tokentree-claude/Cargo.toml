@@ -17,3 +17,4 @@ walkdir.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tokentree-ledger = { path = "../tokentree-ledger" }

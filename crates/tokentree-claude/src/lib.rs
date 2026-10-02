@@ -10,7 +10,11 @@ use tokentree_core::{MeasurementSource, TokenUsage, UsageObservation, canonical_
 use walkdir::WalkDir;
 
 pub const ADAPTER_VERSION: &str = "0.2.0-rust";
-pub const PARSER_VERSION: &str = "0.2.0-rust";
+/// Bumped for the C4 fix: `usage_snapshot` records are now diffed per session
+/// into deltas instead of being stored as full cumulatives. The repair
+/// command (`tokentree repair snapshot-overcount`) targets rows written by
+/// older parser versions.
+pub const PARSER_VERSION: &str = "0.2.1-rust";
 
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct ParseStats {
