@@ -17,15 +17,6 @@
       "path": "packages/adapters/claude"
     },
     {
-      "path": "packages/adapters/codex"
-    },
-    {
-      "path": "packages/adapters/grok"
-    },
-    {
-      "path": "packages/adapters/hermes"
-    },
-    {
       "path": "apps/cli"
     }
   ]

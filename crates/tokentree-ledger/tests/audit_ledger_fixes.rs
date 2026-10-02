@@ -592,3 +592,114 @@ fn medium_wal_journal_mode_honored_on_open() {
     drop(ledger);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn r3_is_vocabulary_notice_classifies_correctly() {
+    use tokentree_ledger::is_vocabulary_notice;
+    assert!(is_vocabulary_notice("unmapped_source_kind"));
+    assert!(!is_vocabulary_notice("malformed_record"));
+    assert!(!is_vocabulary_notice("unsupported_version"));
+    assert!(!is_vocabulary_notice("negative_delta"));
+    assert!(!is_vocabulary_notice(""));
+}
+
+#[test]
+fn r3_vocabulary_notices_excluded_from_completeness() {
+    use tokentree_core::token_completeness;
+    use tokentree_ledger::is_vocabulary_notice;
+
+    let dir = std::env::temp_dir().join(format!("tokentree-vocab-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("ledger.db");
+    let mut ledger = Ledger::open(&db_path).unwrap();
+
+    // 4 measured requests.
+    for i in 0..4 {
+        ledger
+            .ingest(vec![observation(
+                "claude",
+                "ses_vocab",
+                MeasurementSource::TranscriptRequest,
+                None,
+                &format!("req-vocab-{i}"),
+                100,
+                10,
+            )])
+            .unwrap();
+    }
+
+    // A vocabulary notice: legitimate custom kind seen during migration.
+    // Must NOT depress completeness.
+    ledger
+        .record_anomaly(
+            None,
+            None,
+            "unmapped_source_kind",
+            "{\"kind\":\"my_custom_kind\"}",
+        )
+        .unwrap();
+    assert!(is_vocabulary_notice("unmapped_source_kind"));
+
+    let agg = ledger.aggregate_usage().unwrap();
+    assert_eq!(
+        agg.vocabulary_notices, 1,
+        "notice must be counted separately"
+    );
+    assert_eq!(
+        agg.anomalous, 0,
+        "notice must not count as measurement anomaly"
+    );
+    assert_eq!(agg.measured, 4);
+
+    let completeness = token_completeness(agg.measured, agg.unavailable, agg.anomalous);
+    assert_eq!(
+        completeness,
+        Some(100.0),
+        "vocabulary notice must not depress completeness"
+    );
+
+    drop(ledger);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn r3_measurement_anomalies_still_depress_completeness() {
+    use tokentree_core::token_completeness;
+
+    let dir = std::env::temp_dir().join(format!("tokentree-meas-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("ledger.db");
+    let mut ledger = Ledger::open(&db_path).unwrap();
+
+    for i in 0..4 {
+        ledger
+            .ingest(vec![observation(
+                "claude",
+                "ses_meas",
+                MeasurementSource::TranscriptRequest,
+                None,
+                &format!("req-meas-{i}"),
+                100,
+                10,
+            )])
+            .unwrap();
+    }
+
+    // A genuine measurement-quality anomaly.
+    ledger
+        .record_anomaly(None, None, "malformed_record", "{}")
+        .unwrap();
+
+    let agg = ledger.aggregate_usage().unwrap();
+    assert_eq!(agg.anomalous, 1);
+    assert_eq!(agg.vocabulary_notices, 0);
+
+    let completeness = token_completeness(agg.measured, agg.unavailable, agg.anomalous);
+    assert!(
+        completeness.unwrap() < 100.0,
+        "measurement anomaly must depress completeness, got {completeness:?}"
+    );
+
+    drop(ledger);
+    std::fs::remove_dir_all(&dir).ok();
+}
