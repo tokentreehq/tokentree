@@ -131,7 +131,7 @@ fn load_single_project_tree(connection: &Connection, project: &ProjectRow) -> Re
     };
 
     let is_covered = format!(
-        "(ue.source_kind IN ({turn_counters}) AND EXISTS (SELECT 1 FROM usage_events d WHERE d.session_id = ue.session_id AND d.turn_id IS NOT NULL AND d.turn_id = ue.turn_id AND d.source_kind NOT IN ({turn_counters}, {lifecycle})))",
+        "(ue.source_kind IN ({turn_counters}) AND EXISTS (SELECT 1 FROM usage_events d WHERE d.session_id = ue.session_id AND d.turn_id IS NOT NULL AND d.turn_id = ue.turn_id AND d.superseded_by IS NULL AND d.source_kind NOT IN ({turn_counters}, {lifecycle})))",
         turn_counters = source_kind::TURN_COUNTER_SQL_LIST,
         lifecycle = source_kind::LIFECYCLE_COUNTER_SQL_LIST,
     );
@@ -216,6 +216,7 @@ fn load_single_project_tree(connection: &Connection, project: &ProjectRow) -> Re
          LEFT JOIN attribution_groups ag ON ag.id = a.group_id AND ag.active = 1
          LEFT JOIN usage_spans us ON us.id = ag.usage_span_id
          LEFT JOIN usage_events ue ON ue.id = json_extract(us.measured_usage_json, '$.usage_event_id')
+           AND ue.superseded_by IS NULL
          LEFT JOIN cost_calculations cc ON cc.rowid = (
              SELECT c2.rowid FROM cost_calculations c2 WHERE c2.usage_event_id = ue.id ORDER BY c2.calculated_at DESC LIMIT 1
          )

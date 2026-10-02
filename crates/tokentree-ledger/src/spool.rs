@@ -98,7 +98,17 @@ pub fn process_claude_hook_spool(
                     // event would then stall every future run forever.
                     Err(e) => {
                         drop(savepoint);
-                        quarantine_poison_event(&quarantine_path, trimmed, &e);
+                        // Quarantine metadata only: the raw hook line may
+                        // contain prompt text and must never hit disk.
+                        // `current_offset` is this line's start byte offset.
+                        quarantine_poison_event(
+                            &quarantine_path,
+                            "claude-hook",
+                            &event.kind,
+                            current_offset,
+                            &line,
+                            &e,
+                        );
                         summary.quarantined += 1;
                     }
                 }
@@ -145,12 +155,21 @@ fn quarantine_path_for(spool_path: &Path) -> std::path::PathBuf {
     spool_path.with_file_name(format!("{stem}.quarantine.jsonl"))
 }
 
-/// Persist a poison spool event for later inspection (H3). Best-effort by
-/// design: quarantining must never itself fail ingestion, so all IO errors
-/// are swallowed after a stderr notice. The quarantine file gets the same
-/// 0600 treatment as the spool file on unix since it may contain hook
-/// payloads.
-fn quarantine_poison_event(quarantine_path: &Path, raw_line: &str, error: &anyhow::Error) {
+/// Persist a poison spool event's *sanitized metadata* for later inspection
+/// (H3). Privacy constitution: hook payloads may contain prompt text, so the
+/// raw line is NEVER persisted — only a SHA-256 fingerprint the operator can
+/// match against their own spool/transcript files for diagnosis. Best-effort
+/// by design: quarantining must never itself fail ingestion, so all IO errors
+/// are swallowed after a stderr notice. The quarantine file keeps the 0600
+/// treatment as defense-in-depth.
+fn quarantine_poison_event(
+    quarantine_path: &Path,
+    adapter: &str,
+    event_kind: &str,
+    source_offset: u64,
+    raw_line: &str,
+    error: &anyhow::Error,
+) {
     use std::io::Write as _;
     if let Some(parent) = quarantine_path.parent() {
         if fs::create_dir_all(parent).is_err() {
@@ -169,8 +188,12 @@ fn quarantine_poison_event(quarantine_path: &Path, raw_line: &str, error: &anyho
         Ok(mut file) => {
             let record = serde_json::json!({
                 "quarantined_at": chrono::Utc::now().to_rfc3339(),
+                "adapter": adapter,
+                "label": "poison hook event rejected",
+                "event_kind": event_kind,
+                "event_fingerprint": tokentree_core::sha256_hex(raw_line.as_bytes()),
+                "source_offset": source_offset,
                 "error": error.to_string(),
-                "raw_line": raw_line,
             });
             if writeln!(file, "{record}").is_err() {
                 eprintln!("tokentree: failed to write quarantined spool event: {error}");
@@ -184,7 +207,7 @@ fn quarantine_poison_event(quarantine_path: &Path, raw_line: &str, error: &anyho
         }
     }
     eprintln!(
-        "tokentree: quarantined poison spool event -> {}: {error}",
+        "tokentree: quarantined poison spool event metadata -> {}: {error}",
         quarantine_path.display()
     );
 }
@@ -472,15 +495,91 @@ mod tests {
             .unwrap();
         assert_eq!(session_count, 2);
 
-        // The poison event is preserved in the quarantine file.
+        // The quarantine file holds sanitized metadata only: the raw hook
+        // payload (including the canary session id) must never be persisted,
+        // per the privacy constitution.
         let quarantine_path = dir.path().join("claude-hooks.quarantine.jsonl");
         let quarantined = std::fs::read_to_string(&quarantine_path).unwrap();
-        assert!(quarantined.contains("ses_poison"));
+        assert!(
+            !quarantined.contains("ses_poison"),
+            "raw hook payload leaked into quarantine file"
+        );
+        assert!(!quarantined.contains("ses_good_1"));
+        assert!(quarantined.contains("poison hook event rejected"));
+        assert!(quarantined.contains("\"adapter\":\"claude-hook\""));
+        assert!(quarantined.contains("\"event_kind\":\"UserPromptSubmit\""));
+        assert!(quarantined.contains("event_fingerprint"));
+        assert!(quarantined.contains("source_offset"));
+        // The error message is metadata, not payload content.
         assert!(quarantined.contains("forbidden capability"));
+        // The fingerprint identifies the exact raw line for forensics.
+        let poison_line = format!("{}\n", hook("ses_poison", &poison_cwd));
+        let expected_fp = tokentree_core::sha256_hex(poison_line.as_bytes());
+        assert!(
+            quarantined.contains(&expected_fp),
+            "quarantine must carry the raw line's fingerprint"
+        );
 
         // Re-running must not stall on the poison event: checkpoint advanced.
         let summary2 = ledger.process_claude_hook_spool(&spool_path).unwrap();
         assert_eq!(summary2.processed, 0);
         assert_eq!(summary2.quarantined, 0);
+    }
+
+    #[test]
+    fn quarantine_never_persists_prompt_like_or_huge_payloads() {
+        let dir = tempdir().unwrap();
+        let spool_path = dir.path().join("claude-hooks.jsonl");
+
+        let poison_cwd = dir.path().join("poison-proj");
+        std::fs::create_dir_all(&poison_cwd).unwrap();
+        // Forbidden capability key -> resolve_project fails -> apply fails.
+        std::fs::write(
+            poison_cwd.join(".tokentree.yml"),
+            "project: poison\nexec: /bin/true\n",
+        )
+        .unwrap();
+
+        // Adversarial payloads: prompt-like text with a canary, and a 1 MiB
+        // blob. Both must fail apply (poison cwd) and be quarantined without
+        // their bytes ever touching the quarantine file.
+        let canary = "CANARY_PROMPT_do_not_persist_9f8e7d6c";
+        let huge_blob = format!("{canary}_{}", "_".repeat(1048576));
+        let hook = |payload_extra: &str| {
+            format!(
+                "{{\"version\":1,\"kind\":\"UserPromptSubmit\",\"capturedAt\":\"2026-09-29T10:00:00Z\",\
+                 \"payload\":{{\"session_id\":\"ses_adv\",\"cwd\":\"{}\",\"prompt\":{}}}}}",
+                poison_cwd.to_str().unwrap().replace('\\', "\\\\"),
+                payload_extra,
+            )
+        };
+        let line1 = hook(&format!("\"please {canary} summarize my secrets\""));
+        let line2 = hook(&serde_json::to_string(&huge_blob).unwrap());
+        std::fs::write(&spool_path, format!("{line1}\n{line2}\n")).unwrap();
+
+        let mut ledger = Ledger::open_memory().unwrap();
+        let summary = ledger.process_claude_hook_spool(&spool_path).unwrap();
+        assert_eq!(summary.quarantined, 2);
+        assert_eq!(summary.processed, 0);
+
+        let quarantine_path = dir.path().join("claude-hooks.quarantine.jsonl");
+        let quarantined = std::fs::read_to_string(&quarantine_path).unwrap();
+        assert_eq!(quarantined.lines().count(), 2);
+        assert!(
+            !quarantined.contains(canary),
+            "prompt canary leaked into quarantine file"
+        );
+        assert!(
+            !quarantined.contains("summarize my secrets"),
+            "prompt text leaked into quarantine file"
+        );
+        // Metadata survived.
+        assert!(quarantined.contains("event_fingerprint"));
+        assert!(quarantined.contains("\"event_kind\":\"UserPromptSubmit\""));
+        // Fingerprints match the exact raw lines.
+        for raw in [&format!("{line1}\n"), &format!("{line2}\n")] {
+            let fp = tokentree_core::sha256_hex(raw.as_bytes());
+            assert!(quarantined.contains(&fp), "missing fingerprint for a line");
+        }
     }
 }
