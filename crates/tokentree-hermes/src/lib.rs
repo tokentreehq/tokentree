@@ -8,7 +8,9 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use tokentree_core::{MeasurementSource, TokenUsage, UsageObservation};
+use tokentree_core::{
+    MeasurementSource, TokenUsage, UsageObservation, canonical_source_kind, source_kind,
+};
 use walkdir::WalkDir;
 
 pub const ADAPTER_VERSION: &str = "0.2.0-rust";
@@ -427,9 +429,9 @@ pub fn parse_json_usage_str(
         (
             MeasurementSource::Unavailable,
             if is_failed {
-                "hermes_failed_run".to_string()
+                source_kind::HERMES_FAILED_RUN.to_string()
             } else {
-                "hermes_unmeasured".to_string()
+                source_kind::HERMES_UNMEASURED.to_string()
             },
         )
     } else {
@@ -538,7 +540,11 @@ pub fn parse_json_usage_str(
                 let aux_obs = UsageObservation {
                     adapter: "hermes".to_string(),
                     source: task_source,
-                    source_subtype: Some(format!("hermes_auxiliary_{}", task_name)),
+                    source_subtype: Some(format!(
+                        "{}{}",
+                        source_kind::HERMES_AUXILIARY_PREFIX,
+                        task_name
+                    )),
                     source_event_id: Some(format!("hermes:{}:aux:{}", session_id, task_name)),
                     provider_session_id: session_id.clone(),
                     request_id: Some(format!("hermes:{}:aux:{}", session_id, task_name)),
@@ -825,9 +831,9 @@ pub fn parse_hermes_state_db(db_path: &Path, since_timestamp: Option<f64>) -> Re
             adapter: "hermes".to_string(),
             source,
             source_subtype: Some(if provider.is_empty() {
-                "hermes_session_model_usage".to_string()
+                source_kind::HERMES_SESSION_MODEL_USAGE.to_string()
             } else {
-                format!("hermes_usage_{}", provider)
+                format!("{}{}", source_kind::HERMES_USAGE_PREFIX, provider)
             }),
             source_event_id: Some(format!("hermes:{}:{}:{}", session_id, model, task)),
             provider_session_id: session_id.clone(),
@@ -1186,7 +1192,7 @@ pub fn import_hermes_file(connection: &mut Connection, path: &Path) -> Result<He
                 if tokens_increased || cost_increased {
                     let mut delta_obs = obs.clone();
                     delta_obs.source = tokentree_core::MeasurementSource::SnapshotDelta;
-                    delta_obs.source_subtype = Some("hermes_snapshot_delta".to_string());
+                    delta_obs.source_subtype = Some(source_kind::HERMES_SNAPSHOT_DELTA.to_string());
                     delta_obs.request_id = obs.request_id.clone();
                     delta_obs.source_event_id = Some(format!(
                         "{row_key}:delta:te{token_epoch}ts{token_sequence}:ce{cost_epoch}cs{cost_sequence}"
@@ -1220,7 +1226,7 @@ pub fn import_hermes_file(connection: &mut Connection, path: &Path) -> Result<He
                 params![
                     format!("evt_{}", &evt_hash[..16]),
                     to_insert.adapter,
-                    to_insert.source_subtype.as_deref().unwrap_or(to_insert.source.as_str()),
+                    canonical_source_kind(&to_insert),
                     to_insert.source_event_id,
                     session_id,
                     turn_db_id,
