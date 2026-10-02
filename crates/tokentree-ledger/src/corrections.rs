@@ -463,6 +463,145 @@ pub fn validate_group_invariant(connection: &Connection, group_id: &str) -> Resu
     Ok(())
 }
 
+/// Read-only preview of what [`merge_work_items`] would change.
+/// Runs the same validation as the real merge but writes nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergePlan {
+    pub source_id: String,
+    pub target_id: String,
+    /// Active attribution groups that would be superseded.
+    pub attribution_groups: u64,
+    /// Child work items that would be reparented to the target.
+    pub child_work_items: u64,
+    /// Notes that would be reparented to the target.
+    pub notes: u64,
+}
+
+pub fn plan_merge_work_items(
+    connection: &Connection,
+    source_id: &str,
+    target_id: &str,
+) -> Result<MergePlan> {
+    if source_id == target_id {
+        bail!("Cannot merge work item into itself");
+    }
+
+    let source_project: String = connection
+        .query_row(
+            "SELECT project_id FROM work_items WHERE id = ?1",
+            [source_id],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("Source work item {source_id} not found"))?;
+    let source_status: String = connection
+        .query_row(
+            "SELECT status FROM work_items WHERE id = ?1",
+            [source_id],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("Source work item {source_id} not found"))?;
+    let target_project: String = connection
+        .query_row(
+            "SELECT project_id FROM work_items WHERE id = ?1",
+            [target_id],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("Target work item {target_id} not found"))?;
+
+    if source_project != target_project {
+        bail!("Cross-project merge rejected: source and target must belong to the same project");
+    }
+    if source_status == "merged" {
+        bail!("Source work item {source_id} is already merged");
+    }
+
+    let attribution_groups: i64 = connection.query_row(
+        "SELECT COUNT(DISTINCT ag.id)
+         FROM attribution_groups ag
+         JOIN attributions a ON a.group_id = ag.id
+         WHERE a.work_item_id = ?1 AND ag.active = 1",
+        [source_id],
+        |row| row.get(0),
+    )?;
+    let child_work_items: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM work_items WHERE parent_id = ?1",
+        [source_id],
+        |row| row.get(0),
+    )?;
+    let notes: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM notes WHERE work_item_id = ?1",
+        [source_id],
+        |row| row.get(0),
+    )?;
+
+    Ok(MergePlan {
+        source_id: source_id.to_string(),
+        target_id: target_id.to_string(),
+        attribution_groups: attribution_groups as u64,
+        child_work_items: child_work_items as u64,
+        notes: notes as u64,
+    })
+}
+
+/// Read-only preview of what [`split_work_item`] would change.
+/// Runs the same validation as the real split but writes nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitPlan {
+    pub source_id: String,
+    pub new_title: String,
+    /// Spans that would move to the new work item.
+    pub spans: u64,
+}
+
+pub fn plan_split_work_item(
+    connection: &Connection,
+    source_id: &str,
+    new_title: &str,
+    span_ids: &[String],
+) -> Result<SplitPlan> {
+    let title = new_title.trim();
+    if title.is_empty() {
+        bail!("Split work item title cannot be empty");
+    }
+    if span_ids.is_empty() {
+        bail!("Must select at least one usage span to split");
+    }
+
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM work_items WHERE id = ?1)",
+        [source_id],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        bail!("Source work item {source_id} not found");
+    }
+
+    let mut valid_spans = 0u64;
+    for span_id in span_ids {
+        let valid: bool = connection.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM attribution_groups ag
+                 JOIN attributions a ON a.group_id = ag.id
+                 WHERE ag.usage_span_id = ?1 AND a.work_item_id = ?2 AND ag.active = 1
+             )",
+            rusqlite::params![span_id, source_id],
+            |row| row.get(0),
+        )?;
+        if !valid {
+            bail!(
+                "Invalid span selection: span {span_id} is not currently actively attributed to work item {source_id}"
+            );
+        }
+        valid_spans += 1;
+    }
+
+    Ok(SplitPlan {
+        source_id: source_id.to_string(),
+        new_title: title.to_string(),
+        spans: valid_spans,
+    })
+}
+
 pub fn merge_work_items(
     connection: &mut Connection,
     source_id: &str,
@@ -1589,5 +1728,152 @@ mod tests {
         for g in active_groups {
             validate_group_invariant(ledger.connection(), &g).unwrap();
         }
+    }
+
+    #[test]
+    fn plan_merge_reports_counts_and_validates_without_writing() {
+        let mut ledger = Ledger::open_memory().unwrap();
+        let run = start_manual(
+            ledger.connection_mut(),
+            ManualStartInput {
+                project_key: "space-game",
+                project_title: Some("Space Game"),
+                task_title: "Fix collision bug",
+                parent_title: None,
+                cwd: "/tmp/game",
+            },
+        )
+        .unwrap();
+        stop_manual(ledger.connection_mut(), Default::default()).unwrap();
+
+        let target_id = stable_id("wi", "space-game:target-task");
+        ledger
+            .connection_mut()
+            .execute(
+                "INSERT INTO work_items (id, project_id, type, title, status, created_at)
+                 VALUES (?1, ?2, 'task', 'Target Task', 'open', '2026-09-29T10:00:00Z')",
+                params![target_id, run.project_id],
+            )
+            .unwrap();
+        add_note(
+            ledger.connection_mut(),
+            "Important bug note",
+            Some(&run.work_item_id),
+        )
+        .unwrap();
+
+        let plan =
+            plan_merge_work_items(ledger.connection(), &run.work_item_id, &target_id).unwrap();
+        assert_eq!(plan.source_id, run.work_item_id);
+        assert_eq!(plan.target_id, target_id);
+        assert_eq!(plan.attribution_groups, 1);
+        assert_eq!(plan.notes, 1);
+        assert_eq!(plan.child_work_items, 0);
+
+        // Planning wrote nothing: source still open, groups still active.
+        let status: String = ledger
+            .connection()
+            .query_row(
+                "SELECT status FROM work_items WHERE id = ?1",
+                [&run.work_item_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "open");
+        let active: i64 = ledger
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM attribution_groups WHERE active = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active, 1);
+
+        // Validation mirrors the real merge.
+        assert!(
+            plan_merge_work_items(ledger.connection(), &run.work_item_id, &run.work_item_id)
+                .is_err()
+        );
+        assert!(plan_merge_work_items(ledger.connection(), "no-such-item", &target_id).is_err());
+        assert!(
+            plan_merge_work_items(ledger.connection(), &run.work_item_id, "no-such-item").is_err()
+        );
+    }
+
+    #[test]
+    fn plan_split_reports_span_count_and_validates_without_writing() {
+        let mut ledger = Ledger::open_memory().unwrap();
+        let run = start_manual(
+            ledger.connection_mut(),
+            ManualStartInput {
+                project_key: "space-game",
+                project_title: Some("Space Game"),
+                task_title: "Fix collision bug",
+                parent_title: None,
+                cwd: "/tmp/game",
+            },
+        )
+        .unwrap();
+        stop_manual(ledger.connection_mut(), Default::default()).unwrap();
+
+        let span_id: String = ledger
+            .connection()
+            .query_row(
+                "SELECT usage_span_id FROM attribution_groups WHERE active = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let plan = plan_split_work_item(
+            ledger.connection(),
+            &run.work_item_id,
+            "Extracted subtask",
+            std::slice::from_ref(&span_id),
+        )
+        .unwrap();
+        assert_eq!(plan.source_id, run.work_item_id);
+        assert_eq!(plan.new_title, "Extracted subtask");
+        assert_eq!(plan.spans, 1);
+
+        // Planning wrote nothing: no new work item, group still active.
+        let wi_count: i64 = ledger
+            .connection()
+            .query_row("SELECT count(*) FROM work_items", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(wi_count, 1);
+        let active: i64 = ledger
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM attribution_groups WHERE active = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active, 1);
+
+        // Validation mirrors the real split.
+        assert!(
+            plan_split_work_item(
+                ledger.connection(),
+                &run.work_item_id,
+                "  ",
+                std::slice::from_ref(&span_id)
+            )
+            .is_err()
+        );
+        assert!(
+            plan_split_work_item(ledger.connection(), &run.work_item_id, "Title", &[]).is_err()
+        );
+        assert!(
+            plan_split_work_item(
+                ledger.connection(),
+                &run.work_item_id,
+                "Title",
+                &["no-such-span".to_string()]
+            )
+            .is_err()
+        );
     }
 }

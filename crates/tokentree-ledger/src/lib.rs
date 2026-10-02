@@ -11,9 +11,10 @@ pub mod tree;
 pub use audit::{LeakageAuditResult, audit_prompt_leakage};
 
 pub use corrections::{
-    add_note, attach_session, detach_session, ensure_session_attribution,
-    ensure_session_attribution_for_source, merge_work_items, move_work_item, reclassify_work_item,
-    rename_work_item, split_work_item, validate_group_invariant,
+    MergePlan, SplitPlan, add_note, attach_session, detach_session, ensure_session_attribution,
+    ensure_session_attribution_for_source, merge_work_items, move_work_item, plan_merge_work_items,
+    plan_split_work_item, reclassify_work_item, rename_work_item, split_work_item,
+    validate_group_invariant,
 };
 pub use export::{csv_escape, export_csv, export_html, export_json, html_escape};
 pub use manual::{
@@ -25,6 +26,7 @@ pub use repair::{
     PRE_DELTA_FIX_PARSER_VERSIONS, SNAPSHOT_OVERCOUNT_REPAIR_KIND,
     SNAPSHOT_OVERCOUNT_REPAIR_VERSION, SnapshotRepairOutcome, SnapshotRepairPlan,
     apply_snapshot_overcount_repair, plan_snapshot_overcount_repair, restore_snapshot_repair,
+    snapshot_generation_conflicts,
 };
 pub use spool::HookWorkerSummary;
 pub use tree::{
@@ -1095,6 +1097,26 @@ pub fn restore_source_kind_backup(connection: &Connection) -> Result<u64> {
         let _ = connection.execute_batch("ROLLBACK;");
     }
     result
+}
+
+/// Number of rows currently held in the `source_kind_migration_backup`
+/// table (0 when the migration never ran). Used by `--dry-run` previews and
+/// by the CLI to report a no-op instead of erroring on an empty backup.
+pub fn count_source_kind_backup_rows(connection: &Connection) -> Result<u64> {
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'source_kind_migration_backup')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Ok(0);
+    }
+    let count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM source_kind_migration_backup",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count.max(0) as u64)
 }
 
 #[cfg(unix)]

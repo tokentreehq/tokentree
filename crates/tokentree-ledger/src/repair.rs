@@ -31,6 +31,47 @@ use tokentree_core::source_kind;
 pub const SNAPSHOT_OVERCOUNT_REPAIR_KIND: &str = "snapshot_overcount_repair";
 /// Bump when the repair algorithm changes.
 pub const SNAPSHOT_OVERCOUNT_REPAIR_VERSION: &str = "1";
+/// Sessions whose stored `snapshot_delta` rows were written by a different
+/// parser generation than `incoming_parser_version`.
+///
+/// Pre-fix (`0.2.0-rust`) rows store full cumulatives; post-fix rows store
+/// per-session deltas. The two cannot dedup by identity, so importing one
+/// generation over the other silently double-counts. Callers (import paths)
+/// should warn loudly and point at `repair snapshot-overcount --dry-run` —
+/// never silently proceed, never block the import.
+pub fn snapshot_generation_conflicts(
+    connection: &Connection,
+    session_ids: &[String],
+    incoming_parser_version: &str,
+) -> Result<Vec<String>> {
+    let incoming_old = PRE_DELTA_FIX_PARSER_VERSIONS.contains(&incoming_parser_version);
+    let mut conflicts = Vec::new();
+    for session_id in session_ids {
+        let mut stmt = connection.prepare(
+            "SELECT DISTINCT parser_version FROM usage_events
+             WHERE source_kind = ?1 AND session_id = ?2",
+        )?;
+        let existing: Vec<String> = stmt
+            .query_map(params![source_kind::SNAPSHOT_DELTA, session_id], |row| {
+                row.get(0)
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        if existing.is_empty() {
+            continue;
+        }
+        let existing_old = existing
+            .iter()
+            .any(|v| PRE_DELTA_FIX_PARSER_VERSIONS.contains(&v.as_str()));
+        let existing_new = existing
+            .iter()
+            .any(|v| !PRE_DELTA_FIX_PARSER_VERSIONS.contains(&v.as_str()));
+        if (incoming_old && existing_new) || (!incoming_old && existing_old) {
+            conflicts.push(session_id.clone());
+        }
+    }
+    Ok(conflicts)
+}
+
 /// Parser versions whose `snapshot_delta` rows store full cumulatives.
 /// Must stay in sync with `tokentree_claude::PARSER_VERSION` history:
 // `0.2.0-rust` predates the C4 per-session delta fix (`0.2.1-rust`).
@@ -822,5 +863,40 @@ mod tests {
             row_tokens(ledger.connection(), "m2"),
             (Some(50), None, None, Some(10), None)
         );
+    }
+
+    #[test]
+    fn snapshot_generation_conflicts_detects_mixed_parser_generations() {
+        let ledger = Ledger::open_memory().unwrap();
+        let conn = ledger.connection();
+
+        // Old-generation rows for ses_old.
+        insert_snapshot_row(conn, "g1", "ses_old", 0, (100, 0, 0, 40, 0), "0.2.0-rust");
+        // New-generation rows for ses_new.
+        insert_snapshot_row(conn, "g2", "ses_new", 0, (50, 0, 0, 20, 0), "0.2.1-rust");
+
+        // Incoming new over stored old -> conflict.
+        let conflicts =
+            snapshot_generation_conflicts(conn, &["ses_old".to_string()], "0.2.1-rust").unwrap();
+        assert_eq!(conflicts, vec!["ses_old".to_string()]);
+
+        // Incoming old over stored new -> conflict (downgrade path).
+        let conflicts =
+            snapshot_generation_conflicts(conn, &["ses_new".to_string()], "0.2.0-rust").unwrap();
+        assert_eq!(conflicts, vec!["ses_new".to_string()]);
+
+        // Same generation both sides -> no conflict.
+        let conflicts =
+            snapshot_generation_conflicts(conn, &["ses_old".to_string()], "0.2.0-rust").unwrap();
+        assert!(conflicts.is_empty());
+        let conflicts =
+            snapshot_generation_conflicts(conn, &["ses_new".to_string()], "0.2.1-rust").unwrap();
+        assert!(conflicts.is_empty());
+
+        // Session with no stored snapshots -> no conflict.
+        let conflicts =
+            snapshot_generation_conflicts(conn, &["ses_missing".to_string()], "0.2.1-rust")
+                .unwrap();
+        assert!(conflicts.is_empty());
     }
 }
