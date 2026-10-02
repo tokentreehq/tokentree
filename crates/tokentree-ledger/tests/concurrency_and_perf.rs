@@ -293,7 +293,7 @@ fn test_hook_spool_p95_benchmark_under_100ms() {
             r#"{{"version":1,"kind":"hook","capturedAt":"2026-09-29T10:00:00Z","payload":{{"session_id":"ses_spool_bench","cwd":"{cwd_escaped}","hook_name":"UserPromptSubmit","prompt_fingerprint":"fp_bench_{i}","prompt_storage_mode":"fingerprint_only"}}}}"#
         ));
     }
-    std::fs::write(&spool_path, lines.join("\n")).unwrap();
+    std::fs::write(&spool_path, lines.join("\n") + "\n").unwrap();
 
     let start = Instant::now();
     let summary = ledger.process_claude_hook_spool(&spool_path).unwrap();

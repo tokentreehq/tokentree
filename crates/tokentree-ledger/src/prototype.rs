@@ -111,6 +111,15 @@ pub fn apply_prototype(
     let backup_path = backup_dir.join(format!("prototype-{}-{}", now.timestamp_millis(), filename));
     fs::write(&backup_path, &raw_bytes)?;
 
+    // M6: the whole import runs in a single transaction (same pattern as the
+    // source_kind vocabulary migration). Previously each row's observation
+    // ingest ran in its own transaction (`ingest_observations` opens one per
+    // call) while the surrounding INSERTs were autocommit, so a crash or an
+    // error mid-import left a partially imported prototype with no clean
+    // resume path. Now any failure rolls back every row. The backup above is
+    // written before the transaction; a rollback never deletes the backup.
+    let tx = connection.transaction()?;
+
     let mut inserted = 0;
     let mut duplicates = 0;
     let mut measured = 0;
@@ -166,7 +175,7 @@ pub fn apply_prototype(
         };
 
         let prj_key = slug_key(project_name);
-        connection.execute(
+        tx.execute(
             "INSERT OR IGNORE INTO projects(
                 id, key, display_name, identity_hash, detection_method, confidence, created_at, updated_at
             ) VALUES(?,?,?,?,?,?,?,?)",
@@ -182,7 +191,7 @@ pub fn apply_prototype(
             ],
         )?;
 
-        connection.execute(
+        tx.execute(
             "INSERT OR IGNORE INTO work_items(
                 id, project_id, type, title, status, confidence, classifier_version, created_at
             ) VALUES(?,?,?,?,?,?,?,?)",
@@ -198,12 +207,12 @@ pub fn apply_prototype(
             ],
         )?;
 
-        let sum = crate::ingest_observations(connection, vec![observation])?;
+        let sum = crate::ingest_observations_tx(&tx, &[observation])?;
         inserted += sum.inserted as usize;
         duplicates += sum.duplicates as usize;
 
         let session_id = stable_id("ses", &format!("prototype:{session_key}"));
-        connection.execute(
+        tx.execute(
             "UPDATE sessions SET project_id = ? WHERE id = ?",
             params![project_id, session_id],
         )?;
@@ -219,19 +228,19 @@ pub fn apply_prototype(
         let completeness = if is_m { 100 } else { 0 };
         let measured_json = json!({ "usage_event_id": event_id }).to_string();
 
-        connection.execute(
+        tx.execute(
             "INSERT OR IGNORE INTO usage_spans(id, session_id, measurement_status, measured_usage_json, completeness)
              VALUES(?,?,?,?,?)",
             params![span_id, session_id, status_str, measured_json, completeness],
         )?;
 
-        connection.execute(
+        tx.execute(
             "INSERT OR IGNORE INTO attribution_groups(id, usage_span_id, policy, active, created_at)
              VALUES(?,?,?,1,?)",
             params![group_id, span_id, "causal-request", timestamp],
         )?;
 
-        connection.execute(
+        tx.execute(
             "INSERT OR IGNORE INTO attributions(
                 group_id, project_id, work_item_id, role, weight_basis_points, method, confidence, verified_by_user
             ) VALUES(?,?,?,?,10000,?,1,1)",
@@ -239,11 +248,14 @@ pub fn apply_prototype(
         )?;
     }
 
-    // Verify source file was not modified
+    // Verify source file was not modified. This check runs before COMMIT:
+    // a modified source fails the whole import instead of committing rows
+    // parsed from a file that changed mid-flight.
     let after_bytes = fs::read(source_path)?;
     if after_bytes != raw_bytes {
         bail!("Prototype source file was modified during migration");
     }
+    tx.commit()?;
 
     Ok(PrototypePreview {
         records: items.len(),
@@ -295,5 +307,69 @@ mod tests {
         assert_eq!(applied.records, 2);
         assert_eq!(applied.inserted, Some(2));
         assert!(applied.backup_path.is_some());
+    }
+
+    /// M6: a failure mid-import must roll back every row — no partial state.
+    /// Deterministic simulation: drop a table the per-row sequence needs
+    /// *late* (after projects/work_items/sessions/usage_spans for row 0 are
+    /// written), so the import dies part-way through row 0.
+    #[test]
+    fn prototype_import_is_atomic_on_mid_import_failure() {
+        let dir = tempdir().unwrap();
+        let proto_file = dir.path().join("ledger.json");
+        let backup_dir = dir.path().join("backups");
+
+        let content = json!([
+            {"project": "Demo", "task": "Task 1", "input": 100, "output": 50, "session": "ses-1"},
+            {"project": "Demo", "task": "Task 2", "input": 10, "output": 5, "session": "ses-2"},
+            {"project": "Demo", "task": "Task 3", "input": 1, "output": 1, "session": "ses-3"}
+        ]);
+        fs::write(&proto_file, content.to_string()).unwrap();
+
+        let mut ledger = Ledger::open_memory().unwrap();
+        // Sabotage AFTER open: the import writes projects, work_items,
+        // sessions and usage_spans for row 0, then dies on the missing
+        // attribution_groups table — exactly the mid-import crash shape.
+        ledger
+            .connection_mut()
+            .execute_batch("DROP TABLE attribution_groups")
+            .unwrap();
+
+        let result = apply_prototype(ledger.connection_mut(), &proto_file, &backup_dir);
+        assert!(result.is_err(), "import should fail on the dropped table");
+
+        // Atomicity: nothing from the partial import may remain.
+        let proj_count: i64 = ledger
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM projects WHERE detection_method='prototype_import'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            proj_count, 0,
+            "partial prototype import was not rolled back"
+        );
+
+        let event_count: i64 = ledger
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM usage_events WHERE adapter='prototype'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event_count, 0, "partial usage events were not rolled back");
+
+        let span_count: i64 = ledger
+            .connection()
+            .query_row("SELECT count(*) FROM usage_spans", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(span_count, 0, "partial spans were not rolled back");
+
+        // The backup is written before the transaction; a rollback must not
+        // delete the operator's backup copy.
+        assert!(backup_dir.read_dir().unwrap().next().is_some());
     }
 }
