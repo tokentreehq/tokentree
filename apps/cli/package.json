@@ -29,7 +29,8 @@
   ],
   "scripts": {
     "build": "tsc -b && tsx scripts/build.ts",
-    "typecheck": "tsc -b --pretty false"
+    "typecheck": "tsc -b --pretty false",
+    "test:packed-tarball": "bash scripts/test-packed-tarball.sh"
   },
   "dependencies": {},
   "devDependencies": {

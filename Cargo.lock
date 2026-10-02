@@ -959,6 +959,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokentree-core",
+ "tokentree-ledger",
  "walkdir",
 ]
 
