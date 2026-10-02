@@ -53,6 +53,66 @@ impl MeasurementSource {
     }
 }
 
+/// Version of the [`UsageObservation::canonical_identity`] scheme.
+/// - v1: the request branch was `{adapter}:request:{request_id}` (the request
+///   id alone — not unique across sessions).
+/// - v2 (current): the request branch is
+///   `{adapter}:request:{provider_session_id}:{turn_id}:{request_id}`.
+///
+/// Bumped by the H6 fix. Ingest performs dedup lookups against *both* schemes
+/// so that re-importing files ingested under v1 neither duplicates rows nor
+/// drifts accounting. See [`UsageObservation::canonical_identity_v1`].
+pub const IDENTITY_SCHEME_VERSION: u32 = 2;
+
+/// Truth-ladder rank for a stored `usage_events.source_kind` value.
+///
+/// Mirrors [`MeasurementSource::rank`] for the six canonical kinds. Adapter
+/// subtype markers are mapped to the rank of the ladder rung they sit on.
+/// Values outside the known vocabulary return `u8::MAX`: a binary must never
+/// supersede a row whose provenance it does not understand (forward
+/// compatibility with future vocabulary).
+#[must_use]
+pub fn rank_of_source_kind(kind: &str) -> u8 {
+    match kind {
+        k if k == source_kind::UNAVAILABLE => 0,
+        k if k == source_kind::EXPLICIT_CLI || k == source_kind::MANUAL_STOP => 1,
+        k if k == source_kind::SNAPSHOT_DELTA
+            || k == source_kind::HERMES_SNAPSHOT_DELTA
+            || k == source_kind::CODEX_TURN_COUNTER
+            || k == source_kind::TURN_COUNTER
+            || k == source_kind::TURN_SUMMARY
+            || k == source_kind::CUMULATIVE_TURN_COUNTER =>
+        {
+            2
+        }
+        k if k == source_kind::TRANSCRIPT_REQUEST
+            || k == source_kind::PROTOTYPE_JSON
+            || k == source_kind::FINAL_REQUEST_COUNTER
+            || k == source_kind::SUBAGENT_STOP
+            || k == source_kind::SUBAGENT_LIFECYCLE_COUNTER =>
+        {
+            3
+        }
+        k if k == source_kind::PROVIDER_FIELDS => 4,
+        k if k == source_kind::OFFICIAL_TELEMETRY => 5,
+        k if k == source_kind::GROK_TURN_FAILED
+            || k == source_kind::GROK_SESSION_FAILED
+            || k == source_kind::GROK_TURN_UNMEASURED
+            || k == source_kind::GROK_SESSION_UNMEASURED
+            || k == source_kind::HERMES_FAILED_RUN
+            || k == source_kind::HERMES_UNMEASURED =>
+        {
+            0
+        }
+        _ if kind.starts_with(source_kind::HERMES_AUXILIARY_PREFIX)
+            || kind.starts_with(source_kind::HERMES_USAGE_PREFIX) =>
+        {
+            4
+        }
+        _ => u8::MAX,
+    }
+}
+
 /// Canonical vocabulary for the `source_kind` column of `usage_events`.
 ///
 /// CROSS-LANGUAGE CONTRACT: these exact strings are the only values the Rust
@@ -262,14 +322,34 @@ impl UsageObservation {
     /// The request branch deliberately includes the session (and turn): provider
     /// request ids are only unique within a session, so omitting it silently
     /// drops usage when ids are reused across sessions.
+    ///
+    /// This is identity scheme v2; see [`IDENTITY_SCHEME_VERSION`] and
+    /// [`UsageObservation::canonical_identity_v1`] for the v1 format still
+    /// honored by ingest dedup.
     #[must_use]
     pub fn canonical_identity(&self) -> String {
+        self.canonical_identity_inner(false)
+    }
+
+    /// The pre-H6 (scheme v1) identity, for backward-compatible dedup lookups.
+    /// Only the request branch differs from [`UsageObservation::canonical_identity`];
+    /// every other branch is byte-identical across schemes. See
+    /// [`IDENTITY_SCHEME_VERSION`].
+    #[must_use]
+    pub fn canonical_identity_v1(&self) -> String {
+        self.canonical_identity_inner(true)
+    }
+
+    fn canonical_identity_inner(&self, legacy_request_branch: bool) -> String {
         if self.source == MeasurementSource::SnapshotDelta {
             if let Some(event) = &self.source_event_id {
                 return format!("{}:delta:{event}", self.adapter);
             }
         }
         if let Some(request) = &self.request_id {
+            if legacy_request_branch {
+                return format!("{}:request:{request}", self.adapter);
+            }
             return format!(
                 "{}:request:{}:{}:{request}",
                 self.adapter,
@@ -412,6 +492,21 @@ fn decimal_dollars_to_micros(value: &str) -> Result<u128, String> {
 #[must_use]
 pub fn sha256_hex(value: &[u8]) -> String {
     hex::encode(Sha256::digest(value))
+}
+
+/// Canonical stable-ID derivation: `{prefix}_{sha256(value)[..24 hex]}`.
+/// Lives in core (not the ledger) so parser crates — which must not depend
+/// on the SQLite owner — can derive the exact IDs ingest will write.
+#[must_use]
+pub fn stable_id(prefix: &str, value: &str) -> String {
+    format!("{prefix}_{}", &sha256_hex(value.as_bytes())[..24])
+}
+
+/// Canonical session-ID derivation shared by ingest and the CLI import paths.
+/// Keep in exactly one place so attribution lookups can never drift from ingest.
+#[must_use]
+pub fn session_stable_id(adapter: &str, provider_session_id: &str) -> String {
+    stable_id("ses", &format!("{adapter}:{provider_session_id}"))
 }
 
 #[cfg(test)]
@@ -592,5 +687,65 @@ mod tests {
                 "TURN_COUNTER_SQL_LIST missing {kind}"
             );
         }
+    }
+
+    #[test]
+    fn identity_scheme_v1_matches_legacy_format() {
+        assert_eq!(IDENTITY_SCHEME_VERSION, 2);
+        let mut obs = observation(MeasurementSource::TranscriptRequest, 10);
+        obs.provider_session_id = "s1".into();
+        obs.turn_id = Some("t1".into());
+        // v1: request id alone, no session/turn scoping.
+        assert_eq!(obs.canonical_identity_v1(), "claude:request:r");
+        // v2: session- and turn-scoped.
+        assert_eq!(obs.canonical_identity(), "claude:request:s1:t1:r");
+        assert_ne!(obs.canonical_identity(), obs.canonical_identity_v1());
+    }
+
+    #[test]
+    fn identity_v1_non_request_branches_are_scheme_independent() {
+        // Only the request branch changed between schemes; every other branch
+        // must be byte-identical so dual-scheme lookups stay sound.
+        let mut delta = observation(MeasurementSource::SnapshotDelta, 10);
+        delta.source_event_id = Some("evt-1".into());
+        assert_eq!(delta.canonical_identity_v1(), delta.canonical_identity());
+
+        let mut bare = observation(MeasurementSource::TranscriptRequest, 10);
+        bare.request_id = None;
+        bare.source_event_id = Some("evt-2".into());
+        assert_eq!(bare.canonical_identity_v1(), bare.canonical_identity());
+    }
+
+    #[test]
+    fn rank_of_source_kind_maps_the_ladder() {
+        assert_eq!(rank_of_source_kind(source_kind::UNAVAILABLE), 0);
+        assert_eq!(rank_of_source_kind(source_kind::EXPLICIT_CLI), 1);
+        assert_eq!(rank_of_source_kind(source_kind::SNAPSHOT_DELTA), 2);
+        assert_eq!(rank_of_source_kind(source_kind::TRANSCRIPT_REQUEST), 3);
+        assert_eq!(rank_of_source_kind(source_kind::PROVIDER_FIELDS), 4);
+        assert_eq!(rank_of_source_kind(source_kind::OFFICIAL_TELEMETRY), 5);
+        // Cross-check against the enum ranks.
+        for source in [
+            MeasurementSource::Unavailable,
+            MeasurementSource::ExplicitCli,
+            MeasurementSource::SnapshotDelta,
+            MeasurementSource::TranscriptRequest,
+            MeasurementSource::ProviderFields,
+            MeasurementSource::OfficialTelemetry,
+        ] {
+            assert_eq!(rank_of_source_kind(source.as_str()), source.rank());
+        }
+    }
+
+    #[test]
+    fn rank_of_source_kind_is_conservative_on_unknowns() {
+        // Unknown / future vocabulary must never be superseded by a binary
+        // that does not understand it.
+        assert_eq!(rank_of_source_kind("banana"), u8::MAX);
+        assert_eq!(rank_of_source_kind(""), u8::MAX);
+        assert_eq!(rank_of_source_kind("transcript_request_v2"), u8::MAX);
+        // Failure markers sit at the bottom of the ladder.
+        assert_eq!(rank_of_source_kind(source_kind::GROK_TURN_FAILED), 0);
+        assert_eq!(rank_of_source_kind(source_kind::HERMES_UNMEASURED), 0);
     }
 }

@@ -862,20 +862,19 @@ pub fn import_codex_file(connection: &mut Connection, path: &Path) -> Result<Cod
     let mut last_event_hash: Option<String> = None;
 
     for obs in &parse_res.observations {
-        let session_id = format!(
-            "ses_{}",
-            hex::encode(&Sha256::digest(obs.provider_session_id.as_bytes())[..8])
-        );
+        // Canonical session-ID derivation shared with the ledger
+        // (tokentree_core::session_stable_id): default attribution and
+        // every lookup must resolve the same ID ingest wrote.
+        let session_id = tokentree_core::session_stable_id(&obs.adapter, &obs.provider_session_id);
         tx.execute(
             "INSERT OR IGNORE INTO sessions(id, adapter, provider_session_id, source_path, started_at) VALUES(?1, ?2, ?3, ?4, ?5)",
             params![session_id, obs.adapter, obs.provider_session_id, obs.source_path, obs.source_timestamp.as_deref().unwrap_or(&obs.observed_at)],
         )?;
 
         let turn_db_id = if let Some(t_id) = &obs.turn_id {
-            let turn_id = format!(
-                "turn_{}",
-                hex::encode(&Sha256::digest(format!("{}:{}", session_id, t_id).as_bytes())[..8])
-            );
+            // Same derivation as the ledger's ingest path: turn IDs are
+            // namespaced under the canonical session ID.
+            let turn_id = tokentree_core::stable_id("turn", &format!("{session_id}:{t_id}"));
             let seq: i64 = tx
                 .query_row(
                     "SELECT coalesce(max(sequence_number) + 1, 0) FROM turns WHERE session_id = ?1",
