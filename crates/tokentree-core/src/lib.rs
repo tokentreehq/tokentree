@@ -43,13 +43,149 @@ impl MeasurementSource {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Unavailable => "unavailable",
-            Self::ExplicitCli => "explicit_cli",
-            Self::SnapshotDelta => "snapshot_delta",
-            Self::TranscriptRequest => "transcript_request",
-            Self::ProviderFields => "provider_fields",
-            Self::OfficialTelemetry => "official_telemetry",
+            Self::Unavailable => source_kind::UNAVAILABLE,
+            Self::ExplicitCli => source_kind::EXPLICIT_CLI,
+            Self::SnapshotDelta => source_kind::SNAPSHOT_DELTA,
+            Self::TranscriptRequest => source_kind::TRANSCRIPT_REQUEST,
+            Self::ProviderFields => source_kind::PROVIDER_FIELDS,
+            Self::OfficialTelemetry => source_kind::OFFICIAL_TELEMETRY,
         }
+    }
+}
+
+/// Canonical vocabulary for the `source_kind` column of `usage_events`.
+///
+/// CROSS-LANGUAGE CONTRACT: these exact strings are the only values the Rust
+/// engine writes to `usage_events.source_kind`, and the TypeScript side
+/// mirrors this vocabulary verbatim. A database touched by both binaries must
+/// aggregate identically, so parsers must never write raw provider-internal
+/// record types (e.g. Claude transcript `"type"` values like `"assistant"`)
+/// into this column — use the canonical [`MeasurementSource`] string instead.
+///
+/// The vocabulary has two tiers:
+/// * Canonical measurement sources (the [`MeasurementSource::as_str`] set).
+/// * Derived/lifecycle kinds produced by adapters and the ledger itself
+///   (turn counters, lifecycle counters, per-adapter failure/unmeasured
+///   markers). Aggregation SQL matches on these, so they are closed too.
+///
+/// Provider-detail subtypes that carry an open-ended suffix
+/// (`hermes_auxiliary_{task}`, `hermes_usage_{provider}`) are recognized by
+/// their prefixes below; everything else not listed here is rejected by
+/// [`canonical_source_kind`] and falls back to the canonical source string.
+pub mod source_kind {
+    // Canonical measurement sources (see MeasurementSource::as_str).
+    pub const UNAVAILABLE: &str = "unavailable";
+    pub const EXPLICIT_CLI: &str = "explicit_cli";
+    pub const SNAPSHOT_DELTA: &str = "snapshot_delta";
+    pub const TRANSCRIPT_REQUEST: &str = "transcript_request";
+    pub const PROVIDER_FIELDS: &str = "provider_fields";
+    pub const OFFICIAL_TELEMETRY: &str = "official_telemetry";
+
+    // Lifecycle-counter kinds: rollup/counter rows, never standalone requests.
+    pub const FINAL_REQUEST_COUNTER: &str = "final_request_counter";
+    pub const SUBAGENT_STOP: &str = "subagent_stop";
+    pub const SUBAGENT_LIFECYCLE_COUNTER: &str = "subagent_lifecycle_counter";
+
+    // Turn/cumulative counter fallbacks (covered-counter suppression matches these).
+    pub const CODEX_TURN_COUNTER: &str = "codex_turn_counter";
+    pub const TURN_COUNTER: &str = "turn_counter";
+    pub const TURN_SUMMARY: &str = "turn_summary";
+    pub const CUMULATIVE_TURN_COUNTER: &str = "cumulative_turn_counter";
+
+    // Codex app-server / rollout detail kinds.
+    pub const CODEX_APP_SERVER: &str = "codex_app_server";
+    pub const CODEX_ROLLOUT: &str = "codex_rollout";
+
+    // Hermes snapshot deltas (distinct from generic snapshot_delta for adapter scoping).
+    pub const HERMES_SNAPSHOT_DELTA: &str = "hermes_snapshot_delta";
+
+    // Per-adapter failure / unmeasured markers.
+    pub const GROK_TURN_FAILED: &str = "grok_turn_failed";
+    pub const GROK_SESSION_FAILED: &str = "grok_session_failed";
+    pub const GROK_TURN_UNMEASURED: &str = "grok_turn_unmeasured";
+    pub const GROK_SESSION_UNMEASURED: &str = "grok_session_unmeasured";
+    pub const GROK_TURN_USAGE: &str = "grok_turn_usage";
+    pub const GROK_SESSION_USAGE: &str = "grok_session_usage";
+    pub const HERMES_FAILED_RUN: &str = "hermes_failed_run";
+    pub const HERMES_UNMEASURED: &str = "hermes_unmeasured";
+    pub const HERMES_SESSION_MODEL_USAGE: &str = "hermes_session_model_usage";
+
+    // Ledger-originated kinds.
+    pub const MANUAL_STOP: &str = "manual_stop";
+    pub const PROTOTYPE_JSON: &str = "prototype_json";
+    pub const OTEL_API_REQUEST: &str = "otel_api_request";
+
+    /// Prefix for open-ended Hermes auxiliary-task subtypes (`hermes_auxiliary_{task}`).
+    pub const HERMES_AUXILIARY_PREFIX: &str = "hermes_auxiliary_";
+    /// Prefix for open-ended Hermes per-provider usage subtypes (`hermes_usage_{provider}`).
+    pub const HERMES_USAGE_PREFIX: &str = "hermes_usage_";
+
+    /// SQL `IN (...)` list fragment for the lifecycle-counter exclusion.
+    /// Mirrors [`FINAL_REQUEST_COUNTER`], [`SUBAGENT_STOP`], [`SUBAGENT_LIFECYCLE_COUNTER`];
+    /// keep in sync if those change.
+    pub const LIFECYCLE_COUNTER_SQL_LIST: &str =
+        "'final_request_counter', 'subagent_stop', 'subagent_lifecycle_counter'";
+
+    /// SQL `IN (...)` list fragment for turn-counter kinds.
+    pub const TURN_COUNTER_SQL_LIST: &str =
+        "'codex_turn_counter', 'turn_counter', 'turn_summary', 'cumulative_turn_counter'";
+
+    /// SQL `IN (...)` list fragment for snapshot-delta kinds excluded from
+    /// request counts (deltas are not standalone requests).
+    pub const SNAPSHOT_DELTA_SQL_LIST: &str = "'hermes_snapshot_delta', 'snapshot_delta'";
+
+    /// Returns true when `value` is a recognized `source_kind` vocabulary value,
+    /// including the open-ended Hermes provider-detail prefixes.
+    #[must_use]
+    pub fn is_recognized(value: &str) -> bool {
+        matches!(
+            value,
+            UNAVAILABLE
+                | EXPLICIT_CLI
+                | SNAPSHOT_DELTA
+                | TRANSCRIPT_REQUEST
+                | PROVIDER_FIELDS
+                | OFFICIAL_TELEMETRY
+                | FINAL_REQUEST_COUNTER
+                | SUBAGENT_STOP
+                | SUBAGENT_LIFECYCLE_COUNTER
+                | CODEX_TURN_COUNTER
+                | TURN_COUNTER
+                | TURN_SUMMARY
+                | CUMULATIVE_TURN_COUNTER
+                | CODEX_APP_SERVER
+                | CODEX_ROLLOUT
+                | HERMES_SNAPSHOT_DELTA
+                | GROK_TURN_FAILED
+                | GROK_SESSION_FAILED
+                | GROK_TURN_UNMEASURED
+                | GROK_SESSION_UNMEASURED
+                | GROK_TURN_USAGE
+                | GROK_SESSION_USAGE
+                | HERMES_FAILED_RUN
+                | HERMES_UNMEASURED
+                | HERMES_SESSION_MODEL_USAGE
+                | MANUAL_STOP
+                | PROTOTYPE_JSON
+                | OTEL_API_REQUEST
+        ) || value.starts_with(HERMES_AUXILIARY_PREFIX)
+            || value.starts_with(HERMES_USAGE_PREFIX)
+    }
+}
+
+/// Resolve the value to store in `usage_events.source_kind` for an observation.
+///
+/// Prefers the parser-provided `source_subtype` when it is a recognized
+/// vocabulary value; otherwise falls back to the canonical
+/// [`MeasurementSource`] string. This is the choke point that keeps Rust and
+/// TypeScript writes byte-identical for the same observation: raw
+/// provider-internal record types (e.g. an old Claude parser writing the
+/// transcript `"type"` value `"assistant"`) can never reach the column.
+#[must_use]
+pub fn canonical_source_kind(observation: &UsageObservation) -> &str {
+    match observation.source_subtype.as_deref() {
+        Some(subtype) if source_kind::is_recognized(subtype) => subtype,
+        _ => observation.source.as_str(),
     }
 }
 
@@ -115,6 +251,17 @@ pub struct UsageObservation {
 }
 
 impl UsageObservation {
+    /// Stable identity used for cross-source deduplication and as the basis of
+    /// [`UsageObservation::event_hash`]. Format by branch (fields joined by `:`):
+    /// - snapshot delta with event id: `{adapter}:delta:{source_event_id}`
+    /// - request: `{adapter}:request:{provider_session_id}:{turn_id}:{request_id}`
+    /// - bare event id: `{adapter}:event:{source_event_id}`
+    /// - turn counter: `{adapter}:counter:{provider_session_id}:{turn_id}`
+    /// - fallback: `{adapter}:{provider_session_id}:{turn_id}:{model}:{source_timestamp}:{input_tokens}:{output_tokens}:{source_offset}`
+    ///
+    /// The request branch deliberately includes the session (and turn): provider
+    /// request ids are only unique within a session, so omitting it silently
+    /// drops usage when ids are reused across sessions.
     #[must_use]
     pub fn canonical_identity(&self) -> String {
         if self.source == MeasurementSource::SnapshotDelta {
@@ -123,12 +270,17 @@ impl UsageObservation {
             }
         }
         if let Some(request) = &self.request_id {
-            return format!("{}:request:{request}", self.adapter);
+            return format!(
+                "{}:request:{}:{}:{request}",
+                self.adapter,
+                self.provider_session_id,
+                self.turn_id.as_deref().unwrap_or_default(),
+            );
         }
         if let Some(event) = &self.source_event_id {
             return format!("{}:event:{event}", self.adapter);
         }
-        if (self.source_subtype.as_deref() == Some("codex_turn_counter")
+        if (self.source_subtype.as_deref() == Some(source_kind::CODEX_TURN_COUNTER)
             || self.source == MeasurementSource::SnapshotDelta)
             && self.turn_id.is_some()
         {
@@ -307,6 +459,30 @@ mod tests {
     }
 
     #[test]
+    fn request_identity_includes_session_and_turn() {
+        // H6: request ids are only unique within a session; the identity must
+        // not collide across sessions.
+        let mut first = observation(MeasurementSource::TranscriptRequest, 10);
+        first.provider_session_id = "s1".into();
+        first.turn_id = Some("t1".into());
+        let mut second = observation(MeasurementSource::TranscriptRequest, 10);
+        second.provider_session_id = "s2".into();
+        second.turn_id = Some("t1".into());
+        assert_eq!(first.canonical_identity(), "claude:request:s1:t1:r");
+        assert_ne!(first.canonical_identity(), second.canonical_identity());
+
+        // Same session + turn + request still deduplicates across sources,
+        // with the higher-ranked source winning.
+        let mut authoritative = observation(MeasurementSource::OfficialTelemetry, 11);
+        authoritative.provider_session_id = "s1".into();
+        authoritative.turn_id = Some("t1".into());
+        let result = deduplicate(vec![first, authoritative]);
+        assert_eq!(result.canonical.len(), 1);
+        assert_eq!(result.canonical[0].usage.input_tokens, Some(11));
+        assert_eq!(result.conflicts, 1);
+    }
+
+    #[test]
     fn completeness_is_null_without_requests() {
         assert_eq!(token_completeness(0, 0, 0), None);
         assert_eq!(token_completeness(8, 1, 1), Some(80.0));
@@ -332,5 +508,89 @@ mod tests {
             calculate_cost_micros(&usage, &rates).unwrap(),
             Some(22_050_000)
         );
+    }
+
+    #[test]
+    fn source_kind_vocabulary_matches_measurement_source_strings() {
+        // The canonical vocabulary is the cross-language contract: as_str()
+        // must stay byte-identical to these constants.
+        assert_eq!(
+            MeasurementSource::TranscriptRequest.as_str(),
+            source_kind::TRANSCRIPT_REQUEST
+        );
+        assert_eq!(
+            MeasurementSource::SnapshotDelta.as_str(),
+            source_kind::SNAPSHOT_DELTA
+        );
+        assert_eq!(
+            MeasurementSource::OfficialTelemetry.as_str(),
+            source_kind::OFFICIAL_TELEMETRY
+        );
+        assert_eq!(
+            MeasurementSource::ProviderFields.as_str(),
+            source_kind::PROVIDER_FIELDS
+        );
+        assert_eq!(
+            MeasurementSource::ExplicitCli.as_str(),
+            source_kind::EXPLICIT_CLI
+        );
+        assert_eq!(
+            MeasurementSource::Unavailable.as_str(),
+            source_kind::UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn canonical_source_kind_prefers_recognized_subtype() {
+        let mut obs = observation(MeasurementSource::TranscriptRequest, 10);
+        obs.source_subtype = Some(source_kind::CODEX_TURN_COUNTER.to_string());
+        assert_eq!(canonical_source_kind(&obs), source_kind::CODEX_TURN_COUNTER);
+
+        // Open-ended Hermes provider-detail subtypes pass through.
+        obs.source_subtype = Some("hermes_auxiliary_openrouter".to_string());
+        assert_eq!(canonical_source_kind(&obs), "hermes_auxiliary_openrouter");
+    }
+
+    #[test]
+    fn canonical_source_kind_rejects_raw_record_types() {
+        // Old Rust Claude parsers wrote the raw transcript record "type"
+        // (e.g. "assistant") into source_kind; the choke point must map those
+        // to the canonical source string so Rust and TS writes agree.
+        let mut obs = observation(MeasurementSource::TranscriptRequest, 10);
+        obs.source_subtype = Some("assistant".to_string());
+        assert_eq!(canonical_source_kind(&obs), source_kind::TRANSCRIPT_REQUEST);
+
+        obs.source = MeasurementSource::OfficialTelemetry;
+        obs.source_subtype = Some("otel_api_request".to_string());
+        // otel_api_request IS a recognized ledger-originated kind, kept as-is.
+        assert_eq!(canonical_source_kind(&obs), source_kind::OTEL_API_REQUEST);
+
+        obs.source_subtype = None;
+        assert_eq!(canonical_source_kind(&obs), source_kind::OFFICIAL_TELEMETRY);
+    }
+
+    #[test]
+    fn source_kind_sql_lists_cover_their_constants() {
+        for kind in [
+            source_kind::FINAL_REQUEST_COUNTER,
+            source_kind::SUBAGENT_STOP,
+            source_kind::SUBAGENT_LIFECYCLE_COUNTER,
+        ] {
+            assert!(
+                source_kind::LIFECYCLE_COUNTER_SQL_LIST.contains(kind),
+                "LIFECYCLE_COUNTER_SQL_LIST missing {kind}"
+            );
+        }
+        for kind in [
+            source_kind::CODEX_TURN_COUNTER,
+            source_kind::TURN_COUNTER,
+            source_kind::TURN_SUMMARY,
+            source_kind::CUMULATIVE_TURN_COUNTER,
+        ] {
+            assert!(
+                source_kind::TURN_COUNTER_SQL_LIST.contains(kind),
+                "TURN_COUNTER_SQL_LIST missing {kind}"
+            );
+        }
     }
 }

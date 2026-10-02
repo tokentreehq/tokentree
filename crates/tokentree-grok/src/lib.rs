@@ -9,7 +9,9 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use tokentree_core::{MeasurementSource, TokenUsage, UsageObservation};
+use tokentree_core::{
+    MeasurementSource, TokenUsage, UsageObservation, canonical_source_kind, source_kind,
+};
 use walkdir::WalkDir;
 
 pub const ADAPTER_VERSION: &str = "0.2.0-rust";
@@ -380,15 +382,15 @@ pub fn parse_str(
                 (
                     MeasurementSource::Unavailable,
                     if is_failed_or_zero_calls {
-                        "grok_turn_failed".to_string()
+                        source_kind::GROK_TURN_FAILED.to_string()
                     } else {
-                        "grok_turn_unmeasured".to_string()
+                        source_kind::GROK_TURN_UNMEASURED.to_string()
                     },
                 )
             } else {
                 (
                     MeasurementSource::ProviderFields,
-                    "grok_turn_usage".to_string(),
+                    source_kind::GROK_TURN_USAGE.to_string(),
                 )
             };
 
@@ -475,15 +477,15 @@ pub fn parse_str(
                 (
                     MeasurementSource::Unavailable,
                     if is_failed_or_zero_calls {
-                        "grok_session_failed".to_string()
+                        source_kind::GROK_SESSION_FAILED.to_string()
                     } else {
-                        "grok_session_unmeasured".to_string()
+                        source_kind::GROK_SESSION_UNMEASURED.to_string()
                     },
                 )
             } else {
                 (
                     MeasurementSource::ProviderFields,
-                    "grok_session_usage".to_string(),
+                    source_kind::GROK_SESSION_USAGE.to_string(),
                 )
             };
 
@@ -653,7 +655,7 @@ pub fn import_grok_file(connection: &mut Connection, path: &Path) -> Result<Grok
             params![
                 format!("evt_{}", &evt_hash[..16]),
                 obs.adapter,
-                obs.source_subtype.as_deref().unwrap_or(obs.source.as_str()),
+                canonical_source_kind(obs),
                 obs.source_event_id,
                 session_id,
                 turn_db_id,
