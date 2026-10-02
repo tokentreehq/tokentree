@@ -22,7 +22,7 @@ This roadmap outlines the planned development trajectory for TokenTree following
 
 ## Milestone 1: Expanded Agent Adapters
 
-- **OpenAI Codex**: Integration with the documented Codex app-server protocol and rollout event formats.
+- ✅ **OpenAI Codex**: Shipped in v0.2.0 — app-server protocol and rollout event integration with strict precedence (no double-count).
 - **Community Adapter SDK**: Typed TypeScript and Rust interfaces for third-party agent builders.
 - **Cursor & Copilot Exporters**: Parsers for local development logs and workspaces.
 

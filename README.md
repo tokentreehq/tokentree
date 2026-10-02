@@ -5,7 +5,7 @@
  / / / /_/ / ,< /  __/ / / / / / /  /  __/  __/
 /_/  \____/_/|_|\___/_/ /_/_/ /_/   \___/\___/
 
-  the meter for the agent economy
+  know what your agents actually did
 
 ──────────────────────────────────────────────────────────
 
@@ -25,26 +25,22 @@ my-project                              1,248,300 tok      $4.21
 [![npm](https://img.shields.io/npm/v/@tokentreehq/cli)](https://www.npmjs.com/package/@tokentreehq/cli)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](./LICENSE)
 
-# TokenTree is the meter for the agent economy.
+# Know what your agents actually did.
 
-Open-source, local-first usage measurement for AI coding agents. Every request captured, every token counted, every dollar accounted for — organized into projects → work items → sessions → turns.
-
-**If your agents are employees, TokenTree is payroll.**
-
-TokenTree sits underneath your agents and records what they actually cost: tokens in, tokens out, cache hits, reasoning spend — per project, per session, per turn. No cloud account. No telemetry. No subscription. Your data never leaves your machine.
+TokenTree is a free, open-source usage tracker for AI coding agents. It reads your agents' transcripts and telemetry, organizes the work into projects → work items → sessions → turns, and shows you exactly where the tokens went — every token counted, every gap disclosed. No account. No cloud. No telemetry. Your data never leaves your machine.
 
 ## TokenTree is right for you if
 
-- ✅ You run Claude Code / Codex / Cursor for hours and have **no idea what it costs**
+- ✅ You run Claude Code / Codex / Grok for hours and have **no idea where it all went**
 - ✅ You want **per-project cost breakdowns**, not a single scary invoice at month-end
 - ✅ You've been burned by **"estimated" usage dashboards** that don't match reality
-- ✅ You need **proof of spend** — for clients, for teams, for yourself
+- ✅ You want **proof of spend** — for client invoices, or just your own curiosity
 - ✅ You believe measurement tools should be **local-first and open-source**
 - ✅ You want your agent's work **organized automatically** into something you can actually read
 
 ## The Problem
 
-AI coding agents burn money invisibly. A single long Claude Code session can chew through millions of tokens across input, cache reads, cache writes, output, and reasoning — each billed at a different rate. The provider dashboard shows you a monthly total. Your `~/.claude/projects` folder holds raw JSONL you'll never read. In between: nothing.
+AI coding agents burn through tokens invisibly. A single long Claude Code session can chew through millions of tokens across input, cache reads, cache writes, output, and reasoning — each billed at a different rate. The provider dashboard shows you a monthly total. Your `~/.claude/projects` folder holds raw JSONL you'll never read. In between: nothing.
 
 | Without TokenTree | With TokenTree |
 |---|---|
@@ -56,10 +52,10 @@ AI coding agents burn money invisibly. A single long Claude Code session can che
 
 ## How TokenTree solves it
 
-1. **Capture everything** — Lifecycle hooks, transcript imports, and official OTLP telemetry feed one append-only ledger. Four providers supported out of the box.
-2. **Deduplicate ruthlessly** — Canonical request identities + a versioned truth ladder: official provider telemetry outranks transcript observations, across batches. The same request is never counted twice.
+1. **Capture what matters** — Lifecycle hooks, transcript imports, and official OTLP telemetry feed one append-only ledger. Four providers supported out of the box.
+2. **Deduplicate ruthlessly** — Canonical request identities + a versioned truth ladder: official provider telemetry outranks transcript observations, across batches. The same request isn't counted twice.
 3. **Count exactly** — Integer-micro cost arithmetic per token tier. No floats, no rounding drift, no "approximately $4.20".
-4. **Organize automatically** — A conservative boundary classifier groups turns into projects → work items → sessions with 100% precision on benchmarks. You get a tree, not a spreadsheet.
+4. **Organize automatically** — A conservative boundary classifier groups turns into projects → work items → sessions. You get a tree, not a spreadsheet.
 5. **Stay honest** — Missing measurements and missing prices are *unavailable*, never $0.00. Completeness is reported, not assumed.
 
 ```
@@ -80,7 +76,7 @@ completeness: 98.2% measured · 1.8% unavailable (2 sessions missing cache-write
 
 | 🎯 Truth-Ladder Ingestion | 💰 Exact Cost Math | 🔒 Private by Design |
 |---|---|---|
-| Official OTLP telemetry outranks transcript parsing. Canonical request IDs dedup across re-imports and providers. The same request is never counted twice. | Integer-micro arithmetic per token tier — input, cache read, cache write, output, reasoning. Zero floating-point drift. What you see is what you'd be billed. | Prompts, completions, diffs, and tool payloads are analyzed in memory and **never persisted**. There is nothing to leak. |
+| Official OTLP telemetry outranks transcript parsing. Canonical request IDs dedup across re-imports and providers. The same request isn't counted twice. | Integer-micro arithmetic per token tier — input, cache read, cache write, output, reasoning. Zero floating-point drift. List-price estimates, computed exactly. | Prompts, completions, diffs, and tool payloads are analyzed in memory and **never persisted**. There is nothing to leak. |
 
 | 🌳 Auto-Organization | 🛡️ Honest Gaps | 📊 Three Ways to Read It |
 |---|---|---|
@@ -100,7 +96,7 @@ completeness: 98.2% measured · 1.8% unavailable (2 sessions missing cache-write
 | **Missing data** | Surfaced as *unavailable* | Silent | Silent |
 | **Privacy** | Prompts never touch disk | Your data on their servers | Your scripts, your risk |
 | **Offline** | Fully local SQLite | Requires login | Local but fragile |
-| **Open source** | Apache-2.0, audited | Closed | — |
+| **Open source** | Apache-2.0, open | Closed | — |
 
 ## The truth ladder
 
@@ -237,14 +233,10 @@ TokenTree is early and opinionated. Highest-leverage contributions: new provider
 ```bash
 corepack enable && pnpm install
 cargo test --workspace     # Rust — 37 suites
-pnpm test                  # TS — 67 tests
+pnpm test                  # TS
 ```
 
 Read [CONTRIBUTING.md](./CONTRIBUTING.md) and [CLAUDE.md](./CLAUDE.md) before opening a PR.
-
-## Star history
-
-[![Star History](https://api.star-history.com/svg?repos=tokentreehq/tokentree&type=date&legend=top-left)](https://www.star-history.com/#tokentreehq/tokentree&type=date&legend=top-left)
 
 ## License
 
