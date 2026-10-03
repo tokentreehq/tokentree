@@ -387,10 +387,11 @@ fn supersede_is_atomic_with_its_batch() {
     ledger.ingest(vec![transcript]).unwrap();
 
     // Drive two ingest calls inside ONE outer transaction: stage a supersede,
-    // then fail the batch. The rollback must undo the staged supersede too.
-    let tx = ledger.connection_mut().transaction().unwrap();
+    // then ingest a poison row. L10: the poison row is quarantined (not a
+    // batch failure). The rollback must undo the staged supersede too.
+    let mut tx = ledger.connection_mut().transaction().unwrap();
     let staged = ingest_observations_tx(
-        &tx,
+        &mut tx,
         &[obs(
             "s1",
             Some("t1"),
@@ -402,8 +403,10 @@ fn supersede_is_atomic_with_its_batch() {
     )
     .unwrap();
     assert_eq!(staged.superseded, 1);
-    let failed = ingest_observations_tx(&tx, &[poison_obs()]);
-    assert!(failed.is_err());
+    // L10: poison row no longer fails the batch — it is quarantined.
+    let quarantined = ingest_observations_tx(&mut tx, &[poison_obs()]).unwrap();
+    assert_eq!(quarantined.poisoned, 1);
+    assert_eq!(quarantined.inserted, 0);
     drop(tx); // rollback
 
     // Zero partial state: old row still active, no new rows, totals unchanged.
@@ -414,7 +417,9 @@ fn supersede_is_atomic_with_its_batch() {
 }
 
 #[test]
-fn failed_ingest_inserts_nothing() {
+fn poison_row_is_quarantined_and_batch_continues() {
+    // L10: a poison row no longer aborts the batch. The good observation
+    // ingests, the poison one is quarantined as a measurement anomaly.
     let mut ledger = Ledger::open_memory().unwrap();
     let good = obs(
         "s1",
@@ -424,9 +429,25 @@ fn failed_ingest_inserts_nothing() {
         10,
         5,
     );
-    let res = ledger.ingest(vec![good, poison_obs()]);
-    assert!(res.is_err());
-    assert_eq!(event_row_count(&ledger), 0);
+    let summary = ledger.ingest(vec![good, poison_obs()]).unwrap();
+    assert_eq!(summary.inserted, 1);
+    assert_eq!(summary.poisoned, 1);
+    assert_eq!(event_row_count(&ledger), 1);
+    assert_eq!(active_row_count(&ledger), 1);
+    // The quarantine record is visible and names the failure.
+    let (anomaly_type, source_values): (String, String) = ledger
+        .connection()
+        .query_row(
+            "SELECT type, source_values_json FROM measurement_anomalies WHERE type = 'poison_observation'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(anomaly_type, "poison_observation");
+    assert!(source_values.contains("poison"));
+    assert!(source_values.contains("error"));
+    // Good row's totals are intact.
+    assert_eq!(ledger.aggregate_usage().unwrap().input, 10);
 }
 
 #[test]
