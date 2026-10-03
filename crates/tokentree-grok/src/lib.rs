@@ -139,6 +139,8 @@ pub const fn ticks_to_micros(ticks: u64) -> u64 {
 }
 
 pub fn parse_session(path: &Path) -> Result<ParseResult> {
+    // L9: refuse to buffer a degenerate file into memory.
+    tokentree_core::check_file_size(path).map_err(|e| anyhow::anyhow!(e))?;
     let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut contents = String::new();
     file.read_to_string(&mut contents)?;

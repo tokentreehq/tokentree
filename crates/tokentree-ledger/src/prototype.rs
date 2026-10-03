@@ -6,7 +6,8 @@ use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashSet;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::Path;
 use tokentree_core::{MeasurementSource, TokenUsage, UsageObservation, slug_key};
 
@@ -108,8 +109,37 @@ pub fn apply_prototype(
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("ledger.json");
-    let backup_path = backup_dir.join(format!("prototype-{}-{}", now.timestamp_millis(), filename));
-    fs::write(&backup_path, &raw_bytes)?;
+    // L2: the old `prototype-{millis}-{filename}` name collided when two
+    // imports ran in the same millisecond on the same source, silently
+    // overwriting the first backup. Use nanosecond time plus a create-new
+    // loop so concurrent runs can never share a backup path.
+    let nanos = now
+        .timestamp_nanos_opt()
+        .unwrap_or_else(|| now.timestamp_millis() * 1_000_000);
+    let mut backup_path = backup_dir.join(format!("prototype-{nanos}-{filename}"));
+    let mut suffix = 0u32;
+    let mut backup_file = loop {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&backup_path)
+        {
+            Ok(file) => break file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                suffix += 1;
+                backup_path =
+                    backup_dir.join(format!("prototype-{nanos}-{}-{suffix}", std::process::id()));
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("writing prototype backup {}", backup_path.display())
+                });
+            }
+        }
+    };
+    backup_file
+        .write_all(&raw_bytes)
+        .with_context(|| format!("writing prototype backup {}", backup_path.display()))?;
 
     // M6: the whole import runs in a single transaction (same pattern as the
     // source_kind vocabulary migration). Previously each row's observation
@@ -118,7 +148,7 @@ pub fn apply_prototype(
     // error mid-import left a partially imported prototype with no clean
     // resume path. Now any failure rolls back every row. The backup above is
     // written before the transaction; a rollback never deletes the backup.
-    let tx = connection.transaction()?;
+    let mut tx = connection.transaction()?;
 
     let mut inserted = 0;
     let mut duplicates = 0;
@@ -207,7 +237,7 @@ pub fn apply_prototype(
             ],
         )?;
 
-        let sum = crate::ingest_observations_tx(&tx, &[observation])?;
+        let sum = crate::ingest_observations_tx(&mut tx, &[observation])?;
         inserted += sum.inserted as usize;
         duplicates += sum.duplicates as usize;
 

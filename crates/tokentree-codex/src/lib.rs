@@ -119,32 +119,45 @@ pub fn parse_reader<R: BufRead>(
 
     // Read raw bytes per line so one invalid-UTF-8 line can be skipped with
     // exact offset accounting instead of abandoning the rest of the file.
+    // L9: bounded via read_capped_line — a degenerate multi-hundred-MB line
+    // is skipped and counted, never fully buffered.
     let mut raw_buf = Vec::new();
     loop {
-        raw_buf.clear();
-        let bytes_read = match reader.read_until(b'\n', &mut raw_buf) {
-            Ok(n) => n,
-            Err(_) => {
-                stats.malformed += 1;
-                stats.anomalies += 1;
-                anomalies.push(CodexAnomaly {
-                    anomaly_type: "malformed_record".to_string(),
-                    session_id: active_session_id.clone(),
-                    turn_id: active_turn_id.clone(),
-                    source_path: path.display().to_string(),
-                    source_offset: offset,
-                    details: serde_json::json!({ "error": "io error reading line" }),
-                });
-                break;
-            }
-        };
-
-        if bytes_read == 0 {
-            break;
-        }
+        let (bytes_read, truncated) =
+            match tokentree_core::read_capped_line(&mut reader, &mut raw_buf) {
+                Ok(Some(v)) => v,
+                Ok(None) => break,
+                Err(_) => {
+                    stats.malformed += 1;
+                    stats.anomalies += 1;
+                    anomalies.push(CodexAnomaly {
+                        anomaly_type: "malformed_record".to_string(),
+                        session_id: active_session_id.clone(),
+                        turn_id: active_turn_id.clone(),
+                        source_path: path.display().to_string(),
+                        source_offset: offset,
+                        details: serde_json::json!({ "error": "io error reading line" }),
+                    });
+                    break;
+                }
+            };
 
         let line_offset = offset;
-        offset += bytes_read as u64;
+        offset += bytes_read;
+
+        if truncated {
+            stats.malformed += 1;
+            stats.anomalies += 1;
+            anomalies.push(CodexAnomaly {
+                anomaly_type: "malformed_record".to_string(),
+                session_id: active_session_id.clone(),
+                turn_id: active_turn_id.clone(),
+                source_path: path.display().to_string(),
+                source_offset: line_offset,
+                details: serde_json::json!({ "error": "line exceeds size cap, skipped" }),
+            });
+            continue;
+        }
 
         let line_buf = match String::from_utf8(std::mem::take(&mut raw_buf)) {
             Ok(line) => line,

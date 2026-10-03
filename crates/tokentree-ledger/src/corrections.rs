@@ -906,73 +906,40 @@ fn read_group_attributions(conn: &Connection, group_id: &str) -> Result<Vec<Attr
 }
 
 /// For merge: reproduce all rows from the old group, but replace any row
-/// targeting `source_id` with `target_id`. If `target_id` already has a row,
-/// combine the weights (and take the higher confidence).
+/// targeting `source_id` with `target_id`. Rows are consolidated by
+/// `work_item_id`: retarget source rows first, then merge duplicates by
+/// summing `weight_basis_points` and taking the max `confidence`. Single
+/// pass; row order follows first occurrence.
+///
+/// L1: the old two-pass version (with a `target_combined` flag and a
+/// second dedup sweep) left two target rows when the source sorted before
+/// the target in `ORDER BY role` order. This version retargets first, then
+/// dedups in one pass, so ordering no longer matters. The key is
+/// `work_item_id` alone (not the full tuple): a merge collapses the source
+/// into the target regardless of role differences.
 fn merge_attribution_rows(rows: &[AttrRow], source_id: &str, target_id: &str) -> Vec<AttrRow> {
     let mut result: Vec<AttrRow> = Vec::new();
-    let mut target_combined = false;
-
     for row in rows {
-        let is_source = row.work_item_id.as_deref() == Some(source_id);
-        let is_target = row.work_item_id.as_deref() == Some(target_id);
-
-        if is_source {
-            // Find if target already exists in result or in remaining rows
-            if let Some(existing) = result
-                .iter_mut()
-                .find(|r| r.work_item_id.as_deref() == Some(target_id))
-            {
-                // Combine: add source weight to existing target row
-                existing.weight_basis_points += row.weight_basis_points;
-                existing.confidence = match (existing.confidence, row.confidence) {
-                    (Some(a), Some(b)) => Some(a.max(b)),
-                    (a, b) => a.or(b),
-                };
-                target_combined = true;
-            } else {
-                // No target row yet; retarget source → target
-                let mut new_row = row.clone();
-                new_row.work_item_id = Some(target_id.to_string());
-                // Derive a role suffix when combining later
-                result.push(new_row);
-            }
-        } else if is_target && target_combined {
-            // Already combined into the retargeted source row above;
-            // this shouldn't happen because we process sequentially, but guard.
-            continue;
+        let mut row = row.clone();
+        if row.work_item_id.as_deref() == Some(source_id) {
+            row.work_item_id = Some(target_id.to_string());
+        }
+        if let Some(existing) = result
+            .iter_mut()
+            .find(|r| r.work_item_id == row.work_item_id)
+        {
+            existing.weight_basis_points = existing
+                .weight_basis_points
+                .saturating_add(row.weight_basis_points);
+            existing.confidence = match (existing.confidence, row.confidence) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
         } else {
-            // Keep unmodified
-            result.push(row.clone());
+            result.push(row);
         }
     }
-
-    // Second pass: if target appeared AFTER the source row in the original,
-    // we need to combine it into the already-pushed retargeted row.
-    let mut final_result: Vec<AttrRow> = Vec::new();
-    let mut seen_target = false;
-    for row in result {
-        let is_target = row.work_item_id.as_deref() == Some(target_id);
-        if is_target {
-            if seen_target {
-                // Duplicate target; combine into the first
-                if let Some(first) = final_result
-                    .iter_mut()
-                    .find(|r| r.work_item_id.as_deref() == Some(target_id))
-                {
-                    first.weight_basis_points += row.weight_basis_points;
-                    first.confidence = match (first.confidence, row.confidence) {
-                        (Some(a), Some(b)) => Some(a.max(b)),
-                        (a, b) => a.or(b),
-                    };
-                    continue;
-                }
-            }
-            seen_target = true;
-        }
-        final_result.push(row);
-    }
-
-    final_result
+    result
 }
 
 /// For split: reproduce all rows from the old group, but retarget the source's
@@ -999,7 +966,76 @@ fn split_attribution_rows(
 mod tests {
     use super::*;
     use crate::Ledger;
-    use crate::manual::{ManualStartInput, start_manual, stop_manual};
+    use crate::manual::{ManualCounts, ManualStartInput, start_manual, stop_manual};
+
+    /// V5: the manual run's span must reference the usage event row that was
+    /// actually ingested. The old hand-rolled event id diverged from the
+    /// insert path's `stable_id("evt", canonical_identity())`, so the span
+    /// pointed at a non-existent row and manual runs vanished from trees.
+    #[test]
+    fn manual_span_references_real_usage_event() {
+        let mut ledger = Ledger::open_memory().unwrap();
+        let run = start_manual(
+            ledger.connection_mut(),
+            ManualStartInput {
+                project_key: "space-game",
+                project_title: Some("Space Game"),
+                task_title: "Fix collision bug",
+                parent_title: None,
+                cwd: "/tmp/game",
+            },
+        )
+        .unwrap();
+        stop_manual(
+            ledger.connection_mut(),
+            ManualCounts {
+                input: Some(100),
+                output: Some(50),
+                cache_read: None,
+                cache_write: None,
+                reasoning: None,
+                model: Some("manual-model".into()),
+            },
+        )
+        .unwrap();
+
+        let measured_json: String = ledger
+            .connection()
+            .query_row(
+                "SELECT measured_usage_json FROM usage_spans WHERE session_id = ?1",
+                [&run.session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&measured_json).unwrap();
+        let span_event_id = parsed["usage_event_id"].as_str().unwrap();
+
+        let event_exists: i64 = ledger
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM usage_events WHERE id = ?1",
+                [span_event_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            event_exists, 1,
+            "span's usage_event_id must reference a real usage_events row"
+        );
+
+        // And the tree join (usage_spans → usage_events via that id) resolves.
+        let joined: i64 = ledger
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM usage_spans us
+                 JOIN usage_events ue ON ue.id = json_extract(us.measured_usage_json, '$.usage_event_id')
+                 WHERE us.session_id = ?1",
+                [&run.session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(joined, 1);
+    }
 
     #[test]
     fn attach_detach_and_notes_work_correctly() {

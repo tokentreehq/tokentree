@@ -232,7 +232,17 @@ enum ImportSource {
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("{error:#}");
+        // P4: redact the home-directory prefix from error output so pasted
+        // bug reports / shared logs don't leak the operator's username.
+        // Paths under home become `~/...`; anything else is untouched.
+        let mut msg = format!("{error:#}");
+        if let Some(home) = dirs::home_dir() {
+            let home_str = home.to_string_lossy();
+            if !home_str.is_empty() {
+                msg = msg.replace(home_str.as_ref(), "~");
+            }
+        }
+        eprintln!("{msg}");
         std::process::exit(2);
     }
 }
@@ -386,22 +396,40 @@ fn run() -> Result<()> {
             // H2: the loopback receiver requires a per-run bearer secret so a
             // malicious local process cannot append poisoned rows to the
             // append-only ledger. Pin via TOKENTREE_OTLP_TOKEN for automation.
-            let auth = match std::env::var("TOKENTREE_OTLP_TOKEN") {
-                Ok(token) if !token.trim().is_empty() => tokentree_otel::OtlpAuth {
-                    bearer_token: token,
-                },
-                _ => tokentree_otel::OtlpAuth::generate(),
+            let (auth, from_env) = match std::env::var("TOKENTREE_OTLP_TOKEN") {
+                Ok(token) if !token.trim().is_empty() => (
+                    tokentree_otel::OtlpAuth {
+                        bearer_token: token,
+                    },
+                    true,
+                ),
+                _ => (tokentree_otel::OtlpAuth::generate(), false),
             };
             println!("TokenTree OTLP receiver: http://{address}/v1/logs");
-            println!("Bearer token (required on every ingest request):");
-            println!("  {}\n", auth.bearer_token);
+            if from_env {
+                // L13: never echo a user-supplied secret — they already know it.
+                println!(
+                    "Bearer token: using TOKENTREE_OTLP_TOKEN from the environment (not shown)."
+                );
+            } else {
+                // L13: generated tokens are shown ONCE so the sender can be
+                // configured, then never again. Prefer TOKENTREE_OTLP_TOKEN.
+                println!("Bearer token (generated for this run only — copy it now):");
+                println!("  {}\n", auth.bearer_token);
+                println!("Tip: set TOKENTREE_OTLP_TOKEN to reuse a token across runs.");
+            }
             println!("Point the sender at this endpoint with:");
             println!("  export OTEL_EXPORTER_OTLP_PROTOCOL=http/json");
             println!("  export OTEL_EXPORTER_OTLP_ENDPOINT=http://{address}");
-            println!(
-                "  export OTEL_EXPORTER_OTLP_HEADERS=\"Authorization=Bearer {}\"",
-                auth.bearer_token
-            );
+            if from_env {
+                println!(
+                    "  export OTEL_EXPORTER_OTLP_HEADERS=\"Authorization=Bearer $TOKENTREE_OTLP_TOKEN\""
+                );
+            } else {
+                println!(
+                    "  export OTEL_EXPORTER_OTLP_HEADERS=\"Authorization=Bearer <paste-the-token-above>\""
+                );
+            }
             let ledger = ledger(&home)?;
             tokio::runtime::Runtime::new()?.block_on(tokentree_otel::serve(address, ledger, auth))
         }
@@ -550,6 +578,8 @@ fn import_claude(home: &Path, root: PathBuf) -> Result<()> {
     let mut ledger = ledger(home)?;
     let mut inserted = 0;
     let mut duplicates = 0;
+    let mut conflicts = 0;
+    let mut poisoned = 0;
     let mut unknown = 0;
     let mut malformed = 0;
     for path in &sessions {
@@ -600,6 +630,11 @@ fn import_claude(home: &Path, root: PathBuf) -> Result<()> {
         let summary = ledger.ingest(parsed.observations)?;
         inserted += summary.inserted;
         duplicates += summary.duplicates;
+        // V6: surface dedup value-conflicts (same identity, different token
+        // values) and L10 poison-row quarantines — both flag data-quality
+        // issues the operator should see.
+        conflicts += summary.conflicts;
+        poisoned += summary.poisoned;
         // Mirror the TypeScript import flow: every imported session gets a
         // default project/work-item attribution so reports render trees
         // instead of "No projects".
@@ -614,6 +649,7 @@ fn import_claude(home: &Path, root: PathBuf) -> Result<()> {
         "{}",
         serde_json::to_string_pretty(&json!({
             "sessions": sessions.len(), "inserted": inserted, "duplicates": duplicates,
+            "conflicts": conflicts, "poisoned": poisoned,
             "unknown": unknown, "malformed": malformed,
         }))?
     );
@@ -949,6 +985,15 @@ fn split(
 }
 
 fn classify(home: &Path) -> Result<()> {
+    // S3 — concurrency: two `classify` runs may overlap (e.g. a cron poll
+    // racing a manual run). They serialize on SQLite's write lock
+    // (busy_timeout=5000 in Ledger::open); all writes are idempotent
+    // (INSERT OR IGNORE with stable content-derived IDs), so the worst case
+    // is a transient SQLITE_BUSY or double-counted per-run summary stats —
+    // never ledger corruption or double-ingested events. The spool
+    // checkpoint is only advanced inside the same transaction that ingests
+    // the events, so a loser of the lock race re-reads already-ingested
+    // bytes as idempotent no-ops.
     let mut ledger = ledger(home)?;
     let spool = home.join("spool/claude-hooks.jsonl");
     let summary = ledger.process_claude_hook_spool(&spool)?;

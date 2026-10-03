@@ -448,12 +448,20 @@ pub fn calculate_cost_micros(
     usage: &TokenUsage,
     rates: &ExactRates<'_>,
 ) -> Result<Option<u64>, String> {
+    // L5: reasoning tokens are billed as output tokens by every major
+    // provider (Anthropic extended thinking, OpenAI reasoning). When the
+    // snapshot has no explicit reasoning rate, fall back to the output rate
+    // instead of discarding the whole event's otherwise priceable
+    // input/output categories as unavailable.
+    let reasoning_rate = rates
+        .reasoning_per_million
+        .or(Some(rates.output_per_million));
     let categories = [
         (usage.input_tokens, Some(rates.input_per_million)),
         (usage.cached_input_tokens, rates.cached_input_per_million),
         (usage.cache_write_tokens, rates.cache_write_per_million),
         (usage.output_tokens, Some(rates.output_per_million)),
-        (usage.reasoning_tokens, rates.reasoning_per_million),
+        (usage.reasoning_tokens, reasoning_rate),
     ];
     let mut total = 0_u128;
     for (tokens, rate) in categories {
@@ -463,8 +471,17 @@ pub fn calculate_cost_micros(
         }
         let Some(rate) = rate else { return Ok(None) };
         let rate_micros = decimal_dollars_to_micros(rate)?;
+        // L12: checked arithmetic — hostile token counts * hostile rates
+        // must error, not wrap (release) or panic (debug).
+        let product = u128::from(tokens)
+            .checked_mul(rate_micros)
+            .ok_or_else(|| "cost overflow".to_owned())?;
+        let rounded = product
+            .checked_add(500_000)
+            .ok_or_else(|| "cost overflow".to_owned())?
+            / 1_000_000;
         total = total
-            .checked_add((u128::from(tokens) * rate_micros + 500_000) / 1_000_000)
+            .checked_add(rounded)
             .ok_or_else(|| "cost overflow".to_owned())?;
     }
     u64::try_from(total)
@@ -488,7 +505,13 @@ fn decimal_dollars_to_micros(value: &str) -> Result<u128, String> {
     let fractional: u128 = padded
         .parse()
         .map_err(|_| format!("invalid USD rate: {value}"))?;
-    Ok(whole * 1_000_000 + fractional)
+    // L8: checked multiply — a 20–38 digit whole part parses into u128
+    // fine but `whole * 1_000_000` would overflow (panic in debug, silent
+    // wrap in release). The function promises Result for bad input.
+    whole
+        .checked_mul(1_000_000)
+        .and_then(|scaled| scaled.checked_add(fractional))
+        .ok_or_else(|| format!("USD rate out of range: {value}"))
 }
 
 /// Formats an exact micro-dollar amount as a standard USD string with the specified
@@ -513,6 +536,113 @@ pub fn format_micros_to_dollars(micros: u64, decimals: usize) -> String {
 #[must_use]
 pub fn sha256_hex(value: &[u8]) -> String {
     hex::encode(Sha256::digest(value))
+}
+
+/// L9: hard cap on a single buffered line. Transcript JSONL lines are
+/// normally KBs; a 16 MiB line is already pathological. Lines beyond this
+/// are skipped and counted, never fully buffered — a degenerate
+/// multi-hundred-MB line must not OOM the import worker.
+pub const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+
+/// L9: hard cap on a whole file read into memory. Session files beyond
+/// this are rejected with a descriptive error instead of being buffered.
+pub const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// L9: read one line with a hard cap on buffering.
+///
+/// Returns `Ok(None)` at EOF, otherwise the bytes consumed from the reader
+/// and whether the line was truncated. An oversize line's remainder is
+/// discarded in bounded chunks (stopping exactly at the newline via
+/// `fill_buf`/`consume`, so offsets stay exact); the caller should skip
+/// and count the line.
+pub fn read_capped_line<R: std::io::BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<Option<(u64, bool)>> {
+    buf.clear();
+    // One byte past the cap so "exactly MAX_LINE_BYTES + newline" still fits.
+    let cap = MAX_LINE_BYTES as u64 + 1;
+    let mut consumed = 0u64;
+
+    loop {
+        // Scope the fill_buf borrow so consume() can follow.
+        let (take, saw_newline) = {
+            let filled = reader.fill_buf()?;
+            if filled.is_empty() {
+                break; // EOF
+            }
+            let upto_newline = match filled.iter().position(|&b| b == b'\n') {
+                Some(pos) => pos + 1, // include the newline
+                None => filled.len(),
+            };
+            let remaining = cap.saturating_sub(buf.len() as u64) as usize;
+            let take = upto_newline.min(remaining).min(filled.len());
+            let saw_newline = take > 0 && filled[take - 1] == b'\n';
+            buf.extend_from_slice(&filled[..take]);
+            (take, saw_newline)
+        };
+        reader.consume(take);
+        consumed += take as u64;
+
+        if saw_newline {
+            return Ok(Some((consumed, false)));
+        }
+        if buf.len() as u64 >= cap {
+            // Oversize line: discard the remainder in bounded chunks,
+            // stopping exactly at the newline so offsets stay exact.
+            loop {
+                let newline_at = {
+                    let rest = reader.fill_buf()?;
+                    if rest.is_empty() {
+                        None
+                    } else {
+                        Some(rest.iter().position(|&b| b == b'\n'))
+                    }
+                };
+                match newline_at {
+                    None => break, // EOF (or empty fill)
+                    Some(Some(pos)) => {
+                        reader.consume(pos + 1);
+                        consumed += (pos + 1) as u64;
+                        break;
+                    }
+                    Some(None) => {
+                        // No newline in this chunk; consume the whole chunk.
+                        // Re-fill to get its length after the borrow ends.
+                        let len = {
+                            let rest = reader.fill_buf()?;
+                            rest.len()
+                        };
+                        reader.consume(len);
+                        consumed += len as u64;
+                    }
+                }
+            }
+            return Ok(Some((consumed, true)));
+        }
+    }
+
+    if buf.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((consumed, false)))
+}
+
+/// L9: enforce [`MAX_FILE_BYTES`] before a whole-file read. Returns an
+/// error naming the path and sizes instead of buffering a degenerate file.
+pub fn check_file_size(path: &std::path::Path) -> Result<u64, String> {
+    let size = std::fs::metadata(path)
+        .map(|m| m.len())
+        .map_err(|e| format!("stat {}: {e}", path.display()))?;
+    if size > MAX_FILE_BYTES {
+        return Err(format!(
+            "refusing to buffer {} ({} bytes exceeds {} MiB cap)",
+            path.display(),
+            size,
+            MAX_FILE_BYTES / (1024 * 1024)
+        ));
+    }
+    Ok(size)
 }
 
 /// Canonical stable-ID derivation: `{prefix}_{sha256(value)[..24 hex]}`.
@@ -623,6 +753,106 @@ mod tests {
         assert_eq!(
             calculate_cost_micros(&usage, &rates).unwrap(),
             Some(22_050_000)
+        );
+    }
+
+    /// L5: reasoning tokens with no explicit reasoning rate must not nuke
+    /// the whole event — they fall back to the output rate (industry
+    /// convention: reasoning is billed as output).
+    #[test]
+    fn reasoning_tokens_fall_back_to_output_rate() {
+        let usage = TokenUsage {
+            input_tokens: Some(1_000_000),
+            cached_input_tokens: None,
+            cache_write_tokens: None,
+            output_tokens: Some(1_000_000),
+            reasoning_tokens: Some(1_000_000),
+        };
+        let rates = ExactRates {
+            input_per_million: "3.00",
+            cached_input_per_million: None,
+            cache_write_per_million: None,
+            output_per_million: "15.00",
+            reasoning_per_million: None,
+        };
+        // 3.00 + 15.00 + 15.00 (reasoning at output rate), in micros.
+        assert_eq!(
+            calculate_cost_micros(&usage, &rates).unwrap(),
+            Some(33_000_000)
+        );
+    }
+
+    /// L9: oversize lines are truncated (not buffered); offsets stay exact.
+    #[test]
+    fn capped_line_reader_skips_oversize_lines() {
+        use std::io::BufReader;
+        // Build: normal line, oversize line (> MAX_LINE_BYTES, no newline
+        // until the very end), then another normal line.
+        let mut data = b"first\n".to_vec();
+        data.extend(vec![b'x'; MAX_LINE_BYTES + 100]);
+        data.extend(b"\nthird\n");
+        let mut reader = BufReader::new(&data[..]);
+        let mut buf = Vec::new();
+
+        let (c1, t1) = read_capped_line(&mut reader, &mut buf).unwrap().unwrap();
+        assert!(!t1);
+        assert_eq!(&buf, b"first\n");
+        assert_eq!(c1, 6);
+
+        let (c2, t2) = read_capped_line(&mut reader, &mut buf).unwrap().unwrap();
+        assert!(t2, "oversize line must be flagged truncated");
+        // Consumed = whole oversize line including its newline.
+        assert_eq!(c2, (MAX_LINE_BYTES + 100 + 1) as u64);
+
+        let (c3, t3) = read_capped_line(&mut reader, &mut buf).unwrap().unwrap();
+        assert!(!t3);
+        assert_eq!(&buf, b"third\n");
+        assert_eq!(c3, 6);
+
+        assert!(read_capped_line(&mut reader, &mut buf).unwrap().is_none());
+    }
+
+    /// L8: a huge whole part must return Err, not panic (debug) or wrap
+    /// (release).
+    #[test]
+    fn huge_rate_returns_error_not_overflow() {
+        let usage = TokenUsage {
+            input_tokens: Some(1),
+            cached_input_tokens: None,
+            cache_write_tokens: None,
+            output_tokens: None,
+            reasoning_tokens: None,
+        };
+        let rates = ExactRates {
+            input_per_million: "340282366920938463463374607431768211455",
+            cached_input_per_million: None,
+            cache_write_per_million: None,
+            output_per_million: "15.00",
+            reasoning_per_million: None,
+        };
+        assert!(calculate_cost_micros(&usage, &rates).is_err());
+    }
+
+    /// L5: an explicit reasoning rate takes precedence over the fallback.
+    #[test]
+    fn explicit_reasoning_rate_wins() {
+        let usage = TokenUsage {
+            input_tokens: None,
+            cached_input_tokens: None,
+            cache_write_tokens: None,
+            output_tokens: None,
+            reasoning_tokens: Some(1_000_000),
+        };
+        let rates = ExactRates {
+            input_per_million: "3.00",
+            cached_input_per_million: None,
+            cache_write_per_million: None,
+            output_per_million: "15.00",
+            reasoning_per_million: Some("7.50"),
+        };
+        assert_eq!(
+            calculate_cost_micros(&usage, &rates).unwrap(),
+            Some(7_500_000)
         );
     }
 

@@ -365,6 +365,7 @@ fn h8_usage_totals_add_saturates_on_overflow() {
         requests: u64::MAX,
         measured: u64::MAX,
         unavailable: u64::MAX,
+        anomalous: u64::MAX,
         priced: u64::MAX,
         amount_micros: u64::MAX,
     };
@@ -377,6 +378,7 @@ fn h8_usage_totals_add_saturates_on_overflow() {
         requests: 1,
         measured: 1,
         unavailable: 1,
+        anomalous: 1,
         priced: 1,
         amount_micros: 1,
     };

@@ -4,7 +4,7 @@ use chrono::Utc;
 use serde_json::Value;
 use sha2::Digest;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use tokentree_core::{MeasurementSource, TokenUsage, UsageObservation, canonical_source_kind};
 use walkdir::WalkDir;
@@ -62,20 +62,41 @@ pub fn parse_session(path: &Path) -> Result<ParseResult> {
     let mut prior_snapshots: std::collections::HashMap<String, TokenUsage> =
         std::collections::HashMap::new();
 
-    for line in BufReader::new(file).lines() {
-        let line = match line {
+    // L9: bounded line buffering — a degenerate multi-hundred-MB line is
+    // skipped and counted instead of being fully buffered (OOM).
+    let mut reader = BufReader::new(file);
+    let mut raw_buf = Vec::new();
+    loop {
+        let (consumed, truncated) =
+            match tokentree_core::read_capped_line(&mut reader, &mut raw_buf) {
+                Ok(Some(v)) => v,
+                Ok(None) => break,
+                Err(_) => {
+                    stats.malformed += 1;
+                    continue;
+                }
+            };
+        let line_offset = offset;
+        offset += consumed;
+        if truncated {
+            stats.malformed += 1;
+            continue;
+        }
+        // Strip the trailing newline; read_capped_line keeps it in the buffer.
+        if raw_buf.ends_with(b"\n") {
+            raw_buf.pop();
+        }
+        let line = match std::str::from_utf8(&raw_buf) {
             Ok(line) => line,
             Err(_) => {
                 stats.malformed += 1;
                 continue;
             }
         };
-        let line_offset = offset;
-        offset += line.len() as u64 + 1;
         if line.trim().is_empty() {
             continue;
         }
-        let record: Value = match serde_json::from_str(&line) {
+        let record: Value = match serde_json::from_str(line) {
             Ok(Value::Object(record)) => Value::Object(record),
             _ => {
                 stats.malformed += 1;

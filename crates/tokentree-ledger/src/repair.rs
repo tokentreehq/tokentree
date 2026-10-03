@@ -24,7 +24,7 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use rusqlite::{Connection, params};
 
-use crate::stable_id;
+use crate::{replace_usage_events_triggers, stable_id};
 use tokentree_core::source_kind;
 
 /// Maintenance-log kind for this repair.
@@ -47,14 +47,22 @@ pub fn snapshot_generation_conflicts(
     let incoming_old = PRE_DELTA_FIX_PARSER_VERSIONS.contains(&incoming_parser_version);
     let mut conflicts = Vec::new();
     for session_id in session_ids {
+        // L6: both snapshot-delta flavors — the pre-fix cumulative bug
+        // existed in the Hermes delta path too, and a mixed-generation
+        // Hermes import double-counts just the same.
         let mut stmt = connection.prepare(
             "SELECT DISTINCT parser_version FROM usage_events
-             WHERE source_kind = ?1 AND session_id = ?2",
+             WHERE source_kind IN (?1, ?2) AND session_id = ?3",
         )?;
         let existing: Vec<String> = stmt
-            .query_map(params![source_kind::SNAPSHOT_DELTA, session_id], |row| {
-                row.get(0)
-            })?
+            .query_map(
+                params![
+                    source_kind::SNAPSHOT_DELTA,
+                    source_kind::HERMES_SNAPSHOT_DELTA,
+                    session_id
+                ],
+                |row| row.get(0),
+            )?
             .collect::<std::result::Result<_, _>>()?;
         if existing.is_empty() {
             continue;
@@ -154,7 +162,12 @@ fn load_candidate_rows(connection: &Connection) -> Result<Vec<SnapshotRow>> {
                 output_tokens, reasoning_tokens
          FROM usage_events
          WHERE source_kind = '{}' AND parser_version IN ({version_list})
-         ORDER BY coalesce(session_id, ''), observed_at, source_offset",
+         -- L6: observed_at is TEXT; mixed timestamp formats (e.g. with and
+         -- without timezone offsets) do NOT sort chronologically as raw
+         -- text. datetime() normalizes parseable ISO-8601 to UTC; the
+         -- coalesce keeps unparseable values in their legacy text order
+         -- instead of silently sorting them first as NULLs.
+         ORDER BY coalesce(session_id, ''), coalesce(datetime(observed_at), observed_at), source_offset",
         source_kind::SNAPSHOT_DELTA
     );
     let mut stmt = connection.prepare(&sql)?;
@@ -224,16 +237,6 @@ fn drop_append_only_triggers(tx: &rusqlite::Transaction) -> Result<()> {
     tx.execute_batch(
         "DROP TRIGGER IF EXISTS usage_events_no_update;
          DROP TRIGGER IF EXISTS usage_events_no_delete;",
-    )?;
-    Ok(())
-}
-
-fn recreate_append_only_triggers(tx: &rusqlite::Transaction) -> Result<()> {
-    tx.execute_batch(
-        "CREATE TRIGGER usage_events_no_update BEFORE UPDATE ON usage_events
-         BEGIN SELECT RAISE(ABORT, 'usage_events are append-only'); END;
-         CREATE TRIGGER usage_events_no_delete BEFORE DELETE ON usage_events
-         BEGIN SELECT RAISE(ABORT, 'usage_events are append-only'); END;",
     )?;
     Ok(())
 }
@@ -429,7 +432,7 @@ pub fn apply_snapshot_overcount_repair(
             ],
         )?;
     }
-    recreate_append_only_triggers(&tx)?;
+    replace_usage_events_triggers(&tx)?;
     tx.commit()?;
     Ok(SnapshotRepairOutcome {
         run_id,
@@ -497,6 +500,15 @@ pub fn restore_snapshot_repair(
             ])?;
         }
     }
+    // L6: a restore returns the DB to its pre-repair state, so the repair's
+    // own negative-delta anomaly rows must go too — otherwise they reference
+    // a repair that no longer exists and a future repair would double-report.
+    tx.execute(
+        "DELETE FROM measurement_anomalies
+         WHERE type = 'snapshot_repair_negative_delta'
+           AND json_extract(source_values_json, '$.repair_run_id') = ?1",
+        [&target_run],
+    )?;
     // Clear the completion record: the DB is back to its pre-repair state,
     // so a future repair must be allowed to run again.
     tx.execute(
@@ -506,7 +518,7 @@ pub fn restore_snapshot_repair(
             SNAPSHOT_OVERCOUNT_REPAIR_VERSION
         ],
     )?;
-    recreate_append_only_triggers(&tx)?;
+    replace_usage_events_triggers(&tx)?;
     tx.commit()?;
     Ok(SnapshotRepairOutcome {
         run_id: target_run,
@@ -898,5 +910,50 @@ mod tests {
             snapshot_generation_conflicts(conn, &["ses_missing".to_string()], "0.2.1-rust")
                 .unwrap();
         assert!(conflicts.is_empty());
+    }
+
+    /// V3: the trigger installer shared with `repair.rs` must keep the
+    /// truth-ladder carve-out. After a repair drops and reinstalls the
+    /// append-only guards, a legitimate `superseded_by` tombstone write
+    /// must succeed while any other UPDATE/DELETE is still blocked.
+    #[test]
+    fn reinstalled_triggers_keep_superseded_by_carve_out() {
+        let ledger = Ledger::open_memory().unwrap();
+        insert_transcript_row(ledger.connection(), "t1", "ses_t");
+        // Simulate the repair path: drop guards, then reinstall via the
+        // single shared installer.
+        ledger
+            .connection()
+            .execute_batch(
+                "DROP TRIGGER IF EXISTS usage_events_no_update;
+                 DROP TRIGGER IF EXISTS usage_events_no_delete;",
+            )
+            .unwrap();
+        replace_usage_events_triggers(ledger.connection()).unwrap();
+
+        // The truth-ladder tombstone transition is allowed.
+        let marked = ledger
+            .connection()
+            .execute(
+                "UPDATE usage_events SET superseded_by = 'evt_new' WHERE id = 't1'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(marked, 1);
+
+        // Any other mutation is still blocked.
+        let err = ledger
+            .connection()
+            .execute(
+                "UPDATE usage_events SET input_tokens = 999 WHERE id = 't1'",
+                [],
+            )
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("append-only"));
+        let err = ledger
+            .connection()
+            .execute("DELETE FROM usage_events WHERE id = 't1'", [])
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("append-only"));
     }
 }
