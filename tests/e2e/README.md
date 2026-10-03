@@ -39,16 +39,28 @@ clean recovery from `kill -9` mid-migration.
 
 ```bash
 # upgrade suite needs two binaries:
-#   OLD: cargo build --release --bin tokentree @ the base commit
+#   OLD: built from the previous release tag (CI does this via git worktree)
 #   NEW: cargo build --release --bin tokentree @ HEAD
 ./tests/e2e/upgrade/01-populate-old.sh
 ./tests/e2e/upgrade/02-baseline.sh /tmp/e2e/home-old /tmp/e2e/baseline
-# ...then follow tests/e2e/upgrade/README.md steps 3-9
+./tests/e2e/upgrade/03-verify-upgrade.sh /tmp/e2e/home-old /tmp/e2e/baseline
+# ...then follow tests/e2e/upgrade/README.md steps 4 and 7 manually
+# (they need the ad-hoc crafted fixtures from the original run, never committed)
 
 # repair/privacy suites need one release binary:
 TOKENTREE_BIN=/path/to/tokentree ./tests/e2e/repair-privacy/s1_repair.sh
 ```
 
-These are runbooks, not CI gates — they take minutes and need manual
-baseline comparison. Keep them executable and don't modify their logic
-without re-running the full suite.
+## CI
+
+`.github/workflows/ci.yml` job `e2e` runs these on every push/PR:
+
+- **repair-privacy** (`s1_repair.sh`, `s2_providers.sh`, `s3_privacy.sh`) — every run.
+- **upgrade** (`01-populate-old.sh`, `02-baseline.sh`, `03-verify-upgrade.sh`) —
+  only on `main` pushes and tags: it builds a second (old) binary from the
+  previous release tag, which is too slow for every PR.
+
+The remaining upgrade runbook steps (4: cross-batch truth ladder, 7:
+`restore_source_kind_backup` round-trip) stay manual — they depend on
+fixtures that were never committed. Keep all scripts executable and don't
+modify their logic without re-running the full suite.
