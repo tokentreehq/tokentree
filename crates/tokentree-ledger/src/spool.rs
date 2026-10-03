@@ -150,16 +150,25 @@ fn ingest_spool_lines(
 
     loop {
         raw_buf.clear();
-        let bytes_read = match reader.read_until(b'\n', &mut raw_buf) {
-            Ok(0) => break,
-            Ok(n) => n,
+        // L9: bounded line reads — a degenerate multi-hundred-MB hook line
+        // must not OOM the worker. Oversize lines are skipped (fingerprinted
+        // to quarantine) with exact offset accounting.
+        let (consumed, truncated) = match tokentree_core::read_capped_line(reader, &mut raw_buf) {
+            Ok(Some(v)) => v,
+            Ok(None) => break,
             Err(e) => {
                 eprintln!("tokentree: spool read error at offset {current_offset}: {e}");
                 break;
             }
         };
         let line_start = current_offset;
-        current_offset += bytes_read as u64;
+        current_offset += consumed;
+
+        if truncated {
+            quarantine_oversize_line(quarantine_path, line_start, &raw_buf);
+            summary.quarantined += 1;
+            continue;
+        }
 
         // M3: a final line without a trailing newline means the hook writer
         // is mid-append (writers always terminate lines with `\n`;
@@ -278,6 +287,17 @@ fn maybe_rotate_spool(
     spool_path: &Path,
     max_bytes: u64,
 ) -> Result<()> {
+    // S2 — rotation identity contract. The spool file has no stable identity
+    // (no inode tracking); instead rotation is gated on *full ingestion*:
+    // it only fires when the checkpoint's last_offset >= the file's current
+    // size, i.e. every byte has been ingested and the checkpoint committed.
+    // After the rename the checkpoint resets to offset 0 for the fresh file
+    // (V1), so a new file is always read from the start. This gate is
+    // airtight for the append-only hook writer. Known limitation: an
+    // out-of-band truncate+rewrite of the spool file between the poll's
+    // checkpoint commit and this size check could rotate un-ingested
+    // content; only the hook writer touches this file, so this is not
+    // reachable in normal operation.
     // The quarantine file is write-only forensic data (never re-read by
     // ingestion), so it rotates on size alone, independent of the spool.
     let quarantine_path = quarantine_path_for(spool_path);
@@ -401,6 +421,41 @@ fn quarantine_path_for(spool_path: &Path) -> std::path::PathBuf {
 /// by design: quarantining must never itself fail ingestion, so all IO errors
 /// are swallowed after a stderr notice. The quarantine file keeps the 0600
 /// treatment as defense-in-depth.
+/// P2: scrub an error string before persisting it to the quarantine file.
+/// Hook payloads may contain prompt text, and a future
+/// `with_context(|| format!(...payload...))` on the `apply_hook_event` path
+/// would otherwise land that text on disk. Any token from the raw hook line
+/// that leaked into the error message is redacted; the full error still goes
+/// to stderr (ephemeral), and the quarantine record keeps the raw line's
+/// SHA-256 fingerprint for forensics.
+fn scrub_error_for_quarantine(error: &anyhow::Error, raw_line: &str) -> String {
+    use std::collections::HashSet;
+    let msg = error.to_string();
+    // Index the raw line's tokens: anything in the error that also appears
+    // in the raw hook line is treated as potential payload leakage.
+    let raw_tokens: HashSet<&str> = raw_line
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() >= 4)
+        .collect();
+    let scrubbed: Vec<String> = msg
+        .split_whitespace()
+        .map(|word| {
+            let core = word.trim_matches(|c: char| !c.is_alphanumeric());
+            if core.len() >= 4 && raw_tokens.contains(core) {
+                "[redacted]".to_string()
+            } else {
+                word.to_string()
+            }
+        })
+        .collect();
+    let mut result = scrubbed.join(" ");
+    if result.len() > 300 {
+        result.truncate(300);
+        result.push_str("…[truncated]");
+    }
+    result
+}
+
 fn quarantine_poison_event(
     quarantine_path: &Path,
     adapter: &str,
@@ -432,7 +487,7 @@ fn quarantine_poison_event(
                 "event_kind": event_kind,
                 "event_fingerprint": tokentree_core::sha256_hex(raw_line.as_bytes()),
                 "source_offset": source_offset,
-                "error": error.to_string(),
+                "error": scrub_error_for_quarantine(error, raw_line),
             });
             if writeln!(file, "{record}").is_err() {
                 eprintln!("tokentree: failed to write quarantined spool event: {error}");
@@ -482,6 +537,48 @@ fn quarantine_malformed_bytes(quarantine_path: &Path, source_offset: u64, raw_by
             });
             if writeln!(file, "{record}").is_err() {
                 eprintln!("tokentree: failed to write quarantined malformed spool bytes");
+            }
+        }
+        Err(io_err) => {
+            eprintln!(
+                "tokentree: cannot open quarantine file {} ({io_err})",
+                quarantine_path.display()
+            );
+        }
+    }
+}
+
+/// L9: quarantine the fingerprint of an oversize spool line that was skipped
+/// by the bounded reader. Only the first MAX_LINE_BYTES are fingerprinted
+/// (the remainder was discarded without buffering); the raw content is
+/// NEVER persisted.
+fn quarantine_oversize_line(quarantine_path: &Path, source_offset: u64, partial: &[u8]) {
+    use std::io::Write as _;
+    if let Some(parent) = quarantine_path.parent() {
+        if fs::create_dir_all(parent).is_err() {
+            eprintln!("tokentree: cannot create quarantine dir for oversize spool line");
+            return;
+        }
+    }
+    let mut options = fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(quarantine_path) {
+        Ok(mut file) => {
+            let record = serde_json::json!({
+                "quarantined_at": chrono::Utc::now().to_rfc3339(),
+                "adapter": "claude-hook",
+                "label": "oversize spool line skipped",
+                "event_kind": "unknown",
+                "event_fingerprint": tokentree_core::sha256_hex(partial),
+                "source_offset": source_offset,
+            });
+            if writeln!(file, "{record}").is_err() {
+                eprintln!("tokentree: failed to write quarantined oversize spool line");
             }
         }
         Err(io_err) => {
@@ -668,6 +765,24 @@ mod tests {
     use serde_json::json;
     use std::io::Write;
     use tempfile::tempdir;
+
+    /// P2 canary: prompt text that leaks into an error string must not reach
+    /// the quarantine file — only the fingerprint and a scrubbed error.
+    #[test]
+    fn quarantine_error_scrubs_raw_line_content() {
+        let raw_line = r#"{"kind":"SessionStart","payload":{"session_id":"abc123","prompt":"my secret prompt text here"}}"#;
+        // Simulate a future with_context! that interpolates payload data.
+        let err = anyhow::anyhow!("hook apply failed for payload my secret prompt text here: db busy");
+        let scrubbed = scrub_error_for_quarantine(&err, raw_line);
+        assert!(!scrubbed.contains("my secret prompt text here"), "raw line content leaked: {scrubbed}");
+        assert!(scrubbed.contains("[redacted]"));
+        assert!(scrubbed.contains("db busy"));
+        // Long errors are bounded.
+        let long_err = anyhow::anyhow!("{}", "x".repeat(1000));
+        let scrubbed = scrub_error_for_quarantine(&long_err, raw_line);
+        assert!(scrubbed.len() <= 320);
+        assert!(scrubbed.ends_with("[truncated]"));
+    }
 
     #[test]
     fn processes_claude_hooks_safely() {
@@ -1049,6 +1164,64 @@ mod tests {
             "quarantine must carry the bad bytes' fingerprint"
         );
         assert!(quarantined.contains("malformed spool bytes skipped"));
+    }
+
+    /// L9: a spool line over MAX_LINE_BYTES is skipped (fingerprinted to
+    /// quarantine) without buffering the whole line; the lines around it
+    /// still ingest and the checkpoint advances past the oversize bytes.
+    #[test]
+    fn oversize_spool_line_is_skipped_without_oom() {
+        let dir = tempdir().unwrap();
+        let spool_path = dir.path().join("claude-hooks.jsonl");
+        let quarantine_path = dir.path().join("claude-hooks.quarantine.jsonl");
+
+        let hook = |session: &str| {
+            format!(
+                "{}\n",
+                json!({
+                    "version": 1,
+                    "kind": "UserPromptSubmit",
+                    "capturedAt": "2026-09-29T10:00:00Z",
+                    "payload": {
+                        "session_id": session,
+                        "prompt_fingerprint": "abc12345",
+                        "cwd": dir.path().to_str().unwrap()
+                    }
+                })
+            )
+        };
+        let mut raw: Vec<u8> = Vec::new();
+        raw.extend_from_slice(hook("ses_big_1").as_bytes());
+        // One line just over the 16 MiB cap: valid JSON prefix, then padding.
+        let mut big = b"{\"kind\":\"UserPromptSubmit\",\"payload\":{\"session_id\":\"ses_big_mid\",\"pad\":\"".to_vec();
+        big.extend(std::iter::repeat(b'x').take(17 * 1024 * 1024));
+        big.extend_from_slice(b"\"}}\n");
+        let big_start = raw.len();
+        raw.extend_from_slice(&big);
+        raw.extend_from_slice(hook("ses_big_2").as_bytes());
+        fs::write(&spool_path, &raw).unwrap();
+
+        let mut ledger = Ledger::open_memory().unwrap();
+        let summary = ledger.process_claude_hook_spool(&spool_path).unwrap();
+        assert_eq!(summary.processed, 2, "lines around the oversize one must ingest");
+        assert_eq!(summary.quarantined, 1, "oversize line must be quarantined");
+
+        // Checkpoint at EOF: no re-processing, no stall.
+        let offset: i64 = ledger
+            .connection()
+            .query_row(
+                "SELECT last_offset FROM ingestion_checkpoints WHERE adapter='claude-hook'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(offset as u64, raw.len() as u64);
+
+        // Quarantine holds a fingerprint label — never the 17 MiB line.
+        let quarantined = fs::read_to_string(&quarantine_path).unwrap();
+        assert!(quarantined.contains("oversize spool line skipped"));
+        assert!(quarantined.len() < 1024 * 1024, "quarantine must stay small");
+        let _ = big_start;
     }
 
     /// M4: the quarantine file rotates on size alone (it is write-only).
