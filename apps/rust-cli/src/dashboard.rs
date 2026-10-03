@@ -425,7 +425,6 @@ async fn handle_api_status(
         return apply_security_headers((StatusCode::UNAUTHORIZED, "Unauthorized").into_response());
     }
 
-    let db_path = state.home.join("ledger.db");
     let (session_count, event_count, project_count, work_item_count) =
         match blocking_db(&state.home, |ledger| {
             let conn = ledger.connection();
@@ -448,7 +447,8 @@ async fn handle_api_status(
         };
 
     let status_json = json!({
-        "ledger_path": db_path.to_string_lossy(),
+        // P3: no absolute ledger_path — the dashboard is loopback-only today,
+        // but the payload must stay safe if ever reused on a non-local surface.
         "schema_version": 1,
         "session_count": session_count,
         "event_count": event_count,
@@ -1227,7 +1227,6 @@ fn render_dashboard_spa(token: &str) -> String {
         const res = await apiFetch('/api/status');
         const s = await res.json();
         document.getElementById('statusDetails').innerHTML = `
-          <div>Ledger Path: <strong>${{esc(s.ledger_path)}}</strong></div>
           <div>Schema Version: <strong>${{esc(s.schema_version)}}</strong></div>
           <div>Total Sessions: <strong>${{esc(s.session_count)}}</strong></div>
           <div>Total Usage Events: <strong>${{esc(s.event_count)}}</strong></div>
@@ -1643,7 +1642,6 @@ mod tests {
             "${node.id}",
             "${t.title}",
             "${t.key}",
-            "${s.ledger_path}",
             "${s.capture_mode}",
             "err.message + '</div>'",
             "onclick=\"populateRename('",
@@ -1659,7 +1657,7 @@ mod tests {
             "${esc(node.id)}",
             "${esc(t.title)}",
             "${esc(t.key)}",
-            "${esc(s.ledger_path)}",
+            // P3: s.ledger_path was removed from /api/status and the template.
             "${esc(s.capture_mode)}",
             "esc(err.message)",
             "data-rename-id=\"${esc(node.id)}\"",
