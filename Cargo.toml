@@ -7,6 +7,9 @@ members = [
   "crates/tokentree-codex",
   "crates/tokentree-grok",
   "crates/tokentree-hermes",
+  "crates/tokentree-gemini",
+  "crates/tokentree-copilot",
+  "crates/tokentree-opencode",
   "crates/tokentree-otel",
   "apps/rust-cli",
 ]

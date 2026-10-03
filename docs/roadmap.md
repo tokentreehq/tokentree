@@ -23,8 +23,13 @@ This roadmap outlines the planned development trajectory for TokenTree following
 ## Milestone 1: Expanded Agent Adapters
 
 - ✅ **OpenAI Codex**: Shipped in v0.2.0 — app-server protocol and rollout event integration with strict precedence (no double-count).
+- ✅ **xAI Grok CLI**: Shipped — usage telemetry parser with truth-ladder deduplication.
+- ✅ **Hermes Agent**: Shipped — state.db and usage reports parser.
+- ✅ **Google Antigravity / Gemini CLI**: Shipped — conversation SQLite databases with protobuf-encoded step metrics.
+- ✅ **GitHub Copilot CLI**: Shipped — session-store.db telemetry integration.
+- ✅ **OpenCode**: Shipped — opencode.db session and message telemetry integration.
 - **Community Adapter SDK**: Typed TypeScript and Rust interfaces for third-party agent builders.
-- **Cursor & Copilot Exporters**: Parsers for local development logs and workspaces.
+- **Cursor Exporters**: Parsers for local development logs and workspaces.
 
 ---
 

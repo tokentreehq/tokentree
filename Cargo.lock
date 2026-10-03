@@ -982,10 +982,13 @@ dependencies = [
  "tempfile",
  "tokentree-claude",
  "tokentree-codex",
+ "tokentree-copilot",
  "tokentree-core",
+ "tokentree-gemini",
  "tokentree-grok",
  "tokentree-hermes",
  "tokentree-ledger",
+ "tokentree-opencode",
  "tokentree-otel",
  "tokio",
  "tower",
@@ -993,6 +996,23 @@ dependencies = [
 
 [[package]]
 name = "tokentree-codex"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "hex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokentree-core",
+ "tokentree-ledger",
+ "walkdir",
+]
+
+[[package]]
+name = "tokentree-copilot"
 version = "0.2.0"
 dependencies = [
  "anyhow",
@@ -1020,6 +1040,23 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+]
+
+[[package]]
+name = "tokentree-gemini"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "hex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokentree-core",
+ "tokentree-ledger",
+ "walkdir",
 ]
 
 [[package]]
@@ -1067,6 +1104,23 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokentree-core",
+]
+
+[[package]]
+name = "tokentree-opencode"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "hex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokentree-core",
+ "tokentree-ledger",
+ "walkdir",
 ]
 
 [[package]]

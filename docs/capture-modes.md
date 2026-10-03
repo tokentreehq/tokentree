@@ -45,3 +45,17 @@ tokentree stop --input 50000 --output 2000 --model claude-sonnet-4-6
 When only the conversational skill is installed without lifecycle hooks:
 - The agent answers questions (e.g., `/tokentree` or "how much did task X cost?") by reading the local SQLite ledger.
 - **Mandatory Guardrail**: TokenTree never tells a skill-only user they are being tracked automatically. In skill-only mode, the UI clearly displays `Capture Mode: Skill Only (No Automatic Tracking)`.
+
+---
+
+## 5. Transcript Import (`import`)
+
+For retroactive or batch ingestion from CLI sessions:
+- **Claude Code**: `~/.claude/projects/` (JSONL transcripts)
+- **Codex CLI**: `~/.codex/sessions/` (JSONL sessions / app-server rollout logs)
+- **Grok CLI**: `~/.grok/sessions/` (`usage.json` telemetry files)
+- **Hermes Agent**: `~/.hermes/` or `%LOCALAPPDATA%\hermes\` (`state.db` SQLite database / auxiliary usage reports)
+- **Gemini CLI**: `~/.gemini/antigravity-cli/conversations/` or `~/.gemini/antigravity/conversations/` (Conversation SQLite databases with protobuf-encoded step metrics)
+- **GitHub Copilot CLI**: `~/.copilot/` or `%LOCALAPPDATA%\copilot\` (`session-store.db` SQLite database with `assistant_usage_events` telemetry)
+- **OpenCode**: `~/.local/share/opencode/` or `~/.opencode/` (`opencode.db` SQLite database with `session` and `message` telemetry)
+

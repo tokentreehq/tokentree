@@ -224,10 +224,30 @@ enum Command {
 
 #[derive(Subcommand)]
 enum ImportSource {
-    Claude { path: Option<PathBuf> },
-    Codex { path: Option<PathBuf> },
-    Grok { path: Option<PathBuf> },
-    Hermes { path: Option<PathBuf> },
+    Claude {
+        path: Option<PathBuf>,
+    },
+    Codex {
+        path: Option<PathBuf>,
+    },
+    Grok {
+        path: Option<PathBuf>,
+    },
+    Hermes {
+        path: Option<PathBuf>,
+    },
+    /// Import Google Antigravity / Gemini CLI session databases.
+    Gemini {
+        path: Option<PathBuf>,
+    },
+    /// Import GitHub Copilot CLI session-store databases.
+    Copilot {
+        path: Option<PathBuf>,
+    },
+    /// Import OpenCode CLI session databases.
+    Opencode {
+        path: Option<PathBuf>,
+    },
 }
 
 fn main() {
@@ -301,6 +321,15 @@ fn run() -> Result<()> {
         Command::Import {
             source: ImportSource::Hermes { path },
         } => import_hermes(&home, path.unwrap_or_else(default_hermes_path)),
+        Command::Import {
+            source: ImportSource::Gemini { path },
+        } => import_gemini(&home, path.unwrap_or_else(default_gemini_path)),
+        Command::Import {
+            source: ImportSource::Copilot { path },
+        } => import_copilot(&home, path.unwrap_or_else(default_copilot_path)),
+        Command::Import {
+            source: ImportSource::Opencode { path },
+        } => import_opencode(&home, path.unwrap_or_else(default_opencode_path)),
         Command::Report {
             text,
             html,
@@ -475,6 +504,59 @@ fn default_hermes_path() -> PathBuf {
     effective_home_dir().join(".hermes")
 }
 
+fn default_gemini_path() -> PathBuf {
+    let cli_path = effective_home_dir()
+        .join(".gemini")
+        .join("antigravity-cli")
+        .join("conversations");
+    if cli_path.exists() {
+        return cli_path;
+    }
+    let ide_path = effective_home_dir()
+        .join(".gemini")
+        .join("antigravity")
+        .join("conversations");
+    if ide_path.exists() {
+        return ide_path;
+    }
+    effective_home_dir().join(".gemini")
+}
+
+fn default_copilot_path() -> PathBuf {
+    let store_path = effective_home_dir().join(".copilot");
+    if store_path.exists() {
+        return store_path;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(local_appdata) = std::env::var_os("LOCALAPPDATA") {
+            let path = PathBuf::from(local_appdata).join("copilot");
+            if path.exists() {
+                return path;
+            }
+        }
+    }
+    effective_home_dir().join(".copilot")
+}
+
+fn default_opencode_path() -> PathBuf {
+    let local_share = effective_home_dir()
+        .join(".local")
+        .join("share")
+        .join("opencode");
+    if local_share.exists() {
+        return local_share;
+    }
+    let dot_opencode = effective_home_dir().join(".opencode");
+    if dot_opencode.exists() {
+        return dot_opencode;
+    }
+    effective_home_dir()
+        .join(".local")
+        .join("share")
+        .join("opencode")
+}
+
 fn ledger(home: &Path) -> Result<Ledger> {
     Ledger::open(home.join("ledger.db"))
 }
@@ -495,11 +577,17 @@ fn doctor(home: &Path) -> Result<()> {
     let codex = default_codex_path();
     let grok = default_grok_path();
     let hermes = default_hermes_path();
+    let gemini = default_gemini_path();
+    let copilot = default_copilot_path();
+    let opencode = default_opencode_path();
     println!("database: {}", ledger.path().display());
     println!("Claude transcripts: {}", claude.display());
     println!("Codex sessions: {}", codex.display());
     println!("Grok sessions: {}", grok.display());
     println!("Hermes state/sessions: {}", hermes.display());
+    println!("Gemini sessions: {}", gemini.display());
+    println!("Copilot sessions: {}", copilot.display());
+    println!("OpenCode sessions: {}", opencode.display());
     println!("TokenTree home: {}", home.display());
     println!(
         "Claude capture mode: {}",
@@ -529,6 +617,30 @@ fn doctor(home: &Path) -> Result<()> {
         "Hermes capture mode: {}",
         if hermes.exists() {
             "state.db / usage-file reports"
+        } else {
+            "manual/unavailable"
+        }
+    );
+    println!(
+        "Gemini capture mode: {}",
+        if gemini.exists() {
+            "conversation SQLite databases"
+        } else {
+            "manual/unavailable"
+        }
+    );
+    println!(
+        "Copilot capture mode: {}",
+        if copilot.exists() {
+            "session-store.db telemetry"
+        } else {
+            "manual/unavailable"
+        }
+    );
+    println!(
+        "OpenCode capture mode: {}",
+        if opencode.exists() {
+            "opencode.db telemetry"
         } else {
             "manual/unavailable"
         }
@@ -716,6 +828,75 @@ fn import_hermes(home: &Path, root: PathBuf) -> Result<()> {
         duplicates += res.duplicates;
         anomalies += res.anomalies;
         ensure_session_attribution_for_source(ledger.connection_mut(), "hermes", path)?;
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "sources": sessions.len(), "inserted": inserted, "duplicates": duplicates,
+            "anomalies": anomalies,
+        }))?
+    );
+    Ok(())
+}
+
+fn import_gemini(home: &Path, root: PathBuf) -> Result<()> {
+    let sessions = tokentree_gemini::discover_sessions(&root);
+    let mut ledger = ledger(home)?;
+    let mut inserted = 0;
+    let mut duplicates = 0;
+    let mut anomalies = 0;
+    for path in &sessions {
+        let res = tokentree_gemini::import_gemini_file(ledger.connection_mut(), path)?;
+        inserted += res.inserted;
+        duplicates += res.duplicates;
+        anomalies += res.anomalies;
+        ensure_session_attribution_for_source(ledger.connection_mut(), "gemini", path)?;
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "sessions": sessions.len(), "inserted": inserted, "duplicates": duplicates,
+            "anomalies": anomalies,
+        }))?
+    );
+    Ok(())
+}
+
+fn import_copilot(home: &Path, root: PathBuf) -> Result<()> {
+    let sessions = tokentree_copilot::discover_sessions(&root);
+    let mut ledger = ledger(home)?;
+    let mut inserted = 0;
+    let mut duplicates = 0;
+    let mut anomalies = 0;
+    for path in &sessions {
+        let res = tokentree_copilot::import_copilot_file(ledger.connection_mut(), path)?;
+        inserted += res.inserted;
+        duplicates += res.duplicates;
+        anomalies += res.anomalies;
+        ensure_session_attribution_for_source(ledger.connection_mut(), "copilot", path)?;
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "sources": sessions.len(), "inserted": inserted, "duplicates": duplicates,
+            "anomalies": anomalies,
+        }))?
+    );
+    Ok(())
+}
+
+fn import_opencode(home: &Path, root: PathBuf) -> Result<()> {
+    let sessions = tokentree_opencode::discover_sessions(&root);
+    let mut ledger = ledger(home)?;
+    let mut inserted = 0;
+    let mut duplicates = 0;
+    let mut anomalies = 0;
+    for path in &sessions {
+        let res = tokentree_opencode::import_opencode_file(ledger.connection_mut(), path)?;
+        inserted += res.inserted;
+        duplicates += res.duplicates;
+        anomalies += res.anomalies;
+        ensure_session_attribution_for_source(ledger.connection_mut(), "opencode", path)?;
     }
     println!(
         "{}",
