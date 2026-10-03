@@ -10,7 +10,7 @@ This checklist documents the exact procedures for publishing, verifying, and rol
 - **Target Distribution Channels**:
   - npm: `@tokentreehq/cli` (with bundled JS runner and native launcher)
   - GitHub Releases: Native release archives across 5 targets
-- **Publish Status**: Release gate pending human authorization (Criterion 36 remains **PARTIAL** until published to registry).
+- **Publish Status**: Release published (`@tokentreehq/cli@0.2.0` live on npm; v0.2.0 release published on GitHub with all 5 platform binary archives and SHA-256 checksums; Criterion 36 is PASS).
 
 ## 2. Supported Platform Targets & Artifact Layout
 

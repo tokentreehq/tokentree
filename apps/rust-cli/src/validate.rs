@@ -12,7 +12,7 @@ use tokentree_core::token_completeness;
 use tokentree_ledger::Ledger;
 
 pub const VALIDATE_SCHEMA_VERSION: &str = "1.0.0";
-pub const VALIDATE_GENERATOR: &str = "tokentree validate 0.2.0";
+pub const VALIDATE_GENERATOR: &str = concat!("tokentree validate ", env!("CARGO_PKG_VERSION"));
 
 pub const EXIT_HEALTHY: i32 = 0;
 pub const EXIT_VALIDATION_FAILURE: i32 = 1;

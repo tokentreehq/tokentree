@@ -33,7 +33,7 @@
 - [x] Prototype migration preview/apply, backup, and idempotence
 - [x] Real-version Claude compatibility matrix and official OTLP receiver
 - [x] Verified Sonnet 4.6 rate snapshot and versioned cost persistence
-- [x] Broader verified model-rate coverage
+- [ ] Broader verified model-rate coverage (currently active snapshot prices claude-sonnet-4-6; missing models surface as cost unavailable)
 - [x] Crash-spool recovery integration and large-history performance proof
 
 ## Phase 2 — Plugin and classification
@@ -60,14 +60,14 @@
 - [x] Structured JSON and CSV exports (`tokentree export`)
 
 ## Phase 4 — Hardening and distribution
-- [x] Cross-platform release pipeline with SHA-256 checksums, verifiable artifacts, SPDX 2.3 & CycloneDX 1.5 SBOMs, and scoped npm launcher (Criterion 36 PARTIAL pending live registry publication)
-- [x] End-to-end beta validation (Acceptance criteria 1–36 audited in `docs/public-beta-evidence.md`: 32 PASS, 4 PARTIAL [Criteria 1, 2, 24, 36], 0 DEFERRED, 0 FAIL)
-- [x] OpenAI Codex adapter (`crates/tokentree-codex` & `packages/adapters/codex`) with versioned real formats, strict precedence, covered counter suppression, durable append checkpoints, and adversarial tests (Criterion 24 PARTIAL pending official live daemon release)
+- [x] Cross-platform release pipeline with SHA-256 checksums, verifiable artifacts, SPDX 2.3 & CycloneDX 1.5 SBOMs, and scoped npm launcher (Criterion 36 PASS: published @tokentreehq/cli@0.2.0 on npm and GitHub Releases)
+- [x] End-to-end beta validation (Acceptance criteria 1–36 audited in `docs/public-beta-evidence.md`: 33 PASS, 3 PARTIAL [Criteria 1, 2, 24], 0 DEFERRED, 0 FAIL)
+- [x] OpenAI Codex adapter (`crates/tokentree-codex`) with versioned real formats, strict precedence, covered counter suppression, durable append checkpoints, and adversarial tests (Criterion 24 PARTIAL pending official live daemon release)
 - [x] Isolated Claude plugin automation, zero-config report, and cross-platform data preservation on uninstall (Criteria 1 & 2 PARTIAL, Criterion 18 PASS)
 
 ## First-Class Adapters & Provider Validation Suite
-- [x] Grok CLI adapter (`crates/tokentree-grok` & `packages/adapters/grok`) with exact $10^{-9}$ USD tick preservation, turn-level precedence, zero-token billing failure handling, and durable ingestion checkpoints
-- [x] Hermes / OpenRouter adapter (`crates/tokentree-hermes` & `packages/adapters/hermes`) with SQLite `state.db` and `--usage-file` parsing, subagent hierarchy correlation, and live verified non-zero token generation
+- [x] Grok CLI adapter (`crates/tokentree-grok`) with exact $10^{-9}$ USD tick preservation, turn-level precedence, zero-token billing failure handling, and durable ingestion checkpoints
+- [x] Hermes / OpenRouter adapter (`crates/tokentree-hermes`) with SQLite `state.db` and `--usage-file` parsing, subagent hierarchy correlation, and live verified non-zero token generation
 - [x] Provider-neutral validation and diagnostics suite (`tokentree validate`, `docs/validation.md`) with automated discovery, configuration, import, integrity, reconciliation, and privacy auditing
 
 

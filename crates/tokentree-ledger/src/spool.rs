@@ -228,11 +228,21 @@ fn maybe_rotate_spool(connection: &Connection, spool_path: &Path, max_bytes: u64
 /// [`SPOOL_ROTATIONS`] generations and dropping the oldest.
 fn rotate_generations(path: &Path) -> Result<()> {
     let base = path.to_string_lossy().to_string();
+    let oldest_name = format!("{base}.{SPOOL_ROTATIONS}");
+    let oldest = Path::new(&oldest_name);
+    if oldest.exists() {
+        let _ = fs::remove_file(oldest);
+    }
     for generation in (1..SPOOL_ROTATIONS).rev() {
         let from_name = format!("{base}.{generation}");
         let from = Path::new(&from_name);
         if from.exists() {
-            fs::rename(from, format!("{base}.{}", generation + 1)).with_context(|| {
+            let to_name = format!("{base}.{}", generation + 1);
+            let to = Path::new(&to_name);
+            if to.exists() {
+                let _ = fs::remove_file(to);
+            }
+            fs::rename(from, to).with_context(|| {
                 format!(
                     "rotate spool generation {generation} for {}",
                     path.display()
@@ -240,8 +250,12 @@ fn rotate_generations(path: &Path) -> Result<()> {
             })?;
         }
     }
-    fs::rename(path, format!("{base}.1"))
-        .with_context(|| format!("rotate spool file {}", path.display()))?;
+    let target1_name = format!("{base}.1");
+    let target1 = Path::new(&target1_name);
+    if target1.exists() {
+        let _ = fs::remove_file(target1);
+    }
+    fs::rename(path, target1).with_context(|| format!("rotate spool file {}", path.display()))?;
     Ok(())
 }
 
@@ -706,6 +720,35 @@ mod tests {
 
         assert!(dir.path().join("claude-hooks.quarantine.jsonl.1").exists());
         assert!(!quarantine_path.exists());
+    }
+
+    #[test]
+    fn multiple_rotations_drop_oldest_generations_without_error() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("test-rotation.log");
+
+        for i in 1..=6 {
+            fs::write(&file_path, format!("content {i}")).unwrap();
+            rotate_generations(&file_path).unwrap();
+        }
+
+        // Only SPOOL_ROTATIONS (3) generations should remain: .1, .2, .3
+        assert!(dir.path().join("test-rotation.log.1").exists());
+        assert!(dir.path().join("test-rotation.log.2").exists());
+        assert!(dir.path().join("test-rotation.log.3").exists());
+        assert!(!dir.path().join("test-rotation.log.4").exists());
+        assert_eq!(
+            fs::read_to_string(dir.path().join("test-rotation.log.1")).unwrap(),
+            "content 6"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("test-rotation.log.2")).unwrap(),
+            "content 5"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("test-rotation.log.3")).unwrap(),
+            "content 4"
+        );
     }
 
     /// H3: a poison event (here: a hook whose cwd contains a `.tokentree.yml`

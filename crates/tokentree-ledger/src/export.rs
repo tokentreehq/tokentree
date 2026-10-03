@@ -57,7 +57,7 @@ pub fn export_csv(trees: &[ProjectTree]) -> Result<String> {
         let u = &node.inclusive;
         let total_tokens = u.input + u.cache_read + u.cache_write + u.output + u.reasoning;
         let cost_dollars = if u.requests > 0 && u.priced == u.requests {
-            format!("{:.4}", u.amount_micros as f64 / 1_000_000.0)
+            tokentree_core::format_micros_to_dollars(u.amount_micros, 4)
         } else {
             "unavailable".to_string()
         };
@@ -139,7 +139,10 @@ pub fn export_html(trees: &[ProjectTree], disclaimer: &str) -> String {
     }
 
     let overall_cost = if total_requests > 0 && fully_priced {
-        format!("${:.2}", total_micros as f64 / 1_000_000.0)
+        format!(
+            "${}",
+            tokentree_core::format_micros_to_dollars(total_micros, 2)
+        )
     } else {
         "Cost Unavailable".to_string()
     };
@@ -157,7 +160,10 @@ pub fn export_html(trees: &[ProjectTree], disclaimer: &str) -> String {
         let u = &node.inclusive;
         let total_tok = u.input + u.cache_read + u.cache_write + u.output + u.reasoning;
         let cost = if u.requests > 0 && u.priced == u.requests {
-            format!("${:.2}", u.amount_micros as f64 / 1_000_000.0)
+            format!(
+                "${}",
+                tokentree_core::format_micros_to_dollars(u.amount_micros, 2)
+            )
         } else {
             "unavailable".to_string()
         };
@@ -219,7 +225,10 @@ pub fn export_html(trees: &[ProjectTree], disclaimer: &str) -> String {
         let t = &tree.totals;
         let prj_tok = t.input + t.cache_read + t.cache_write + t.output + t.reasoning;
         let prj_cost = if t.requests > 0 && t.priced == t.requests {
-            format!("${:.2}", t.amount_micros as f64 / 1_000_000.0)
+            format!(
+                "${}",
+                tokentree_core::format_micros_to_dollars(t.amount_micros, 2)
+            )
         } else {
             "unavailable".to_string()
         };

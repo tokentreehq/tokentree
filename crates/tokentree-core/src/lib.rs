@@ -491,6 +491,25 @@ fn decimal_dollars_to_micros(value: &str) -> Result<u128, String> {
     Ok(whole * 1_000_000 + fractional)
 }
 
+/// Formats an exact micro-dollar amount as a standard USD string with the specified
+/// number of decimal places (e.g. 2 for cents `1.23`, 4 for sub-cents `1.2345`),
+/// using pure integer division and rounding (no floating-point cast).
+#[must_use]
+pub fn format_micros_to_dollars(micros: u64, decimals: usize) -> String {
+    if decimals == 0 {
+        let rounded = (micros + 500_000) / 1_000_000;
+        return format!("{rounded}");
+    }
+    let decimals = decimals.min(6);
+    let divisor = 10u64.pow(6 - decimals as u32);
+    let half = divisor / 2;
+    let rounded = (micros + half) / divisor;
+    let scale = 10u64.pow(decimals as u32);
+    let whole = rounded / scale;
+    let frac = rounded % scale;
+    format!("{whole}.{frac:0width$}", width = decimals)
+}
+
 #[must_use]
 pub fn sha256_hex(value: &[u8]) -> String {
     hex::encode(Sha256::digest(value))
@@ -749,5 +768,18 @@ mod tests {
         // Failure markers sit at the bottom of the ladder.
         assert_eq!(rank_of_source_kind(source_kind::GROK_TURN_FAILED), 0);
         assert_eq!(rank_of_source_kind(source_kind::HERMES_UNMEASURED), 0);
+    }
+
+    #[test]
+    fn format_micros_to_dollars_exact_integer_arithmetic() {
+        assert_eq!(format_micros_to_dollars(0, 2), "0.00");
+        assert_eq!(format_micros_to_dollars(1_000_000, 2), "1.00");
+        assert_eq!(format_micros_to_dollars(22_050_000, 2), "22.05");
+        assert_eq!(format_micros_to_dollars(1_234_567, 2), "1.23");
+        assert_eq!(format_micros_to_dollars(1_235_000, 2), "1.24");
+        assert_eq!(format_micros_to_dollars(1_234_567, 4), "1.2346");
+        assert_eq!(format_micros_to_dollars(12_345, 4), "0.0123");
+        assert_eq!(format_micros_to_dollars(99_999, 2), "0.10");
+        assert_eq!(format_micros_to_dollars(1_000_000, 0), "1");
     }
 }

@@ -350,8 +350,8 @@ pub fn format_totals(value: &UsageTotals) -> String {
     };
     let cost = if value.requests > 0 && value.priced == value.requests {
         format!(
-            "${:.2} est. API-equivalent",
-            value.amount_micros as f64 / 1_000_000.0
+            "${} est. API-equivalent",
+            tokentree_core::format_micros_to_dollars(value.amount_micros, 2)
         )
     } else {
         "cost unavailable".to_owned()

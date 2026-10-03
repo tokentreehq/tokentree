@@ -408,28 +408,30 @@ fn run() -> Result<()> {
     }
 }
 
-fn default_home() -> PathBuf {
-    dirs::home_dir()
+fn effective_home_dir() -> PathBuf {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".tokentree")
+}
+
+fn default_home() -> PathBuf {
+    std::env::var_os("TOKENTREE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| effective_home_dir().join(".tokentree"))
 }
 
 fn default_claude_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".claude/projects")
+    effective_home_dir().join(".claude").join("projects")
 }
 
 fn default_codex_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".codex/sessions")
+    effective_home_dir().join(".codex").join("sessions")
 }
 
 fn default_grok_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".grok/sessions")
+    effective_home_dir().join(".grok").join("sessions")
 }
 
 fn default_hermes_path() -> PathBuf {
@@ -442,9 +444,7 @@ fn default_hermes_path() -> PathBuf {
             }
         }
     }
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".hermes")
+    effective_home_dir().join(".hermes")
 }
 
 fn ledger(home: &Path) -> Result<Ledger> {

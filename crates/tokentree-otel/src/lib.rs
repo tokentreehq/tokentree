@@ -206,7 +206,7 @@ pub fn extract_api_requests(payload: &Value) -> Vec<UsageObservation> {
                     provider_reported_cost_micros: u64_field(&fields, "cost_usd_micros"),
                     source_path: "otel:http/json:/v1/logs".into(),
                     source_offset: sequence_field(&fields).unwrap_or(0),
-                    adapter_version: "0.2.0-rust".into(),
+                    adapter_version: concat!(env!("CARGO_PKG_VERSION"), "-rust").into(),
                     parser_version: "otel-http-json-v1".into(),
                 });
             }

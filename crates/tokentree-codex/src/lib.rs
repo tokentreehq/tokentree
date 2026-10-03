@@ -15,7 +15,7 @@ use tokentree_core::{
 };
 use walkdir::WalkDir;
 
-pub const ADAPTER_VERSION: &str = "0.2.0-rust";
+pub const ADAPTER_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-rust");
 pub const PARSER_VERSION: &str = "0.2.0-rust";
 
 #[must_use]

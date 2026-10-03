@@ -171,7 +171,7 @@ pub fn stop_manual(connection: &mut Connection, counts: ManualCounts) -> Result<
         provider_reported_cost_micros: None,
         source_path: "manual".into(),
         source_offset: 0,
-        adapter_version: "0.2.0".into(),
+        adapter_version: env!("CARGO_PKG_VERSION").into(),
         parser_version: "manual-v1".into(),
     };
 

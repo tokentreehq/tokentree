@@ -823,7 +823,12 @@ fn apply_migrations(connection: &Connection) -> Result<()> {
     let result = (|| -> Result<()> {
         connection.execute_batch(INITIAL_SCHEMA)?;
         connection.execute(
-            "INSERT INTO schema_metadata(schema_version,application_version,migration_state,created_at,updated_at) VALUES(1,'0.2.0','applied',datetime('now'),datetime('now'))", [],
+            concat!(
+                "INSERT INTO schema_metadata(schema_version,application_version,migration_state,created_at,updated_at) VALUES(1,'",
+                env!("CARGO_PKG_VERSION"),
+                "','applied',datetime('now'),datetime('now'))"
+            ),
+            [],
         )?;
         ensure_ledger_evolution(connection)?;
         connection.execute_batch("COMMIT;")?;

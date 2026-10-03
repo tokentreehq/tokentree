@@ -45,9 +45,25 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
-fn verify_token(state: &AppState, headers: &HeaderMap, query: &AuthQuery) -> bool {
-    if let Some(t) = &query.token {
-        if constant_time_eq(t, &state.session_token) {
+fn extract_cookie_token(headers: &HeaderMap) -> Option<&str> {
+    let cookie_header = headers.get("cookie")?.to_str().ok()?;
+    for part in cookie_header.split(';') {
+        let part = part.trim();
+        if let Some(val) = part.strip_prefix("tokentree_session=") {
+            return Some(val.trim());
+        }
+    }
+    None
+}
+
+/// Verify authentication for API endpoints.
+///
+/// Accepts session tokens via Cookie, Authorization: Bearer, or x-tokentree-token header.
+/// Query string tokens are explicitly rejected on all `/api/*` endpoints to eliminate
+/// token leakage into proxy access logs, browser history, or Referer headers.
+fn verify_api_token(state: &AppState, headers: &HeaderMap) -> bool {
+    if let Some(cookie_token) = extract_cookie_token(headers) {
+        if constant_time_eq(cookie_token, &state.session_token) {
             return true;
         }
     }
@@ -63,6 +79,22 @@ fn verify_token(state: &AppState, headers: &HeaderMap, query: &AuthQuery) -> boo
         .and_then(|v| v.to_str().ok())
     {
         if constant_time_eq(token_hdr.trim(), &state.session_token) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Verify authentication for the initial HTML page load (`/`).
+///
+/// Allows a one-time query parameter token for the initial navigation from `tokentree dashboard`,
+/// setting a secure `HttpOnly` session cookie so all subsequent operations do not require URL tokens.
+fn verify_index_token(state: &AppState, headers: &HeaderMap, query: &AuthQuery) -> bool {
+    if verify_api_token(state, headers) {
+        return true;
+    }
+    if let Some(t) = &query.token {
+        if constant_time_eq(t, &state.session_token) {
             return true;
         }
     }
@@ -137,7 +169,7 @@ async fn handle_index(
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
 ) -> Response {
-    if !verify_token(&state, &headers, &query) {
+    if !verify_index_token(&state, &headers, &query) {
         return apply_security_headers(
             (
                 StatusCode::UNAUTHORIZED,
@@ -148,15 +180,19 @@ async fn handle_index(
     }
 
     let html = render_dashboard_spa(&state.session_token);
-    apply_security_headers(Html(html).into_response())
+    let mut response = Html(html).into_response();
+    let cookie_val = format!(
+        "tokentree_session={}; HttpOnly; SameSite=Strict; Path=/",
+        state.session_token
+    );
+    if let Ok(cookie_hdr) = HeaderValue::from_str(&cookie_val) {
+        response.headers_mut().insert("set-cookie", cookie_hdr);
+    }
+    apply_security_headers(response)
 }
 
-async fn handle_api_projects(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
-) -> Response {
-    if !verify_token(&state, &headers, &query) {
+async fn handle_api_projects(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if !verify_api_token(&state, &headers) {
         return apply_security_headers(
             (
                 StatusCode::UNAUTHORIZED,
@@ -195,11 +231,16 @@ pub struct RenamePayload {
 async fn handle_rename(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
     axum::Json(payload): axum::Json<RenamePayload>,
 ) -> Response {
-    if !verify_token(&state, &headers, &query) {
-        return apply_security_headers((StatusCode::UNAUTHORIZED, "Unauthorized").into_response());
+    if !verify_api_token(&state, &headers) {
+        return apply_security_headers(
+            (
+                StatusCode::UNAUTHORIZED,
+                json!({"error": "Unauthorized"}).to_string(),
+            )
+                .into_response(),
+        );
     }
 
     let RenamePayload { task, title } = payload;
@@ -225,11 +266,16 @@ pub struct MovePayload {
 async fn handle_move(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
     axum::Json(payload): axum::Json<MovePayload>,
 ) -> Response {
-    if !verify_token(&state, &headers, &query) {
-        return apply_security_headers((StatusCode::UNAUTHORIZED, "Unauthorized").into_response());
+    if !verify_api_token(&state, &headers) {
+        return apply_security_headers(
+            (
+                StatusCode::UNAUTHORIZED,
+                json!({"error": "Unauthorized"}).to_string(),
+            )
+                .into_response(),
+        );
     }
 
     let MovePayload { task, parent } = payload;
@@ -255,11 +301,16 @@ pub struct NotePayload {
 async fn handle_note(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
     axum::Json(payload): axum::Json<NotePayload>,
 ) -> Response {
-    if !verify_token(&state, &headers, &query) {
-        return apply_security_headers((StatusCode::UNAUTHORIZED, "Unauthorized").into_response());
+    if !verify_api_token(&state, &headers) {
+        return apply_security_headers(
+            (
+                StatusCode::UNAUTHORIZED,
+                json!({"error": "Unauthorized"}).to_string(),
+            )
+                .into_response(),
+        );
     }
 
     let NotePayload { task, text } = payload;
@@ -285,11 +336,16 @@ pub struct AttachPayload {
 async fn handle_attach(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
     axum::Json(payload): axum::Json<AttachPayload>,
 ) -> Response {
-    if !verify_token(&state, &headers, &query) {
-        return apply_security_headers((StatusCode::UNAUTHORIZED, "Unauthorized").into_response());
+    if !verify_api_token(&state, &headers) {
+        return apply_security_headers(
+            (
+                StatusCode::UNAUTHORIZED,
+                json!({"error": "Unauthorized"}).to_string(),
+            )
+                .into_response(),
+        );
     }
 
     let AttachPayload { session, task } = payload;
@@ -318,11 +374,16 @@ pub struct DetachPayload {
 async fn handle_detach(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
     axum::Json(payload): axum::Json<DetachPayload>,
 ) -> Response {
-    if !verify_token(&state, &headers, &query) {
-        return apply_security_headers((StatusCode::UNAUTHORIZED, "Unauthorized").into_response());
+    if !verify_api_token(&state, &headers) {
+        return apply_security_headers(
+            (
+                StatusCode::UNAUTHORIZED,
+                json!({"error": "Unauthorized"}).to_string(),
+            )
+                .into_response(),
+        );
     }
 
     let DetachPayload { session } = payload;
@@ -352,11 +413,16 @@ pub struct MergePayload {
 async fn handle_merge(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
     axum::Json(payload): axum::Json<MergePayload>,
 ) -> Response {
-    if !verify_token(&state, &headers, &query) {
-        return apply_security_headers((StatusCode::UNAUTHORIZED, "Unauthorized").into_response());
+    if !verify_api_token(&state, &headers) {
+        return apply_security_headers(
+            (
+                StatusCode::UNAUTHORIZED,
+                json!({"error": "Unauthorized"}).to_string(),
+            )
+                .into_response(),
+        );
     }
 
     let MergePayload { source, target } = payload;
@@ -387,11 +453,16 @@ pub struct SplitPayload {
 async fn handle_split(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
     axum::Json(payload): axum::Json<SplitPayload>,
 ) -> Response {
-    if !verify_token(&state, &headers, &query) {
-        return apply_security_headers((StatusCode::UNAUTHORIZED, "Unauthorized").into_response());
+    if !verify_api_token(&state, &headers) {
+        return apply_security_headers(
+            (
+                StatusCode::UNAUTHORIZED,
+                json!({"error": "Unauthorized"}).to_string(),
+            )
+                .into_response(),
+        );
     }
 
     let SplitPayload {
@@ -416,13 +487,15 @@ async fn handle_split(
     }
 }
 
-async fn handle_api_status(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
-) -> Response {
-    if !verify_token(&state, &headers, &query) {
-        return apply_security_headers((StatusCode::UNAUTHORIZED, "Unauthorized").into_response());
+async fn handle_api_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if !verify_api_token(&state, &headers) {
+        return apply_security_headers(
+            (
+                StatusCode::UNAUTHORIZED,
+                json!({"error": "Unauthorized"}).to_string(),
+            )
+                .into_response(),
+        );
     }
 
     let db_path = state.home.join("ledger.db");
@@ -1471,7 +1544,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auth_token_in_query_param_succeeds() {
+    async fn auth_token_in_query_param_succeeds_on_index_and_sets_cookie() {
         let (app, token, _temp) = test_app();
         let req = Request::builder()
             .uri(format!("/?token={token}"))
@@ -1479,6 +1552,38 @@ mod tests {
             .unwrap();
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+        let cookie = res
+            .headers()
+            .get("set-cookie")
+            .expect("index response must set session cookie")
+            .to_str()
+            .unwrap();
+        assert!(cookie.contains(&format!("tokentree_session={token}")));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Strict"));
+    }
+
+    #[tokio::test]
+    async fn auth_token_in_cookie_succeeds() {
+        let (app, token, _temp) = test_app();
+        let req = Request::builder()
+            .uri("/api/status")
+            .header("Cookie", format!("tokentree_session={token}"))
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn auth_token_in_query_param_rejected_on_api_endpoints() {
+        let (app, token, _temp) = test_app();
+        let req = Request::builder()
+            .uri(format!("/api/status?token={token}"))
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -1570,7 +1675,8 @@ mod tests {
     async fn route_denial_no_transcript_or_traversal_endpoints() {
         let (app1, token, _temp) = test_app();
         let req1 = Request::builder()
-            .uri(format!("/api/transcripts?token={token}"))
+            .uri("/api/transcripts")
+            .header("Authorization", format!("Bearer {token}"))
             .body(Body::empty())
             .unwrap();
         let res1 = app1.oneshot(req1).await.unwrap();
@@ -1578,7 +1684,8 @@ mod tests {
 
         let (app2, token, _temp) = test_app();
         let req2 = Request::builder()
-            .uri(format!("/transcripts?token={token}"))
+            .uri("/transcripts")
+            .header("Authorization", format!("Bearer {token}"))
             .body(Body::empty())
             .unwrap();
         let res2 = app2.oneshot(req2).await.unwrap();
@@ -1586,7 +1693,8 @@ mod tests {
 
         let (app3, token, _temp) = test_app();
         let req3 = Request::builder()
-            .uri(format!("/api/raw?token={token}"))
+            .uri("/api/raw")
+            .header("Authorization", format!("Bearer {token}"))
             .body(Body::empty())
             .unwrap();
         let res3 = app3.oneshot(req3).await.unwrap();
@@ -1598,7 +1706,8 @@ mod tests {
         let (app, token, _temp) = test_app();
         let req = Request::builder()
             .method("POST")
-            .uri(format!("/api/corrections/rename?token={token}"))
+            .uri("/api/corrections/rename")
+            .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/json")
             .body(Body::from("{malformed_json:"))
             .unwrap();
@@ -1705,7 +1814,8 @@ mod tests {
         // Test merge endpoint
         let merge_req = Request::builder()
             .method("POST")
-            .uri(format!("/api/corrections/merge?token={token}"))
+            .uri("/api/corrections/merge")
+            .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/json")
             .body(Body::from(
                 json!({
@@ -1722,7 +1832,8 @@ mod tests {
         // Test invalid merge endpoint (cross-project / non-existent)
         let bad_merge_req = Request::builder()
             .method("POST")
-            .uri(format!("/api/corrections/merge?token={token}"))
+            .uri("/api/corrections/merge")
+            .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/json")
             .body(Body::from(
                 json!({
@@ -1739,7 +1850,8 @@ mod tests {
         // Test invalid split endpoint (empty spans)
         let bad_split_req = Request::builder()
             .method("POST")
-            .uri(format!("/api/corrections/split?token={token}"))
+            .uri("/api/corrections/split")
+            .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/json")
             .body(Body::from(
                 json!({

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use tokentree_core::{MeasurementSource, TokenUsage, UsageObservation, canonical_source_kind};
 use walkdir::WalkDir;
 
-pub const ADAPTER_VERSION: &str = "0.2.0-rust";
+pub const ADAPTER_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-rust");
 /// Bumped for the C4 fix: `usage_snapshot` records are now diffed per session
 /// into deltas instead of being stored as full cumulatives. The repair
 /// command (`tokentree repair snapshot-overcount`) targets rows written by
@@ -475,6 +475,29 @@ pub fn import_claude_file(
         ],
     )?;
 
+    if parse_res.stats.negative_deltas > 0 {
+        let stable_file_id = hex::encode(&sha2::Sha256::digest(source_path_str.as_bytes())[..8]);
+        let raw_key = format!(
+            "claude:{}:{}:{}",
+            stable_file_id, "negative_delta", PARSER_VERSION
+        );
+        let anom_id = format!(
+            "anom_{}",
+            &hex::encode(sha2::Sha256::digest(raw_key.as_bytes()))[..16]
+        );
+        tx.execute(
+            "INSERT OR IGNORE INTO measurement_anomalies (id, session_id, turn_id, type, source_values_json, created_at) VALUES (?1, NULL, NULL, 'negative_delta', ?2, ?3)",
+            rusqlite::params![
+                anom_id,
+                serde_json::json!({
+                    "count": parse_res.stats.negative_deltas,
+                    "source_path": source_path_str,
+                }).to_string(),
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        )?;
+    }
+
     tx.commit()?;
 
     let mut anomaly_types = Vec::new();
@@ -493,7 +516,9 @@ pub fn import_claude_file(
         duplicates,
         malformed: parse_res.stats.malformed,
         unsupported: parse_res.stats.unsupported,
-        anomalies: anomaly_types.len() as u64,
+        anomalies: parse_res.stats.malformed
+            + parse_res.stats.unsupported
+            + parse_res.stats.negative_deltas,
         anomaly_types,
         latest_event_identity,
         latest_authoritative_timestamp,
