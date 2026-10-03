@@ -772,9 +772,13 @@ mod tests {
     fn quarantine_error_scrubs_raw_line_content() {
         let raw_line = r#"{"kind":"SessionStart","payload":{"session_id":"abc123","prompt":"my secret prompt text here"}}"#;
         // Simulate a future with_context! that interpolates payload data.
-        let err = anyhow::anyhow!("hook apply failed for payload my secret prompt text here: db busy");
+        let err =
+            anyhow::anyhow!("hook apply failed for payload my secret prompt text here: db busy");
         let scrubbed = scrub_error_for_quarantine(&err, raw_line);
-        assert!(!scrubbed.contains("my secret prompt text here"), "raw line content leaked: {scrubbed}");
+        assert!(
+            !scrubbed.contains("my secret prompt text here"),
+            "raw line content leaked: {scrubbed}"
+        );
         assert!(scrubbed.contains("[redacted]"));
         assert!(scrubbed.contains("db busy"));
         // Long errors are bounded.
@@ -1194,7 +1198,7 @@ mod tests {
         raw.extend_from_slice(hook("ses_big_1").as_bytes());
         // One line just over the 16 MiB cap: valid JSON prefix, then padding.
         let mut big = b"{\"kind\":\"UserPromptSubmit\",\"payload\":{\"session_id\":\"ses_big_mid\",\"pad\":\"".to_vec();
-        big.extend(std::iter::repeat(b'x').take(17 * 1024 * 1024));
+        big.extend(std::iter::repeat_n(b'x', 17 * 1024 * 1024));
         big.extend_from_slice(b"\"}}\n");
         let big_start = raw.len();
         raw.extend_from_slice(&big);
@@ -1203,7 +1207,10 @@ mod tests {
 
         let mut ledger = Ledger::open_memory().unwrap();
         let summary = ledger.process_claude_hook_spool(&spool_path).unwrap();
-        assert_eq!(summary.processed, 2, "lines around the oversize one must ingest");
+        assert_eq!(
+            summary.processed, 2,
+            "lines around the oversize one must ingest"
+        );
         assert_eq!(summary.quarantined, 1, "oversize line must be quarantined");
 
         // Checkpoint at EOF: no re-processing, no stall.
@@ -1220,7 +1227,10 @@ mod tests {
         // Quarantine holds a fingerprint label — never the 17 MiB line.
         let quarantined = fs::read_to_string(&quarantine_path).unwrap();
         assert!(quarantined.contains("oversize spool line skipped"));
-        assert!(quarantined.len() < 1024 * 1024, "quarantine must stay small");
+        assert!(
+            quarantined.len() < 1024 * 1024,
+            "quarantine must stay small"
+        );
         let _ = big_start;
     }
 
