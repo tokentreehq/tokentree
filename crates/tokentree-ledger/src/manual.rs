@@ -175,7 +175,12 @@ pub fn stop_manual(connection: &mut Connection, counts: ManualCounts) -> Result<
         parser_version: "manual-v1".into(),
     };
 
-    let event_id = stable_id("evt", &format!("manual:request:manual:{}", run.id));
+    // V5: derive the event id with the SAME function the insert path uses.
+    // The old hand-rolled `manual:request:manual:{run_id}` string diverged
+    // from `canonical_identity()`, so `usage_spans.measured_usage_json`
+    // referenced a non-existent `usage_events.id` and manual runs vanished
+    // from tree rollups.
+    let event_id = stable_id("evt", &observation.canonical_identity());
     let span_id = stable_id("span", &event_id);
     let group_id = stable_id("attr", &observation.event_hash());
 
