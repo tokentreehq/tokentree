@@ -13,5 +13,6 @@ if (!nativeBin) {
   process.exit(1);
 }
 
-const result = spawnSync(nativeBin, process.argv.slice(2), { stdio: 'inherit' });
+const isCmd = process.platform === 'win32' && /\.(cmd|bat)$/i.test(nativeBin);
+const result = spawnSync(nativeBin, process.argv.slice(2), { stdio: 'inherit', shell: isCmd });
 process.exit(result.status ?? (result.signal ? 1 : 0));
