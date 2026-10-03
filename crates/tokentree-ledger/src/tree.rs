@@ -15,6 +15,11 @@ pub struct UsageTotals {
     pub requests: u64,
     pub measured: u64,
     pub unavailable: u64,
+    /// Unresolved measurement anomalies (excluding informational vocabulary
+    /// notices) attributed to this node's sessions. Counted against
+    /// completeness, consistent with the text report.
+    #[serde(default)]
+    pub anomalous: u64,
     pub priced: u64,
     pub amount_micros: u64,
 }
@@ -33,6 +38,7 @@ impl UsageTotals {
             requests: self.requests.saturating_add(other.requests),
             measured: self.measured.saturating_add(other.measured),
             unavailable: self.unavailable.saturating_add(other.unavailable),
+            anomalous: self.anomalous.saturating_add(other.anomalous),
             priced: self.priced.saturating_add(other.priced),
             amount_micros: self.amount_micros.saturating_add(other.amount_micros),
         }
@@ -70,9 +76,15 @@ pub fn load_project_trees(
 ) -> Result<Vec<ProjectTree>> {
     let mut projects = Vec::new();
     if let Some(filter) = project_filter {
-        let pattern = format!("%{filter}%");
+        // L14: escape LIKE wildcards so a filter containing `%` or `_`
+        // matches literally instead of acting as a wildcard.
+        let escaped = filter
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
         let mut stmt = connection.prepare(
-            "SELECT id, key, display_name FROM projects WHERE key = ?1 OR display_name LIKE ?2 ORDER BY display_name",
+            "SELECT id, key, display_name FROM projects WHERE key = ?1 OR display_name LIKE ?2 ESCAPE '\\' ORDER BY display_name",
         )?;
         let rows = stmt.query_map([filter, &pattern], |row| {
             Ok(ProjectRow {
@@ -119,6 +131,7 @@ fn load_single_project_tree(connection: &Connection, project: &ProjectRow) -> Re
         requests: i64,
         measured: i64,
         unavailable: i64,
+        anomalous: i64,
         priced: i64,
         amount_micros: i64,
     }
@@ -136,6 +149,11 @@ fn load_single_project_tree(connection: &Connection, project: &ProjectRow) -> Re
         lifecycle = source_kind::LIFECYCLE_COUNTER_SQL_LIST,
     );
 
+    let notice_list = crate::VOCABULARY_NOTICE_TYPES
+        .iter()
+        .map(|t| format!("'{t}'"))
+        .collect::<Vec<_>>()
+        .join(",");
     let query = format!(
         "SELECT wi.id, wi.parent_id, wi.title,
                 coalesce(sum(CASE
@@ -195,6 +213,19 @@ fn load_single_project_tree(connection: &Connection, project: &ProjectRow) -> Re
                     WHEN us.measurement_status<>'measured' THEN 1
                     ELSE 0
                 END), 0) unavailable,
+                coalesce((
+                    SELECT count(DISTINCT ma.id)
+                    FROM measurement_anomalies ma
+                    WHERE ma.resolved_at IS NULL
+                      AND ma.type NOT IN ({notice_list})
+                      AND ma.session_id IN (
+                          SELECT us2.session_id
+                          FROM usage_spans us2
+                          JOIN attribution_groups ag2 ON ag2.usage_span_id = us2.id AND ag2.active = 1
+                          JOIN attributions a2 ON a2.group_id = ag2.id
+                          WHERE a2.work_item_id = wi.id
+                      )
+                ), 0) anomalous,
                 count(CASE
                     WHEN cc.usage_event_id IS NULL THEN NULL
                     WHEN ue.source_kind IN ({lifecycle}) THEN NULL
@@ -225,6 +256,7 @@ fn load_single_project_tree(connection: &Connection, project: &ProjectRow) -> Re
          ORDER BY wi.created_at, wi.title",
         lifecycle = source_kind::LIFECYCLE_COUNTER_SQL_LIST,
         deltas = source_kind::SNAPSHOT_DELTA_SQL_LIST,
+        notice_list = notice_list,
     );
     let mut stmt = connection.prepare(&query)?;
 
@@ -242,8 +274,9 @@ fn load_single_project_tree(connection: &Connection, project: &ProjectRow) -> Re
                 requests: row.get(8)?,
                 measured: row.get(9)?,
                 unavailable: row.get(10)?,
-                priced: row.get(11)?,
-                amount_micros: row.get(12)?,
+                anomalous: row.get(11)?,
+                priced: row.get(12)?,
+                amount_micros: row.get(13)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -261,6 +294,7 @@ fn load_single_project_tree(connection: &Connection, project: &ProjectRow) -> Re
             requests: r.requests.max(0) as u64,
             measured: r.measured.max(0) as u64,
             unavailable: r.unavailable.max(0) as u64,
+            anomalous: r.anomalous.max(0) as u64,
             priced: r.priced.max(0) as u64,
             amount_micros: r.amount_micros.max(0) as u64,
         };
@@ -452,5 +486,28 @@ mod tests {
         let trees = load_project_trees(ledger.connection(), None).unwrap();
         assert!(trees.is_empty());
         assert_eq!(render_project_trees(&trees), "No projects in the ledger.");
+    }
+
+    /// L14: `%` and `_` in `--project` are matched literally, not as
+    /// LIKE wildcards.
+    #[test]
+    fn project_filter_escapes_like_wildcards() {
+        let ledger = Ledger::open_memory().unwrap();
+        for key in ["100%coverage", "100Xcoverage", "other"] {
+            ledger
+                .connection()
+                .execute(
+                    "INSERT INTO projects(id, key, display_name, identity_hash, detection_method, created_at, updated_at) VALUES(?1, ?2, ?3, ?4, 'test', '2026-01-01', '2026-01-01')",
+                    rusqlite::params![format!("prj_{key}"), key, key, format!("hash_{key}")],
+                )
+                .unwrap();
+        }
+        // Literal `%` must match only the project containing a real `%`.
+        let trees = load_project_trees(ledger.connection(), Some("100%")).unwrap();
+        assert_eq!(trees.len(), 1);
+        assert_eq!(trees[0].key, "100%coverage");
+        // `_` is literal too: "100_coverage" must not match "100Xcoverage".
+        let trees = load_project_trees(ledger.connection(), Some("100_coverage")).unwrap();
+        assert!(trees.is_empty());
     }
 }
