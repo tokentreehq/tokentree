@@ -37,5 +37,3 @@ export function assertAttributionWeights(db: DatabaseSync, groupId: string): voi
   if (row.total !== 10_000) throw new Error(`Attribution group ${groupId} totals ${row.total} basis points; expected 10000`);
 }
 
-export { LedgerWriter, ingestObservations, openLedger, stableId } from './ledger.js';
-export type { IngestAnomaly, IngestSummary } from './ledger.js';

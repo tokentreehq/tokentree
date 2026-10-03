@@ -28,7 +28,7 @@ For environments where Claude Code or Codex is configured to emit OTLP traces:
 For agents without plugin hooks or for generic command-line workflows:
 ```bash
 # Start an explicit work session
-tokentree start --project space-game --task "Fix collision bug"
+tokentree start --project space-game --work-item "Fix collision bug"
 
 # Stop the session with reported counts (or stop with no counts for unavailable)
 tokentree stop --input 50000 --output 2000 --model claude-sonnet-4-6

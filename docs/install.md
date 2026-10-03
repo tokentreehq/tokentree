@@ -38,12 +38,15 @@ You can install the official `@tokentreehq/cli` binary wrapper via npm or downlo
 npm install -g @tokentreehq/cli
 ```
 
-`@tokentreehq/cli` ships the prebuilt native `tokentree` binary for every
-supported platform inside the package (`vendor/<target>/`), so the install
-works out of the box — including offline — with no post-install download.
-The launcher (`dist/main.js`) picks the binary matching your platform and
-delegates to it; the bundled checksums (`vendor/SHA256SUMS.txt`) are verified
-during the release build.
+`@tokentreehq/cli` ships a prebuilt native `tokentree` binary for your
+platform via a tiny per-platform optional-dependency package
+(`@tokentreehq/cli-<platform>-<arch>`, e.g. `@tokentreehq/cli-linux-x64`),
+so the install works out of the box — including offline — with no
+post-install download, and you only download your platform's ~8 MB binary
+instead of all five. The launcher (`dist/main.js`) resolves the installed
+platform package and delegates to its `bin/` binary; as a fallback it also
+honours the historical `vendor/<target>/` layout (used by GitHub release
+archives). The bundled checksums are verified during the release build.
 
 If you need to override the binary (custom build, dev checkout), set
 `TOKENTREE_BIN=/path/to/tokentree`. If no binary is found for your platform,
