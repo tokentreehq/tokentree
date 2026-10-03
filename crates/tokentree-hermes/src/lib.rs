@@ -581,6 +581,8 @@ pub fn parse_session(path: &Path) -> Result<ParseResult> {
     if is_sqlite {
         parse_hermes_state_db(path, None)
     } else {
+        // L9: refuse to buffer a degenerate file into memory.
+        tokentree_core::check_file_size(path).map_err(|e| anyhow::anyhow!(e))?;
         let content =
             fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         parse_json_usage_str(&content, path, 0, HermesParserState::default())
