@@ -231,6 +231,8 @@ pub fn reconcile(connection: &Connection) -> Result<ReconcileResult> {
     // Detect duplicate final-request / lifecycle counters vs request-level events:
     // Any turn or request where there is both a request-level event and a final-request counter event,
     // or multiple final-request counters for the same turn.
+    // L6: a failing integrity query must surface, not silently report 0
+    // duplicates. reconcile() returns Result precisely so callers see it.
     let duplicate_subagent_counters: i64 = connection.query_row(
         &format!(
             "SELECT count(*) FROM (
@@ -254,7 +256,7 @@ pub fn reconcile(connection: &Connection) -> Result<ReconcileResult> {
         ),
         [],
         |row| row.get(0),
-    ).unwrap_or(0);
+    )?;
 
     let unresolved_anomalies: i64 = connection.query_row(
         "SELECT count(*) FROM measurement_anomalies WHERE resolved_at IS NULL",
@@ -483,15 +485,25 @@ fn ingest_one_observation(
     // `logical_event_hash` is the base-identity hash of the row that
     // started the supersede chain; rows written before the column existed
     // fall back to `event_hash`. Prefer the current-scheme match on ties.
+    //
+    // V2: the v1-identity fallback (`hash_old`) is NOT session-scoped
+    // (`{adapter}:request:{request_id}`), so without the session
+    // predicate below a v1-era row from session s1 would falsely match
+    // a genuinely new post-upgrade observation from session s2 on
+    // request_id reuse — silently dropping it as a "duplicate" or
+    // wrongly superseding s1's row. The v2 hash already embeds the
+    // session, so scoping the whole match by session_id loses nothing:
+    // true re-imports are always same-session.
     let matched: Vec<(String, String)> = transaction
         .prepare(
             "SELECT id, source_kind FROM usage_events
              WHERE superseded_by IS NULL
+               AND session_id = ?3
                AND ((logical_event_hash IN (?1, ?2))
                  OR (logical_event_hash IS NULL AND event_hash IN (?1, ?2)))
              ORDER BY CASE WHEN (logical_event_hash = ?1 OR (logical_event_hash IS NULL AND event_hash = ?1)) THEN 0 ELSE 1 END",
         )?
-        .query_map(params![hash_new, hash_old], |row| {
+        .query_map(params![hash_new, hash_old, &session_id], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?
         .collect::<Result<_, _>>()?;
@@ -1029,7 +1041,12 @@ fn ensure_ledger_evolution(connection: &Connection) -> Result<()> {
 /// so retrying the whole DROP+CREATE pair converges: each iteration either
 /// installs the triggers cleanly or proves another installer is making
 /// progress toward the same end state.
-fn replace_usage_events_triggers(connection: &Connection) -> Result<()> {
+///
+/// This is the single source of truth for the append-only triggers,
+/// including the truth-ladder `superseded_by` carve-out. `repair.rs` calls
+/// it after dropping the guards for an operator-invoked correction; it must
+/// never maintain its own stricter copy (V3).
+pub(crate) fn replace_usage_events_triggers(connection: &Connection) -> Result<()> {
     for _ in 0..5 {
         connection.execute_batch(
             "DROP TRIGGER IF EXISTS usage_events_no_update;
@@ -1320,5 +1337,67 @@ mod tests {
         assert_eq!(ledger.ingest(vec![observation()]).unwrap().duplicates, 1);
         assert_eq!(ledger.aggregate_usage().unwrap().requests, 1);
         assert_eq!(ledger.integrity_check().unwrap(), "ok");
+    }
+
+    /// V2: the v1→v2 identity fallback must not deduplicate across sessions.
+    /// A v1-era row (`event_hash = sha256("claude:request:req1")`, no
+    /// `logical_event_hash`) from session-A must NOT match a post-upgrade
+    /// v2 observation with the same request_id from session-B.
+    #[test]
+    fn v1_identity_fallback_does_not_dedup_across_sessions() {
+        let mut ledger = Ledger::open_memory().unwrap();
+        let session_a = tokentree_core::session_stable_id("claude", "session-A");
+        let v1_hash = tokentree_core::sha256_hex("claude:request:req1".as_bytes());
+        ledger
+            .connection_mut()
+            .execute(
+                "INSERT INTO sessions(id, adapter, provider_session_id, started_at)
+                 VALUES(?1, 'claude', 'session-A', '2026-01-01T00:00:00Z')",
+                [&session_a],
+            )
+            .unwrap();
+        // Simulate a v1-era row: v1 identity hash, no logical_event_hash.
+        ledger
+            .connection_mut()
+            .execute(
+                "INSERT INTO usage_events(
+                   id, adapter, source_kind, session_id, request_id,
+                   observed_at, ingested_at, event_hash,
+                   adapter_version, parser_version
+                 ) VALUES('evt_v1', 'claude', 'transcript_request', ?1, 'req1',
+                          '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', ?2,
+                          '0.1.0', '0.1.0')",
+                params![session_a, v1_hash],
+            )
+            .unwrap();
+
+        // Same request_id, DIFFERENT session, post-upgrade observation.
+        let mut obs_b = observation();
+        obs_b.provider_session_id = "session-B".into();
+        obs_b.request_id = Some("req1".into());
+        let summary = ledger.ingest(vec![obs_b]).unwrap();
+        assert_eq!(
+            summary.inserted, 1,
+            "session-B observation must not dedup against session-A's v1 row"
+        );
+        assert_eq!(summary.duplicates, 0);
+
+        // Both rows survive as active.
+        let active: i64 = ledger
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM usage_events WHERE superseded_by IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active, 2);
+
+        // Sanity: a true same-session re-import still dedups.
+        let mut obs_a = observation();
+        obs_a.provider_session_id = "session-A".into();
+        obs_a.request_id = Some("req1".into());
+        let summary2 = ledger.ingest(vec![obs_a]).unwrap();
+        assert_eq!(summary2.duplicates, 1);
     }
 }
