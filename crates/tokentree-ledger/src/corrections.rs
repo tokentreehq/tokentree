@@ -907,13 +907,16 @@ fn read_group_attributions(conn: &Connection, group_id: &str) -> Result<Vec<Attr
 
 /// For merge: reproduce all rows from the old group, but replace any row
 /// targeting `source_id` with `target_id`. Rows are consolidated by
-/// `(project_id, work_item_id, role)`: retarget source rows first, then
-/// merge duplicates by summing `weight_basis_points` and taking the max
-/// `confidence`. Single pass; row order follows first occurrence.
+/// `work_item_id`: retarget source rows first, then merge duplicates by
+/// summing `weight_basis_points` and taking the max `confidence`. Single
+/// pass; row order follows first occurrence.
 ///
 /// L1: the old two-pass version (with a `target_combined` flag and a
-/// second dedup sweep) was easy to misread and easy to break. This version
-/// states the invariant directly: one row per key.
+/// second dedup sweep) left two target rows when the source sorted before
+/// the target in `ORDER BY role` order. This version retargets first, then
+/// dedups in one pass, so ordering no longer matters. The key is
+/// `work_item_id` alone (not the full tuple): a merge collapses the source
+/// into the target regardless of role differences.
 fn merge_attribution_rows(rows: &[AttrRow], source_id: &str, target_id: &str) -> Vec<AttrRow> {
     let mut result: Vec<AttrRow> = Vec::new();
     for row in rows {
@@ -921,16 +924,13 @@ fn merge_attribution_rows(rows: &[AttrRow], source_id: &str, target_id: &str) ->
         if row.work_item_id.as_deref() == Some(source_id) {
             row.work_item_id = Some(target_id.to_string());
         }
-        let key = (
-            row.project_id.clone(),
-            row.work_item_id.clone(),
-            row.role.clone(),
-        );
         if let Some(existing) = result
             .iter_mut()
-            .find(|r| (r.project_id.clone(), r.work_item_id.clone(), r.role.clone()) == key)
+            .find(|r| r.work_item_id == row.work_item_id)
         {
-            existing.weight_basis_points += row.weight_basis_points;
+            existing.weight_basis_points = existing
+                .weight_basis_points
+                .saturating_add(row.weight_basis_points);
             existing.confidence = match (existing.confidence, row.confidence) {
                 (Some(a), Some(b)) => Some(a.max(b)),
                 (a, b) => a.or(b),
