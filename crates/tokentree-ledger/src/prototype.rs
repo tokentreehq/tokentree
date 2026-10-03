@@ -131,8 +131,9 @@ pub fn apply_prototype(
                     backup_dir.join(format!("prototype-{nanos}-{}-{suffix}", std::process::id()));
             }
             Err(e) => {
-                return Err(e)
-                    .with_context(|| format!("writing prototype backup {}", backup_path.display()));
+                return Err(e).with_context(|| {
+                    format!("writing prototype backup {}", backup_path.display())
+                });
             }
         }
     };
