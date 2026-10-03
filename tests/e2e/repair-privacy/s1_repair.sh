@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SUITE 1 — snapshot repair end to end. Repeatable. Reports PASS/FAIL per check.
 set -uo pipefail
-BIN=/tmp/tokentree-release-bin
+BIN=${TOKENTREE_BIN:-/tmp/tokentree-release-bin}
 H=/tmp/e2e/s1-home
 DB=$H/ledger.db
 PASS=0; FAIL=0

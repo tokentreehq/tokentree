@@ -2,9 +2,6 @@
   "files": [],
   "references": [
     {
-      "path": "packages/core"
-    },
-    {
       "path": "packages/database"
     },
     {
@@ -12,9 +9,6 @@
     },
     {
       "path": "packages/classifier"
-    },
-    {
-      "path": "packages/adapters/claude"
     },
     {
       "path": "apps/cli"
