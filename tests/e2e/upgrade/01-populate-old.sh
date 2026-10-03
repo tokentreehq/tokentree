@@ -21,7 +21,9 @@ $OLD_BIN stop --input 100 --output 50
 $OLD_BIN rename --task "$WI" --title "renamed work item"
 $OLD_BIN note --task "$WI" --text "e2e baseline note"
 $OLD_BIN attach --session "$SES" --task "$WI"
-SPAN=$(sqlite3 "$TOKENTREE_HOME/ledger.db" "SELECT id FROM usage_spans LIMIT 1;")
+# pick a span actively attributed to the manual work item (split --source
+# requires this; a bare LIMIT 1 is nondeterministic once imports create spans)
+SPAN=$(sqlite3 "$TOKENTREE_HOME/ledger.db" "SELECT g.usage_span_id FROM attribution_groups g JOIN attributions a ON a.group_id = g.id WHERE g.active = 1 AND a.work_item_id = '$WI' LIMIT 1;")
 $OLD_BIN split --source "$WI" --title "split child" --spans "$SPAN"
 
 # custom source_kind row (bypasses parser)

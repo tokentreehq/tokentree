@@ -31,7 +31,7 @@ TokenTree is a free, open-source usage tracker for AI coding agents. It reads yo
 
 ## TokenTree is right for you if
 
-- ✅ You run Claude Code, Codex, Grok, or Hermes for hours and have **no idea where it all went**
+- ✅ You run Claude Code / Codex / Grok for hours and have **no idea where it all went**
 - ✅ You want **per-project cost breakdowns**, not a single scary invoice at month-end
 - ✅ You've been burned by **"estimated" usage dashboards** that don't match reality
 - ✅ You want **proof of spend** — for client invoices, or just your own curiosity
@@ -55,7 +55,7 @@ AI coding agents burn through tokens invisibly. A single long Claude Code sessio
 1. **Capture what matters** — Lifecycle hooks, transcript imports, and official OTLP telemetry feed one append-only ledger. Four providers supported out of the box.
 2. **Deduplicate ruthlessly** — Canonical request identities + a versioned truth ladder: official provider telemetry outranks transcript observations, across batches. The same request isn't counted twice.
 3. **Count exactly** — Integer-micro cost arithmetic per token tier. No floats, no rounding drift, no "approximately $4.20".
-4. **Organize automatically** — A conservative boundary classifier groups turns into projects → work items → sessions (95.8% accuracy on a 24-sample evaluation corpus, gated at ≥90% accuracy). You get a tree, not a spreadsheet.
+4. **Organize automatically** — A conservative boundary classifier groups turns into projects → work items → sessions. You get a tree, not a spreadsheet.
 5. **Stay honest** — Missing measurements and missing prices are *unavailable*, never $0.00. Completeness is reported, not assumed.
 
 ```
@@ -76,7 +76,7 @@ completeness: 98.2% measured · 1.8% unavailable (2 sessions missing cache-write
 
 | 🎯 Truth-Ladder Ingestion | 💰 Exact Cost Math | 🔒 Private by Design |
 |---|---|---|
-| Official OTLP telemetry outranks transcript parsing. Canonical request IDs dedup across re-imports and providers. The same request isn't counted twice. | Integer-micro arithmetic per token tier — input, cache read, cache write, output, reasoning. Zero floating-point drift. List-price estimates from public rates. | Prompts, completions, diffs, and tool payloads are analyzed in memory and **never persisted**. There is nothing to leak. |
+| Official OTLP telemetry outranks transcript parsing. Canonical request IDs dedup across re-imports and providers. The same request isn't counted twice. | Integer-micro arithmetic per token tier — input, cache read, cache write, output, reasoning. Zero floating-point drift. List-price estimates, computed exactly. | Prompts, completions, diffs, and tool payloads are analyzed in memory and **never persisted**. There is nothing to leak. |
 
 | 🌳 Auto-Organization | 🛡️ Honest Gaps | 📊 Three Ways to Read It |
 |---|---|---|
@@ -138,8 +138,6 @@ When two sources describe the same request, the more authoritative one wins. Alw
 
 ## Cost math, concretely
 
-Amounts are list-price estimates derived from public per-token rates. The bundled verified price snapshot (`packages/pricing/data/prices.json`) currently covers active model snapshots (`claude-sonnet-4-6`). Any unlisted model or missing telemetry strictly surfaces as *cost unavailable*, never a fabricated $0.00.
-
 | Token tier | Float math (typical) | TokenTree (integer-micro) |
 |---|---|---|
 | 1,000,000 input @ $3.00/MTok | `$3.0000000000000004` | `$3.000000` |
@@ -197,6 +195,9 @@ tokentree report --text
 ```bash
 cargo build --release --bin tokentree
 ./target/release/tokentree doctor
+
+# Or install straight onto your $PATH:
+cargo install --path apps/rust-cli
 ```
 
 Then: `tokentree dashboard` for the local web UI.
@@ -234,8 +235,8 @@ TokenTree is early and opinionated. Highest-leverage contributions: new provider
 
 ```bash
 corepack enable && pnpm install
-cargo test --workspace     # Rust test suites
-pnpm test                  # TypeScript verification tests
+cargo test --workspace     # Rust — 37 suites
+pnpm test                  # TS
 ```
 
 Read [CONTRIBUTING.md](./CONTRIBUTING.md) and [CLAUDE.md](./CLAUDE.md) before opening a PR.

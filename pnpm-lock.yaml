@@ -40,59 +40,38 @@ importers:
         version: 3.2.7(@types/node@24.19.0)(tsx@4.23.15)
 
   apps/cli:
-    devDependencies:
-      '@tokentreehq/adapter-claude':
+    optionalDependencies:
+      '@tokentreehq/cli-darwin-arm64':
         specifier: workspace:*
-        version: link:../../packages/adapters/claude
-      '@tokentreehq/core':
+        version: link:../../packages/cli-darwin-arm64
+      '@tokentreehq/cli-darwin-x64':
         specifier: workspace:*
-        version: link:../../packages/core
-      '@tokentreehq/database':
+        version: link:../../packages/cli-darwin-x64
+      '@tokentreehq/cli-linux-arm64':
         specifier: workspace:*
-        version: link:../../packages/database
-      '@tokentreehq/pricing':
+        version: link:../../packages/cli-linux-arm64
+      '@tokentreehq/cli-linux-x64':
         specifier: workspace:*
-        version: link:../../packages/pricing
-
-  packages/adapters/claude:
-    dependencies:
-      '@tokentreehq/core':
+        version: link:../../packages/cli-linux-x64
+      '@tokentreehq/cli-win32-x64':
         specifier: workspace:*
-        version: link:../../core
-
-  packages/adapters/codex:
-    dependencies:
-      '@tokentreehq/core':
-        specifier: workspace:*
-        version: link:../../core
-
-  packages/adapters/grok:
-    dependencies:
-      '@tokentreehq/core':
-        specifier: workspace:*
-        version: link:../../core
-
-  packages/adapters/hermes:
-    dependencies:
-      '@tokentreehq/core':
-        specifier: workspace:*
-        version: link:../../core
+        version: link:../../packages/cli-win32-x64
 
   packages/classifier: {}
 
-  packages/core: {}
+  packages/cli-darwin-arm64: {}
 
-  packages/database:
-    dependencies:
-      '@tokentreehq/core':
-        specifier: workspace:*
-        version: link:../core
+  packages/cli-darwin-x64: {}
 
-  packages/pricing:
-    dependencies:
-      '@tokentreehq/core':
-        specifier: workspace:*
-        version: link:../core
+  packages/cli-linux-arm64: {}
+
+  packages/cli-linux-x64: {}
+
+  packages/cli-win32-x64: {}
+
+  packages/database: {}
+
+  packages/pricing: {}
 
   plugins/claude-code: {}
 

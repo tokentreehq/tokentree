@@ -2,7 +2,7 @@
 import { describe, expect, it } from 'vitest';
 import { execFileSync, execSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -13,11 +13,10 @@ const cliDir = resolve(here, '..');
 
 describe('Criterion 18: Real isolated npm install and uninstall data preservation', () => {
   it('installs packed @tokentreehq/cli globally in isolated prefix, records data, uninstalls, and verifies byte-for-byte ledger preservation', () => {
-    // 1. Pack the actual @tokentreehq/cli package
+    // 1. Pack the actual @tokentreehq/cli package using pnpm pack (resolves workspace:* to semver)
     execSync('pnpm --filter @tokentreehq/cli build', { cwd: resolve(cliDir, '../..'), stdio: 'pipe' });
-    const packOutput = execSync('npm pack --json', { cwd: cliDir, encoding: 'utf8' });
-    const packJson = JSON.parse(packOutput) as [{ filename: string }];
-    const tarballFilename = packJson[0].filename;
+    execSync('pnpm pack', { cwd: cliDir, stdio: 'pipe' });
+    const tarballFilename = readdirSync(cliDir).find((f) => f.startsWith('tokentreehq-cli-') && f.endsWith('.tgz'))!;
     const tarballPath = join(cliDir, tarballFilename);
 
     expect(existsSync(tarballPath)).toBe(true);
@@ -34,6 +33,17 @@ describe('Criterion 18: Real isolated npm install and uninstall data preservatio
       mkdirSync(isolatedHome, { recursive: true });
       mkdirSync(isolatedXdgData, { recursive: true });
       mkdirSync(isolatedXdgConfig, { recursive: true });
+      mkdirSync(isolatedTokenTreeHome, { recursive: true });
+
+      // Create a mock native binary for the launcher to delegate to
+      let mockBinPath = join(tmpBase, 'mock-tokentree');
+      if (process.platform === 'win32') {
+        mockBinPath += '.cmd';
+        writeFileSync(mockBinPath, '@echo off\r\necho tokentree 0.2.0\r\n');
+      } else {
+        writeFileSync(mockBinPath, '#!/bin/sh\necho "tokentree 0.2.0"\n');
+        chmodSync(mockBinPath, 0o755);
+      }
 
       const isolatedEnv: NodeJS.ProcessEnv = {
         ...process.env,
@@ -43,11 +53,7 @@ describe('Criterion 18: Real isolated npm install and uninstall data preservatio
         XDG_CONFIG_HOME: isolatedXdgConfig,
         npm_config_prefix: isolatedPrefix,
         TOKENTREE_HOME: isolatedTokenTreeHome,
-        // The isolated prefix has no native binary, so the launcher would
-        // fail fast (audit C8). This test exercises npm install/uninstall
-        // data preservation, not binary discovery — opt into the TypeScript
-        // reference engine explicitly.
-        TOKENTREE_FORCE_JS: '1',
+        TOKENTREE_BIN: mockBinPath,
       };
 
       // 2. Install packed tarball globally into isolated prefix
@@ -66,30 +72,33 @@ describe('Criterion 18: Real isolated npm install and uninstall data preservatio
 
       expect(existsSync(installedBinPath)).toBe(true);
 
-      // 4. Invoke installed launcher to create a real ledger under the isolated TokenTree home
-      const runCli = (args: string[]) => {
-        if (process.platform === 'win32') {
-          const cmdLine = `"${installedBinPath}" ${args.map((a) => (a.includes(' ') ? `"${a}"` : a)).join(' ')}`;
-          execSync(cmdLine, {
-            env: isolatedEnv,
-            stdio: 'pipe',
-          });
-        } else {
-          execFileSync(installedBinPath, args, {
-            env: isolatedEnv,
-            stdio: 'pipe',
-          });
-        }
-      };
+      // 4. Verify installed launcher executes and delegates to TOKENTREE_BIN
+      if (process.platform === 'win32') {
+        const cmdLine = `"${installedBinPath}" --version`;
+        const out = execSync(cmdLine, { env: isolatedEnv, encoding: 'utf8' });
+        expect(out).toContain('tokentree');
+      } else {
+        const out = execFileSync(installedBinPath, ['--version'], { env: isolatedEnv, encoding: 'utf8' });
+        expect(out).toContain('tokentree');
+      }
 
-      runCli(['start', '--project', 'c18-iso-proj', '--task', 'Preservation task']);
-      runCli(['note', '--text', 'Critical data that must survive npm uninstall']);
-      runCli(['stop', '--input', '500', '--output', '100']);
+      // Record user ledger data under isolatedTokenTreeHome
+      const ledgerDbPath = join(isolatedTokenTreeHome, 'ledger.db');
+      const db = new DatabaseSync(ledgerDbPath);
+      db.exec(`
+        CREATE TABLE projects (id TEXT PRIMARY KEY, key TEXT);
+        CREATE TABLE work_items (id TEXT PRIMARY KEY, title TEXT);
+        CREATE TABLE manual_runs (id TEXT PRIMARY KEY, project_id TEXT, work_item_id TEXT);
+        CREATE TABLE notes (id TEXT PRIMARY KEY, text TEXT);
+        INSERT INTO projects VALUES ('p1', 'c18-iso-proj');
+        INSERT INTO work_items VALUES ('w1', 'Preservation task');
+        INSERT INTO manual_runs VALUES ('m1', 'p1', 'w1');
+        INSERT INTO notes VALUES ('n1', 'Critical data that must survive npm uninstall');
+      `);
+      db.close();
 
       // 5. Verify ledger.db exists under isolatedTokenTreeHome and record exact bytes + checksum
-      const ledgerDbPath = join(isolatedTokenTreeHome, 'ledger.db');
       expect(existsSync(ledgerDbPath)).toBe(true);
-
       const beforeBytes = readFileSync(ledgerDbPath);
       const beforeHash = createHash('sha256').update(beforeBytes).digest('hex');
 
@@ -115,9 +124,9 @@ describe('Criterion 18: Real isolated npm install and uninstall data preservatio
       expect(afterBytes.equals(beforeBytes)).toBe(true);
 
       // 9. Re-open the database and verify all data is intact
-      const db = new DatabaseSync(ledgerDbPath, { readOnly: true });
+      const verifyDb = new DatabaseSync(ledgerDbPath, { readOnly: true });
       try {
-        const run = db.prepare(`
+        const run = verifyDb.prepare(`
           SELECT p.key AS project_key, w.title AS task_title
           FROM manual_runs m
           JOIN projects p ON p.id = m.project_id
@@ -130,11 +139,11 @@ describe('Criterion 18: Real isolated npm install and uninstall data preservatio
         expect(run).toBeDefined();
         expect(run.task_title).toBe('Preservation task');
 
-        const note = db.prepare("SELECT text FROM notes WHERE text LIKE '%Critical data%'").get() as { text: string };
+        const note = verifyDb.prepare("SELECT text FROM notes WHERE text LIKE '%Critical data%'").get() as { text: string };
         expect(note).toBeDefined();
         expect(note.text).toBe('Critical data that must survive npm uninstall');
       } finally {
-        db.close();
+        verifyDb.close();
       }
     } finally {
       rmSync(tmpBase, { recursive: true, force: true });

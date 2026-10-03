@@ -28,7 +28,7 @@ For environments where Claude Code or Codex is configured to emit OTLP traces:
 For agents without plugin hooks or for generic command-line workflows:
 ```bash
 # Start an explicit work session
-tokentree start --project space-game --task "Fix collision bug"
+tokentree start --project space-game --work-item "Fix collision bug"
 
 # Stop the session with reported counts (or stop with no counts for unavailable)
 tokentree stop --input 50000 --output 2000 --model claude-sonnet-4-6
@@ -48,14 +48,44 @@ When only the conversational skill is installed without lifecycle hooks:
 
 ---
 
-## 5. Transcript Import (`import`)
+## 5. Transcript Import (`import <provider>`)
 
-For retroactive or batch ingestion from CLI sessions:
-- **Claude Code**: `~/.claude/projects/` (JSONL transcripts)
-- **Codex CLI**: `~/.codex/sessions/` (JSONL sessions / app-server rollout logs)
-- **Grok CLI**: `~/.grok/sessions/` (`usage.json` telemetry files)
-- **Hermes Agent**: `~/.hermes/` or `%LOCALAPPDATA%\hermes\` (`state.db` SQLite database / auxiliary usage reports)
-- **Gemini CLI**: `~/.gemini/antigravity-cli/conversations/` or `~/.gemini/antigravity/conversations/` (Conversation SQLite databases with protobuf-encoded step metrics)
-- **GitHub Copilot CLI**: `~/.copilot/` or `%LOCALAPPDATA%\copilot\` (`session-store.db` SQLite database with `assistant_usage_events` telemetry)
-- **OpenCode**: `~/.local/share/opencode/` or `~/.opencode/` (`opencode.db` SQLite database with `session` and `message` telemetry)
+For providers without hooks or OTLP wiring, TokenTree walks the provider's local
+session store and imports transcripts straight into the ledger. Each provider
+has a default scan path (pass a custom path as the second argument to override).
 
+- **`tokentree import claude [dir]`** — walks `dir` for session `.jsonl` files
+  (`discover_sessions` in `crates/tokentree-claude/src/lib.rs`).
+  Default: `~/.claude/projects/`
+  (`default_claude_path` in `apps/rust-cli/src/main.rs`).
+- **`tokentree import codex [dir]`** — walks `dir` for `*.jsonl` files
+  (`discover_sessions` in `crates/tokentree-codex/src/lib.rs`), i.e. Codex
+  rollout-event transcripts from the app-server protocol.
+  Default: `~/.codex/sessions`
+  (`default_codex_path` in `apps/rust-cli/src/main.rs`).
+- **`tokentree import grok [dir]`** — walks `dir` for files named exactly
+  `usage.json` (`discover_sessions` in `crates/tokentree-grok/src/lib.rs`).
+  Default: `~/.grok/sessions`
+  (`default_grok_path` in `apps/rust-cli/src/main.rs`).
+- **`tokentree import hermes [path]`** — accepts a single file ending in `.db`
+  or `.json`, or walks a directory for `state.db`, `*_state.db` / `-state.db`
+  suffixes, `*usage.json`, and `request_dump_*` files
+  (`discover_sessions` in `crates/tokentree-hermes/src/lib.rs`).
+  Default: `~/.hermes` — on Windows, `%LOCALAPPDATA%/hermes` if it exists
+  (`default_hermes_path` in `apps/rust-cli/src/main.rs`).
+- **`tokentree import gemini [path]`** — walks `path` for SQLite conversation databases
+  (`discover_sessions` in `crates/tokentree-gemini/src/lib.rs`), decoding protobuf step metadata.
+  Default: `~/.gemini/antigravity-cli/conversations` or `~/.gemini/antigravity/conversations`
+  (`default_gemini_path` in `apps/rust-cli/src/main.rs`).
+- **`tokentree import copilot [path]`** — accepts `session-store.db` / `data.db` or walks `path`
+  (`discover_sessions` in `crates/tokentree-copilot/src/lib.rs`) for `assistant_usage_events`.
+  Default: `~/.copilot` — on Windows, `%LOCALAPPDATA%/copilot` if it exists
+  (`default_copilot_path` in `apps/rust-cli/src/main.rs`).
+- **`tokentree import opencode [path]`** — accepts `opencode.db` or walks `path`
+  (`discover_sessions` in `crates/tokentree-opencode/src/lib.rs`) for session and message token usage.
+  Default: `~/.local/share/opencode` or `~/.opencode`
+  (`default_opencode_path` in `apps/rust-cli/src/main.rs`).
+
+Import prints a JSON summary of `sessions` (or `sources`), `inserted`,
+`duplicates`, and `anomalies`. Imports are idempotent: re-running skips
+already-seen requests on the truth ladder.

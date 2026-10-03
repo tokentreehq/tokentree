@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # SUITE 2 — every provider produces trees. Repeatable. PASS/FAIL per provider.
 set -uo pipefail
-BIN=/tmp/tokentree-release-bin
-F=~/workspace/tokentree-fix/e2e-b/fixtures/parsers
+BIN=${TOKENTREE_BIN:-/tmp/tokentree-release-bin}
+# Fixture dir, repo-relative (was a machine-specific absolute path).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+F=${E2E_FIXTURES:-$SCRIPT_DIR/../../../fixtures/parsers}
 PASS=0; FAIL=0
 ok()  { echo "PASS: $1"; PASS=$((PASS+1)); }
 bad() { echo "FAIL: $1"; FAIL=$((FAIL+1)); }
