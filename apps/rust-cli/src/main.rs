@@ -69,7 +69,10 @@ enum RepairAction {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Check ledger health, import paths, pricing snapshot, and the prompt-leakage guard.
     Doctor,
+    /// Run the parser/adapter validation harness (development and CI only).
+    #[command(hide = true)]
     Validate {
         #[arg(value_name = "ADAPTER")]
         adapter: Option<String>,
@@ -88,10 +91,12 @@ enum Command {
         #[arg(long)]
         local_details: bool,
     },
+    /// Import AI coding-agent sessions into the ledger.
     Import {
         #[command(subcommand)]
         source: ImportSource,
     },
+    /// Print a text usage report, or with --html write a static HTML report (defaults to <home>/reports/report-<timestamp>.html when --out is not given).
     Report {
         #[arg(long)]
         text: bool,
@@ -102,12 +107,14 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Serve the local interactive dashboard and open it in a browser.
     Dashboard {
         #[arg(long)]
         port: Option<u16>,
         #[arg(long)]
         no_open: bool,
     },
+    /// Export ledger usage as JSON, CSV, or HTML (to stdout, or a file with --out).
     Export {
         #[arg(long, default_value = "json")]
         format: String,
@@ -116,6 +123,7 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Query usage rows by project and/or work item, as JSON.
     Query {
         #[arg(long)]
         project: Option<String>,
@@ -124,14 +132,17 @@ enum Command {
         #[arg(long)]
         include_descendants: bool,
     },
+    /// Start a manual work-item session for ad-hoc usage tracking.
     Start {
         #[arg(long)]
         project: String,
-        #[arg(long)]
-        task: String,
+        /// Work-item id or title to track.
+        #[arg(long, alias = "task")]
+        work_item: String,
         #[arg(long)]
         parent: Option<String>,
     },
+    /// Stop the active manual session, recording measured token counts.
     Stop {
         #[arg(long)]
         input: Option<u64>,
@@ -146,34 +157,44 @@ enum Command {
         #[arg(long)]
         model: Option<String>,
     },
+    /// Attribute a session to a work item.
     Attach {
         #[arg(long)]
         session: String,
-        #[arg(long)]
-        task: String,
+        /// Work-item id receiving the attribution.
+        #[arg(long, alias = "task")]
+        work_item: String,
     },
+    /// Remove a session's work-item attribution.
     Detach {
         #[arg(long)]
         session: String,
     },
+    /// Attach a free-text note to a work item.
     Note {
         #[arg(long)]
         text: String,
-        #[arg(long)]
-        task: Option<String>,
+        /// Work-item id the note belongs to.
+        #[arg(long, alias = "task")]
+        work_item: Option<String>,
     },
+    /// Rename a work item.
     Rename {
-        #[arg(long)]
-        task: String,
+        /// Work-item id to rename.
+        #[arg(long, alias = "task")]
+        work_item: String,
         #[arg(long)]
         title: String,
     },
+    /// Reparent a work item within the project tree.
     Move {
-        #[arg(long)]
-        task: String,
+        /// Work-item id to move.
+        #[arg(long, alias = "task")]
+        work_item: String,
         #[arg(long)]
         parent: Option<String>,
     },
+    /// Merge one work item into another, reattributing its sessions, children, and notes.
     Merge {
         #[arg(long)]
         source: String,
@@ -186,6 +207,7 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// Split selected session spans off a work item into a new work item.
     Split {
         #[arg(long)]
         source: String,
@@ -200,8 +222,11 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// Drain the hook spool and classify queued observations into the ledger.
     Classify,
+    /// Check ledger consistency: duplicate requests, anomalies, subagent attribution.
     Reconcile,
+    /// Import a legacy task-usage prototype ledger (--preview or --apply).
     MigratePrototype {
         #[arg(long)]
         source: Option<PathBuf>,
@@ -210,39 +235,36 @@ enum Command {
         #[arg(long)]
         apply: bool,
     },
+    /// Run ledger repair operations.
     Repair {
         #[command(subcommand)]
         action: RepairAction,
     },
+    /// Serve a local OTLP ingest endpoint for provider telemetry.
     OtlpServe {
         #[arg(long, default_value = "127.0.0.1:4318")]
         address: SocketAddr,
     },
     #[command(hide = true)]
+    /// Append a hook event to the spool (internal; reads JSON from stdin).
     HookEnqueue,
 }
 
 #[derive(Subcommand)]
 enum ImportSource {
+    /// Import from Claude Code session transcripts.
     Claude { path: Option<PathBuf> },
+    /// Import from Codex rollout/app-server logs.
     Codex { path: Option<PathBuf> },
+    /// Import from Grok usage.json telemetry.
     Grok { path: Option<PathBuf> },
+    /// Import from Hermes state.db / usage-file reports.
     Hermes { path: Option<PathBuf> },
 }
 
 fn main() {
     if let Err(error) = run() {
-        // P4: redact the home-directory prefix from error output so pasted
-        // bug reports / shared logs don't leak the operator's username.
-        // Paths under home become `~/...`; anything else is untouched.
-        let mut msg = format!("{error:#}");
-        if let Some(home) = dirs::home_dir() {
-            let home_str = home.to_string_lossy();
-            if !home_str.is_empty() {
-                msg = msg.replace(home_str.as_ref(), "~");
-            }
-        }
-        eprintln!("{msg}");
+        eprintln!("{error:#}");
         std::process::exit(2);
     }
 }
@@ -336,9 +358,9 @@ fn run() -> Result<()> {
         ),
         Command::Start {
             project,
-            task,
+            work_item,
             parent,
-        } => start(&home, &project, &task, parent.as_deref()),
+        } => start(&home, &project, &work_item, parent.as_deref()),
         Command::Stop {
             input,
             output,
@@ -357,11 +379,11 @@ fn run() -> Result<()> {
                 model,
             },
         ),
-        Command::Attach { session, task } => attach(&home, &session, &task),
+        Command::Attach { session, work_item } => attach(&home, &session, &work_item),
         Command::Detach { session } => detach(&home, &session),
-        Command::Note { text, task } => note(&home, &text, task.as_deref()),
-        Command::Rename { task, title } => rename(&home, &task, &title),
-        Command::Move { task, parent } => move_item(&home, &task, parent.as_deref()),
+        Command::Note { text, work_item } => note(&home, &text, work_item.as_deref()),
+        Command::Rename { work_item, title } => rename(&home, &work_item, &title),
+        Command::Move { work_item, parent } => move_item(&home, &work_item, parent.as_deref()),
         Command::Merge {
             source,
             target,
@@ -396,70 +418,50 @@ fn run() -> Result<()> {
             // H2: the loopback receiver requires a per-run bearer secret so a
             // malicious local process cannot append poisoned rows to the
             // append-only ledger. Pin via TOKENTREE_OTLP_TOKEN for automation.
-            let (auth, from_env) = match std::env::var("TOKENTREE_OTLP_TOKEN") {
-                Ok(token) if !token.trim().is_empty() => (
-                    tokentree_otel::OtlpAuth {
-                        bearer_token: token,
-                    },
-                    true,
-                ),
-                _ => (tokentree_otel::OtlpAuth::generate(), false),
+            let auth = match std::env::var("TOKENTREE_OTLP_TOKEN") {
+                Ok(token) if !token.trim().is_empty() => tokentree_otel::OtlpAuth {
+                    bearer_token: token,
+                },
+                _ => tokentree_otel::OtlpAuth::generate(),
             };
             println!("TokenTree OTLP receiver: http://{address}/v1/logs");
-            if from_env {
-                // L13: never echo a user-supplied secret — they already know it.
-                println!(
-                    "Bearer token: using TOKENTREE_OTLP_TOKEN from the environment (not shown)."
-                );
-            } else {
-                // L13: generated tokens are shown ONCE so the sender can be
-                // configured, then never again. Prefer TOKENTREE_OTLP_TOKEN.
-                println!("Bearer token (generated for this run only — copy it now):");
-                println!("  {}\n", auth.bearer_token);
-                println!("Tip: set TOKENTREE_OTLP_TOKEN to reuse a token across runs.");
-            }
+            println!("Bearer token (required on every ingest request):");
+            println!("  {}\n", auth.bearer_token);
             println!("Point the sender at this endpoint with:");
             println!("  export OTEL_EXPORTER_OTLP_PROTOCOL=http/json");
             println!("  export OTEL_EXPORTER_OTLP_ENDPOINT=http://{address}");
-            if from_env {
-                println!(
-                    "  export OTEL_EXPORTER_OTLP_HEADERS=\"Authorization=Bearer $TOKENTREE_OTLP_TOKEN\""
-                );
-            } else {
-                println!(
-                    "  export OTEL_EXPORTER_OTLP_HEADERS=\"Authorization=Bearer <paste-the-token-above>\""
-                );
-            }
+            println!(
+                "  export OTEL_EXPORTER_OTLP_HEADERS=\"Authorization=Bearer {}\"",
+                auth.bearer_token
+            );
             let ledger = ledger(&home)?;
             tokio::runtime::Runtime::new()?.block_on(tokentree_otel::serve(address, ledger, auth))
         }
     }
 }
 
-fn effective_home_dir() -> PathBuf {
-    std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from)
-        .or_else(dirs::home_dir)
-        .unwrap_or_else(|| PathBuf::from("."))
-}
-
 fn default_home() -> PathBuf {
-    std::env::var_os("TOKENTREE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| effective_home_dir().join(".tokentree"))
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".tokentree")
 }
 
 fn default_claude_path() -> PathBuf {
-    effective_home_dir().join(".claude").join("projects")
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".claude/projects")
 }
 
 fn default_codex_path() -> PathBuf {
-    effective_home_dir().join(".codex").join("sessions")
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".codex/sessions")
 }
 
 fn default_grok_path() -> PathBuf {
-    effective_home_dir().join(".grok").join("sessions")
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".grok/sessions")
 }
 
 fn default_hermes_path() -> PathBuf {
@@ -472,7 +474,9 @@ fn default_hermes_path() -> PathBuf {
             }
         }
     }
-    effective_home_dir().join(".hermes")
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".hermes")
 }
 
 fn ledger(home: &Path) -> Result<Ledger> {
@@ -578,8 +582,6 @@ fn import_claude(home: &Path, root: PathBuf) -> Result<()> {
     let mut ledger = ledger(home)?;
     let mut inserted = 0;
     let mut duplicates = 0;
-    let mut conflicts = 0;
-    let mut poisoned = 0;
     let mut unknown = 0;
     let mut malformed = 0;
     for path in &sessions {
@@ -630,11 +632,6 @@ fn import_claude(home: &Path, root: PathBuf) -> Result<()> {
         let summary = ledger.ingest(parsed.observations)?;
         inserted += summary.inserted;
         duplicates += summary.duplicates;
-        // V6: surface dedup value-conflicts (same identity, different token
-        // values) and L10 poison-row quarantines — both flag data-quality
-        // issues the operator should see.
-        conflicts += summary.conflicts;
-        poisoned += summary.poisoned;
         // Mirror the TypeScript import flow: every imported session gets a
         // default project/work-item attribution so reports render trees
         // instead of "No projects".
@@ -649,7 +646,6 @@ fn import_claude(home: &Path, root: PathBuf) -> Result<()> {
         "{}",
         serde_json::to_string_pretty(&json!({
             "sessions": sessions.len(), "inserted": inserted, "duplicates": duplicates,
-            "conflicts": conflicts, "poisoned": poisoned,
             "unknown": unknown, "malformed": malformed,
         }))?
     );
@@ -839,7 +835,7 @@ fn query(
     Ok(())
 }
 
-fn start(home: &Path, project: &str, task: &str, parent: Option<&str>) -> Result<()> {
+fn start(home: &Path, project: &str, work_item: &str, parent: Option<&str>) -> Result<()> {
     let mut ledger = ledger(home)?;
     let cwd = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
@@ -850,7 +846,7 @@ fn start(home: &Path, project: &str, task: &str, parent: Option<&str>) -> Result
         ManualStartInput {
             project_key: project,
             project_title: None,
-            task_title: task,
+            task_title: work_item,
             parent_title: parent,
             cwd: &cwd,
         },
@@ -866,9 +862,9 @@ fn stop(home: &Path, counts: ManualCounts) -> Result<()> {
     Ok(())
 }
 
-fn attach(home: &Path, session: &str, task: &str) -> Result<()> {
+fn attach(home: &Path, session: &str, work_item: &str) -> Result<()> {
     let mut ledger = ledger(home)?;
-    let changed = attach_session(ledger.connection_mut(), session, task)?;
+    let changed = attach_session(ledger.connection_mut(), session, work_item)?;
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({ "changed": changed }))?
@@ -886,16 +882,16 @@ fn detach(home: &Path, session: &str) -> Result<()> {
     Ok(())
 }
 
-fn note(home: &Path, text: &str, task: Option<&str>) -> Result<()> {
+fn note(home: &Path, text: &str, work_item: Option<&str>) -> Result<()> {
     let mut ledger = ledger(home)?;
-    let id = add_note(ledger.connection_mut(), text, task)?;
+    let id = add_note(ledger.connection_mut(), text, work_item)?;
     println!("{}", serde_json::to_string_pretty(&json!({ "id": id }))?);
     Ok(())
 }
 
-fn rename(home: &Path, task: &str, title: &str) -> Result<()> {
+fn rename(home: &Path, work_item: &str, title: &str) -> Result<()> {
     let mut ledger = ledger(home)?;
-    rename_work_item(ledger.connection_mut(), task, title)?;
+    rename_work_item(ledger.connection_mut(), work_item, title)?;
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({ "renamed": true }))?
@@ -903,9 +899,9 @@ fn rename(home: &Path, task: &str, title: &str) -> Result<()> {
     Ok(())
 }
 
-fn move_item(home: &Path, task: &str, parent: Option<&str>) -> Result<()> {
+fn move_item(home: &Path, work_item: &str, parent: Option<&str>) -> Result<()> {
     let mut ledger = ledger(home)?;
-    move_work_item(ledger.connection_mut(), task, parent)?;
+    move_work_item(ledger.connection_mut(), work_item, parent)?;
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({ "moved": true }))?
@@ -985,15 +981,6 @@ fn split(
 }
 
 fn classify(home: &Path) -> Result<()> {
-    // S3 — concurrency: two `classify` runs may overlap (e.g. a cron poll
-    // racing a manual run). They serialize on SQLite's write lock
-    // (busy_timeout=5000 in Ledger::open); all writes are idempotent
-    // (INSERT OR IGNORE with stable content-derived IDs), so the worst case
-    // is a transient SQLITE_BUSY or double-counted per-run summary stats —
-    // never ledger corruption or double-ingested events. The spool
-    // checkpoint is only advanced inside the same transaction that ingests
-    // the events, so a loser of the lock race re-reads already-ingested
-    // bytes as idempotent no-ops.
     let mut ledger = ledger(home)?;
     let spool = home.join("spool/claude-hooks.jsonl");
     let summary = ledger.process_claude_hook_spool(&spool)?;
