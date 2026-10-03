@@ -175,12 +175,7 @@ pub fn stop_manual(connection: &mut Connection, counts: ManualCounts) -> Result<
         parser_version: "manual-v1".into(),
     };
 
-    // V5: derive the event id with the SAME function the insert path uses.
-    // The old hand-rolled `manual:request:manual:{run_id}` string diverged
-    // from `canonical_identity()`, so `usage_spans.measured_usage_json`
-    // referenced a non-existent `usage_events.id` and manual runs vanished
-    // from tree rollups.
-    let event_id = stable_id("evt", &observation.canonical_identity());
+    let event_id = stable_id("evt", &format!("manual:request:manual:{}", run.id));
     let span_id = stable_id("span", &event_id);
     let group_id = stable_id("attr", &observation.event_hash());
 
@@ -188,9 +183,9 @@ pub fn stop_manual(connection: &mut Connection, counts: ManualCounts) -> Result<
     // span/attribution rows commit together. A crash can no longer leave the
     // event ingested while the run stays 'active' with no span (previously
     // unrecoverable: retrying bailed on the duplicate event).
-    let transaction = connection.transaction()?;
+    let mut transaction = connection.transaction()?;
 
-    let summary = crate::ingest_observations_tx(&transaction, &[observation])?;
+    let summary = crate::ingest_observations_tx(&mut transaction, &[observation])?;
     if summary.inserted != 1 {
         bail!("Manual usage event already exists");
     }
