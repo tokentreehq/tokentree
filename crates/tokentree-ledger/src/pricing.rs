@@ -56,13 +56,14 @@ pub fn apply_price_snapshot(
 
     for event in event_rows {
         let Some(model) = &event.model else {
-            summary.unavailable += 1;
+            // L12: saturating counters — never wrap on adversarial input.
+            summary.unavailable = summary.unavailable.saturating_add(1);
             continue;
         };
 
         let rate = snapshot.resolve_rate(model, event.timestamp.as_deref());
         let Some(rate) = rate else {
-            summary.unavailable += 1;
+            summary.unavailable = summary.unavailable.saturating_add(1);
             continue;
         };
 
@@ -91,18 +92,23 @@ pub fn apply_price_snapshot(
             ],
         )?;
 
+        // L4: checked conversion — a hand-edited DB with negative token
+        // values must not wrap to huge u64 via `as`. Negative (impossible)
+        // values degrade to "missing" instead of corrupting the cost.
         let usage = TokenUsage {
-            input_tokens: event.input_tokens.map(|v| v as u64),
-            cached_input_tokens: event.cached_input_tokens.map(|v| v as u64),
-            cache_write_tokens: event.cache_write_tokens.map(|v| v as u64),
-            output_tokens: event.output_tokens.map(|v| v as u64),
-            reasoning_tokens: event.reasoning_tokens.map(|v| v as u64),
+            input_tokens: event.input_tokens.and_then(|v| u64::try_from(v).ok()),
+            cached_input_tokens: event
+                .cached_input_tokens
+                .and_then(|v| u64::try_from(v).ok()),
+            cache_write_tokens: event.cache_write_tokens.and_then(|v| u64::try_from(v).ok()),
+            output_tokens: event.output_tokens.and_then(|v| u64::try_from(v).ok()),
+            reasoning_tokens: event.reasoning_tokens.and_then(|v| u64::try_from(v).ok()),
         };
 
         let cost_res = calculate_cost_micros(&usage, &rate.exact_rates())
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let Some(amount_micros) = cost_res else {
-            summary.unavailable += 1;
+            summary.unavailable = summary.unavailable.saturating_add(1);
             continue;
         };
 
@@ -115,23 +121,25 @@ pub fn apply_price_snapshot(
         .to_string();
 
         let changed = transaction.execute(
+            // L5: use the snapshot's currency instead of a hardcoded 'USD'.
             "INSERT OR IGNORE INTO cost_calculations(
                 usage_event_id, pricing_version_id, amount_micros, currency, cost_type, attribution_policy, coverage_json, calculated_at
-            ) VALUES(?,?,?,'USD','api_equivalent_estimate','causal-request',?,?)",
+            ) VALUES(?,?,?,?, 'api_equivalent_estimate','causal-request',?,?)",
             params![
                 event.id,
                 price_id,
                 i64::try_from(amount_micros)
                     .context("cost amount exceeds SQLite integer range")?,
+                &snapshot.currency,
                 coverage,
                 now,
             ],
         )?;
 
         if changed == 1 {
-            summary.priced += 1;
+            summary.priced = summary.priced.saturating_add(1);
         } else {
-            summary.already_calculated += 1;
+            summary.already_calculated = summary.already_calculated.saturating_add(1);
         }
     }
 
