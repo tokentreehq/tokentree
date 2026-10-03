@@ -55,17 +55,24 @@ pub fn export_csv(trees: &[ProjectTree]) -> Result<String> {
         node: &WorkTreeNode,
     ) {
         let u = &node.inclusive;
-        let total_tokens = u.input + u.cache_read + u.cache_write + u.output + u.reasoning;
+        let total_tokens = u
+            .input
+            .saturating_add(u.cache_read)
+            .saturating_add(u.cache_write)
+            .saturating_add(u.output)
+            .saturating_add(u.reasoning);
         let cost_dollars = if u.requests > 0 && u.priced == u.requests {
             format!("{:.4}", u.amount_micros as f64 / 1_000_000.0)
         } else {
             "unavailable".to_string()
         };
-        let completeness = match tokentree_core::token_completeness(u.measured, u.unavailable, 0) {
-            Some(pct) => format!("{pct:.1}"),
-            // No measured/unavailable signal: neutral, never NaN.
-            None => "unavailable".to_string(),
-        };
+        // L7: include anomalous, consistent with the text report.
+        let completeness =
+            match tokentree_core::token_completeness(u.measured, u.unavailable, u.anomalous) {
+                Some(pct) => format!("{pct:.1}"),
+                // No measured/unavailable signal: neutral, never NaN.
+                None => "unavailable".to_string(),
+            };
 
         let parent_id_str = node.parent_id.as_deref().unwrap_or("");
 
@@ -118,6 +125,7 @@ pub fn export_html(trees: &[ProjectTree], disclaimer: &str) -> String {
     let mut total_requests = 0u64;
     let mut total_measured = 0u64;
     let mut total_unavailable = 0u64;
+    let mut total_anomalous = 0u64;
     let mut fully_priced = true;
 
     for tree in trees {
@@ -133,6 +141,7 @@ pub fn export_html(trees: &[ProjectTree], disclaimer: &str) -> String {
         total_requests = total_requests.saturating_add(t.requests);
         total_measured = total_measured.saturating_add(t.measured);
         total_unavailable = total_unavailable.saturating_add(t.unavailable);
+        total_anomalous = total_anomalous.saturating_add(t.anomalous);
         if t.requests > 0 && t.priced < t.requests {
             fully_priced = false;
         }
@@ -146,8 +155,9 @@ pub fn export_html(trees: &[ProjectTree], disclaimer: &str) -> String {
 
     // No requests at all, or requests with no measured/unavailable signal:
     // show a neutral "unavailable" state, never a green 100% or NaN.
+    // L7: include anomalous, consistent with the text report.
     let overall_completeness: Option<f64> =
-        tokentree_core::token_completeness(total_measured, total_unavailable, 0);
+        tokentree_core::token_completeness(total_measured, total_unavailable, total_anomalous);
     let overall_completeness_html =
         overall_completeness.map_or_else(|| "unavailable".to_string(), |pct| format!("{pct:.0}%"));
 
@@ -155,21 +165,31 @@ pub fn export_html(trees: &[ProjectTree], disclaimer: &str) -> String {
         let mut html = String::new();
         let indent = depth * 24;
         let u = &node.inclusive;
-        let total_tok = u.input + u.cache_read + u.cache_write + u.output + u.reasoning;
+        let total_tok = u
+            .input
+            .saturating_add(u.cache_read)
+            .saturating_add(u.cache_write)
+            .saturating_add(u.output)
+            .saturating_add(u.reasoning);
         let cost = if u.requests > 0 && u.priced == u.requests {
             format!("${:.2}", u.amount_micros as f64 / 1_000_000.0)
         } else {
             "unavailable".to_string()
         };
 
-        let comp_badge = match tokentree_core::token_completeness(u.measured, u.unavailable, 0) {
+        // L7: include anomalous, consistent with the text report.
+        let comp_badge = match tokentree_core::token_completeness(
+            u.measured,
+            u.unavailable,
+            u.anomalous,
+        ) {
             None => r#"<span class="badge badge-muted">no requests</span>"#.to_string(),
-            Some(_) if u.unavailable == 0 => {
+            Some(_) if u.unavailable == 0 && u.anomalous == 0 => {
                 r#"<span class="badge badge-green">100% complete</span>"#.to_string()
             }
             Some(pct) => format!(
-                r#"<span class="badge badge-amber">{pct:.0}% complete ({} unavailable)</span>"#,
-                u.unavailable
+                r#"<span class="badge badge-amber">{pct:.0}% complete ({} unavailable, {} anomalous)</span>"#,
+                u.unavailable, u.anomalous
             ),
         };
 
@@ -217,7 +237,12 @@ pub fn export_html(trees: &[ProjectTree], disclaimer: &str) -> String {
         let safe_prj_title = html_escape(&tree.title);
         let safe_prj_key = html_escape(&tree.key);
         let t = &tree.totals;
-        let prj_tok = t.input + t.cache_read + t.cache_write + t.output + t.reasoning;
+        let prj_tok = t
+            .input
+            .saturating_add(t.cache_read)
+            .saturating_add(t.cache_write)
+            .saturating_add(t.output)
+            .saturating_add(t.reasoning);
         let prj_cost = if t.requests > 0 && t.priced == t.requests {
             format!("${:.2}", t.amount_micros as f64 / 1_000_000.0)
         } else {
@@ -651,6 +676,44 @@ mod tests {
         assert!(html.contains("Fix bug"));
         assert!(html.contains("Test disclaimer"));
         assert!(html.contains("$0.05"));
+    }
+
+    /// L7: CSV/HTML completeness must count anomalous requests, consistent
+    /// with the text report (measured / (measured + unavailable + anomalous)).
+    #[test]
+    fn completeness_counts_anomalous() {
+        let totals = UsageTotals {
+            requests: 10,
+            measured: 8,
+            unavailable: 1,
+            anomalous: 1,
+            ..Default::default()
+        };
+        let tree = ProjectTree {
+            id: "prj_a".into(),
+            key: "a".into(),
+            title: "A".into(),
+            roots: vec![WorkTreeNode {
+                id: "wrk_1".into(),
+                title: "W".into(),
+                parent_id: None,
+                direct: totals.clone(),
+                inclusive: totals.clone(),
+                children: vec![],
+            }],
+            totals,
+        };
+        // 8 / (8 + 1 + 1) = 80.0%
+        let csv = export_csv(std::slice::from_ref(&tree)).unwrap();
+        assert!(
+            csv.contains(",80.0\n") || csv.contains(",80.0\r\n"),
+            "CSV completeness should be 80.0 with one anomalous request, got:\n{csv}"
+        );
+        let html = export_html(&[tree], "");
+        assert!(
+            html.contains("80% complete (1 unavailable, 1 anomalous)"),
+            "HTML badge should reflect anomalous count"
+        );
     }
 
     #[test]
