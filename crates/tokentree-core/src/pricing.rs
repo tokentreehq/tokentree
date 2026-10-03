@@ -15,6 +15,10 @@ pub struct PriceRate {
     pub cached_input_per_million: Option<String>,
     pub cache_write_per_million: Option<String>,
     pub output_per_million: String,
+    // L5: skip serializing when absent so pre-existing checksummed
+    // snapshots (without this field) keep their hashes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_per_million: Option<String>,
     pub source: String,
 }
 
@@ -26,7 +30,7 @@ impl PriceRate {
             cached_input_per_million: self.cached_input_per_million.as_deref(),
             cache_write_per_million: self.cache_write_per_million.as_deref(),
             output_per_million: &self.output_per_million,
-            reasoning_per_million: None,
+            reasoning_per_million: self.reasoning_per_million.as_deref(),
         }
     }
 }
@@ -84,29 +88,78 @@ impl PriceSnapshot {
 
     #[must_use]
     pub fn resolve_rate(&self, model: &str, timestamp: Option<&str>) -> Option<&PriceRate> {
-        let mut candidates: Vec<&PriceRate> = self
+        let mut candidates: Vec<(&PriceRate, bool, usize)> = self
             .models
             .iter()
-            .filter(|rate| {
-                let matches = if let Some(prefix) = rate.model_pattern.strip_suffix('*') {
-                    model.starts_with(prefix)
-                } else {
-                    rate.model_pattern == model
-                };
-                if !matches {
-                    return false;
-                }
+            .filter_map(|rate| {
+                // Track match specificity: exact matches beat wildcards, and
+                // longer patterns beat shorter ones at the same tier.
+                let (exact, specificity) =
+                    if let Some(prefix) = rate.model_pattern.strip_suffix('*') {
+                        if !model.starts_with(prefix) {
+                            return None;
+                        }
+                        (false, prefix.len())
+                    } else {
+                        if rate.model_pattern != model {
+                            return None;
+                        }
+                        (true, rate.model_pattern.len())
+                    };
                 if let Some(ts) = timestamp {
                     let ts_date = ts.split('T').next().unwrap_or(ts);
-                    rate.effective_from.as_str() <= ts_date
-                } else {
-                    true
+                    if !effective_on_or_before(&rate.effective_from, ts_date) {
+                        return None;
+                    }
                 }
+                Some((rate, exact, specificity))
             })
             .collect();
 
-        candidates.sort_by(|a, b| b.effective_from.cmp(&a.effective_from));
-        candidates.first().copied()
+        // L3: the old tie-break sorted by effective_from alone, so an exact
+        // pattern and a wildcard with the same date resolved arbitrarily
+        // (stable sort = snapshot order). Prefer exact > longer wildcard >
+        // latest effective date.
+        candidates.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| b.2.cmp(&a.2))
+                .then_with(|| compare_iso_dates(&b.0.effective_from, &a.0.effective_from))
+        });
+        candidates.into_iter().next().map(|(rate, _, _)| rate)
+    }
+}
+
+/// Parse an ISO date (allowing non-padded components like `2026-2-1`) into
+/// a numerically comparable tuple.
+fn parse_iso_date(s: &str) -> Option<(i32, u32, u32)> {
+    let date_part = s.split('T').next().unwrap_or(s);
+    let mut parts = date_part.split('-');
+    let year: i32 = parts.next()?.parse().ok()?;
+    let month: u32 = parts.next()?.parse().ok()?;
+    let day: u32 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    Some((year, month, day))
+}
+
+/// L3: plain string comparison breaks on non-padded dates
+/// (`"2026-2-1" > "2026-02-01"` lexicographically), so compare parsed
+/// components; fall back to string order only for unparseable input.
+fn effective_on_or_before(effective_from: &str, ts_date: &str) -> bool {
+    match (parse_iso_date(effective_from), parse_iso_date(ts_date)) {
+        (Some(a), Some(b)) => a <= b,
+        _ => effective_from <= ts_date,
+    }
+}
+
+fn compare_iso_dates(a: &str, b: &str) -> std::cmp::Ordering {
+    match (parse_iso_date(a), parse_iso_date(b)) {
+        (Some(x), Some(y)) => x.cmp(&y),
+        _ => a.cmp(b),
     }
 }
 
@@ -157,5 +210,82 @@ mod tests {
     fn unknown_model_is_unresolved() {
         let snapshot = PriceSnapshot::load_from_str(FIXTURE_JSON).unwrap();
         assert!(snapshot.resolve_rate("unknown-model", None).is_none());
+    }
+
+    fn rate(pattern: &str, effective_from: &str, input: &str) -> PriceRate {
+        PriceRate {
+            provider: "test".to_string(),
+            model_pattern: pattern.to_string(),
+            effective_from: effective_from.to_string(),
+            input_per_million: input.to_string(),
+            cached_input_per_million: None,
+            cache_write_per_million: None,
+            output_per_million: "1.00".to_string(),
+            reasoning_per_million: None,
+            source: "test".to_string(),
+        }
+    }
+
+    fn snapshot_with(rates: Vec<PriceRate>) -> PriceSnapshot {
+        PriceSnapshot {
+            version: 1,
+            updated: "2026-09-29".to_string(),
+            currency: "USD".to_string(),
+            models: rates,
+            sha256: String::new(),
+        }
+    }
+
+    /// L3: non-padded `effective_from` dates must compare numerically, not
+    /// lexicographically (`"2026-2-1"` sorts after `"2026-02-01"` as a
+    /// string, which would wrongly exclude the rate).
+    #[test]
+    fn non_padded_effective_from_matches() {
+        let snapshot = snapshot_with(vec![rate("model-x", "2026-2-1", "3.00")]);
+        let found = snapshot
+            .resolve_rate("model-x", Some("2026-02-15T00:00:00Z"))
+            .unwrap();
+        assert_eq!(found.input_per_million, "3.00");
+        // And a timestamp before the effective date still excludes it.
+        assert!(
+            snapshot
+                .resolve_rate("model-x", Some("2026-01-15T00:00:00Z"))
+                .is_none()
+        );
+    }
+
+    /// L3: an exact pattern beats a wildcard with the same effective date.
+    #[test]
+    fn exact_pattern_beats_wildcard_on_date_tie() {
+        let snapshot = snapshot_with(vec![
+            rate("model-*", "2026-01-01", "9.99"),
+            rate("model-x", "2026-01-01", "3.00"),
+        ]);
+        let found = snapshot.resolve_rate("model-x", None).unwrap();
+        assert_eq!(found.input_per_million, "3.00");
+    }
+
+    /// L3: a longer (more specific) wildcard beats a shorter one.
+    #[test]
+    fn longer_wildcard_beats_shorter_on_tie() {
+        let snapshot = snapshot_with(vec![
+            rate("model-*", "2026-01-01", "9.99"),
+            rate("model-x*", "2026-01-01", "3.00"),
+        ]);
+        let found = snapshot.resolve_rate("model-xyz", None).unwrap();
+        assert_eq!(found.input_per_million, "3.00");
+    }
+
+    /// L3: latest effective date still wins among equally specific patterns.
+    #[test]
+    fn latest_effective_date_wins_among_equals() {
+        let snapshot = snapshot_with(vec![
+            rate("model-x", "2026-01-01", "9.99"),
+            rate("model-x", "2026-06-01", "3.00"),
+        ]);
+        let found = snapshot
+            .resolve_rate("model-x", Some("2026-09-01T00:00:00Z"))
+            .unwrap();
+        assert_eq!(found.input_per_million, "3.00");
     }
 }
