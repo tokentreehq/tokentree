@@ -100,9 +100,20 @@ pub fn rank_of_source_kind(kind: &str) -> u8 {
             || k == source_kind::GROK_TURN_UNMEASURED
             || k == source_kind::GROK_SESSION_UNMEASURED
             || k == source_kind::HERMES_FAILED_RUN
-            || k == source_kind::HERMES_UNMEASURED =>
+            || k == source_kind::HERMES_UNMEASURED
+            || k == source_kind::GEMINI_TURN_FAILED
+            || k == source_kind::GEMINI_TURN_UNMEASURED
+            || k == source_kind::COPILOT_UNMEASURED
+            || k == source_kind::OPENCODE_UNMEASURED =>
         {
             0
+        }
+        k if k == source_kind::GEMINI_TURN_USAGE
+            || k == source_kind::COPILOT_USAGE_EVENT
+            || k == source_kind::OPENCODE_MESSAGE_USAGE
+            || k == source_kind::OPENCODE_SESSION_USAGE =>
+        {
+            4
         }
         _ if kind.starts_with(source_kind::HERMES_AUXILIARY_PREFIX)
             || kind.starts_with(source_kind::HERMES_USAGE_PREFIX) =>
@@ -171,6 +182,20 @@ pub mod source_kind {
     pub const HERMES_ONESHOT_USAGE: &str = "hermes_oneshot_usage";
     pub const HERMES_SESSION_MODEL_USAGE: &str = "hermes_session_model_usage";
 
+    // Gemini kinds.
+    pub const GEMINI_TURN_USAGE: &str = "gemini_turn_usage";
+    pub const GEMINI_TURN_FAILED: &str = "gemini_turn_failed";
+    pub const GEMINI_TURN_UNMEASURED: &str = "gemini_turn_unmeasured";
+
+    // Copilot kinds.
+    pub const COPILOT_USAGE_EVENT: &str = "copilot_usage_event";
+    pub const COPILOT_UNMEASURED: &str = "copilot_unmeasured";
+
+    // OpenCode kinds.
+    pub const OPENCODE_MESSAGE_USAGE: &str = "opencode_message_usage";
+    pub const OPENCODE_SESSION_USAGE: &str = "opencode_session_usage";
+    pub const OPENCODE_UNMEASURED: &str = "opencode_unmeasured";
+
     // Ledger-originated kinds.
     pub const MANUAL_STOP: &str = "manual_stop";
     pub const PROTOTYPE_JSON: &str = "prototype_json";
@@ -227,6 +252,14 @@ pub mod source_kind {
                 | HERMES_UNMEASURED
                 | HERMES_ONESHOT_USAGE
                 | HERMES_SESSION_MODEL_USAGE
+                | GEMINI_TURN_USAGE
+                | GEMINI_TURN_FAILED
+                | GEMINI_TURN_UNMEASURED
+                | COPILOT_USAGE_EVENT
+                | COPILOT_UNMEASURED
+                | OPENCODE_MESSAGE_USAGE
+                | OPENCODE_SESSION_USAGE
+                | OPENCODE_UNMEASURED
                 | MANUAL_STOP
                 | PROTOTYPE_JSON
                 | OTEL_API_REQUEST
@@ -998,6 +1031,10 @@ mod tests {
         // Failure markers sit at the bottom of the ladder.
         assert_eq!(rank_of_source_kind(source_kind::GROK_TURN_FAILED), 0);
         assert_eq!(rank_of_source_kind(source_kind::HERMES_UNMEASURED), 0);
+        assert_eq!(rank_of_source_kind(source_kind::GEMINI_TURN_FAILED), 0);
+        assert_eq!(rank_of_source_kind(source_kind::GEMINI_TURN_USAGE), 4);
+        assert_eq!(rank_of_source_kind(source_kind::COPILOT_USAGE_EVENT), 4);
+        assert_eq!(rank_of_source_kind(source_kind::OPENCODE_MESSAGE_USAGE), 4);
     }
 
     #[test]

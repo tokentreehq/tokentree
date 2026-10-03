@@ -4,6 +4,7 @@ coverage/
 *.db
 *.db-shm
 *.db-wal
+!fixtures/**/*.db
 .DS_Store
 target/
 *.tgz

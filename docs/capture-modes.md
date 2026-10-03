@@ -54,6 +54,10 @@ For providers without hooks or OTLP wiring, TokenTree walks the provider's local
 session store and imports transcripts straight into the ledger. Each provider
 has a default scan path (pass a custom path as the second argument to override).
 
+- **`tokentree import claude [dir]`** — walks `dir` for session `.jsonl` files
+  (`discover_sessions` in `crates/tokentree-claude/src/lib.rs`).
+  Default: `~/.claude/projects/`
+  (`default_claude_path` in `apps/rust-cli/src/main.rs`).
 - **`tokentree import codex [dir]`** — walks `dir` for `*.jsonl` files
   (`discover_sessions` in `crates/tokentree-codex/src/lib.rs`), i.e. Codex
   rollout-event transcripts from the app-server protocol.
@@ -69,6 +73,18 @@ has a default scan path (pass a custom path as the second argument to override).
   (`discover_sessions` in `crates/tokentree-hermes/src/lib.rs`).
   Default: `~/.hermes` — on Windows, `%LOCALAPPDATA%/hermes` if it exists
   (`default_hermes_path` in `apps/rust-cli/src/main.rs`).
+- **`tokentree import gemini [path]`** — walks `path` for SQLite conversation databases
+  (`discover_sessions` in `crates/tokentree-gemini/src/lib.rs`), decoding protobuf step metadata.
+  Default: `~/.gemini/antigravity-cli/conversations` or `~/.gemini/antigravity/conversations`
+  (`default_gemini_path` in `apps/rust-cli/src/main.rs`).
+- **`tokentree import copilot [path]`** — accepts `session-store.db` / `data.db` or walks `path`
+  (`discover_sessions` in `crates/tokentree-copilot/src/lib.rs`) for `assistant_usage_events`.
+  Default: `~/.copilot` — on Windows, `%LOCALAPPDATA%/copilot` if it exists
+  (`default_copilot_path` in `apps/rust-cli/src/main.rs`).
+- **`tokentree import opencode [path]`** — accepts `opencode.db` or walks `path`
+  (`discover_sessions` in `crates/tokentree-opencode/src/lib.rs`) for session and message token usage.
+  Default: `~/.local/share/opencode` or `~/.opencode`
+  (`default_opencode_path` in `apps/rust-cli/src/main.rs`).
 
 Import prints a JSON summary of `sessions` (or `sources`), `inserted`,
 `duplicates`, and `anomalies`. Imports are idempotent: re-running skips
