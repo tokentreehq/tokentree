@@ -386,22 +386,40 @@ fn run() -> Result<()> {
             // H2: the loopback receiver requires a per-run bearer secret so a
             // malicious local process cannot append poisoned rows to the
             // append-only ledger. Pin via TOKENTREE_OTLP_TOKEN for automation.
-            let auth = match std::env::var("TOKENTREE_OTLP_TOKEN") {
-                Ok(token) if !token.trim().is_empty() => tokentree_otel::OtlpAuth {
-                    bearer_token: token,
-                },
-                _ => tokentree_otel::OtlpAuth::generate(),
+            let (auth, from_env) = match std::env::var("TOKENTREE_OTLP_TOKEN") {
+                Ok(token) if !token.trim().is_empty() => (
+                    tokentree_otel::OtlpAuth {
+                        bearer_token: token,
+                    },
+                    true,
+                ),
+                _ => (tokentree_otel::OtlpAuth::generate(), false),
             };
             println!("TokenTree OTLP receiver: http://{address}/v1/logs");
-            println!("Bearer token (required on every ingest request):");
-            println!("  {}\n", auth.bearer_token);
+            if from_env {
+                // L13: never echo a user-supplied secret — they already know it.
+                println!(
+                    "Bearer token: using TOKENTREE_OTLP_TOKEN from the environment (not shown)."
+                );
+            } else {
+                // L13: generated tokens are shown ONCE so the sender can be
+                // configured, then never again. Prefer TOKENTREE_OTLP_TOKEN.
+                println!("Bearer token (generated for this run only — copy it now):");
+                println!("  {}\n", auth.bearer_token);
+                println!("Tip: set TOKENTREE_OTLP_TOKEN to reuse a token across runs.");
+            }
             println!("Point the sender at this endpoint with:");
             println!("  export OTEL_EXPORTER_OTLP_PROTOCOL=http/json");
             println!("  export OTEL_EXPORTER_OTLP_ENDPOINT=http://{address}");
-            println!(
-                "  export OTEL_EXPORTER_OTLP_HEADERS=\"Authorization=Bearer {}\"",
-                auth.bearer_token
-            );
+            if from_env {
+                println!(
+                    "  export OTEL_EXPORTER_OTLP_HEADERS=\"Authorization=Bearer $TOKENTREE_OTLP_TOKEN\""
+                );
+            } else {
+                println!(
+                    "  export OTEL_EXPORTER_OTLP_HEADERS=\"Authorization=Bearer <paste-the-token-above>\""
+                );
+            }
             let ledger = ledger(&home)?;
             tokio::runtime::Runtime::new()?.block_on(tokentree_otel::serve(address, ledger, auth))
         }
