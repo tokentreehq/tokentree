@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SUITE 3 — privacy and security. Repeatable. PASS/FAIL per check.
 set -uo pipefail
-BIN=/tmp/tokentree-release-bin
+BIN=${TOKENTREE_BIN:-/tmp/tokentree-release-bin}
 H=/tmp/e2e/s3-home
 C1="CANARY_PROMPT_9x7zqx"; C2="sk-ant-CANARY_KEY_12345"
 PASS=0; FAIL=0

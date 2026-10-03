@@ -31,23 +31,23 @@ When a user attaches or moves a session:
 ### Rename Work Item
 Updates the display title of a work item:
 ```bash
-tokentree rename --task wrk_123 --title "Fix collision bug v2"
+tokentree rename --work-item wrk_123 --title "Fix collision bug v2"
 ```
 
 ### Move Work Item
 Reparents a work item under another task or promotes it to a root:
 ```bash
 # Reparent under wrk_parent
-tokentree move --task wrk_child --parent wrk_parent
+tokentree move --work-item wrk_child --parent wrk_parent
 
 # Promote to root
-tokentree move --task wrk_child
+tokentree move --work-item wrk_child
 ```
 
 ### Attach Session
 Explicitly attaches an unassigned or misattributed session to a work item:
 ```bash
-tokentree attach --session ses_abc --task wrk_123
+tokentree attach --session ses_abc --work-item wrk_123
 ```
 
 ### Detach Session
@@ -59,6 +59,6 @@ tokentree detach --session ses_abc
 ### Add Explicit Note
 Adds a human annotation (1–240 characters) to a work item:
 ```bash
-tokentree note --task wrk_123 --text "Root cause was race condition in physics step"
+tokentree note --work-item wrk_123 --text "Root cause was race condition in physics step"
 ```
 Notes are strictly opt-in, explicitly entered by humans, and never scraped from prompt text.

@@ -32,11 +32,11 @@
     "typecheck": "tsc -b --pretty false",
     "test:packed-tarball": "bash scripts/test-packed-tarball.sh"
   },
-  "dependencies": {},
-  "devDependencies": {
-    "@tokentreehq/core": "workspace:*",
-    "@tokentreehq/database": "workspace:*",
-    "@tokentreehq/adapter-claude": "workspace:*",
-    "@tokentreehq/pricing": "workspace:*"
+  "optionalDependencies": {
+    "@tokentreehq/cli-darwin-arm64": "workspace:*",
+    "@tokentreehq/cli-darwin-x64": "workspace:*",
+    "@tokentreehq/cli-linux-arm64": "workspace:*",
+    "@tokentreehq/cli-linux-x64": "workspace:*",
+    "@tokentreehq/cli-win32-x64": "workspace:*"
   }
 }

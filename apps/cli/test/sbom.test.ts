@@ -62,15 +62,11 @@ describe('Software Bill of Materials (SBOM) generation & schema validation', () 
 
       // Assert representative npm dependencies exist
       expect(spdxPackageNames).toContain('@tokentreehq/cli');
-      expect(spdxPackageNames).toContain('@tokentreehq/core');
       expect(spdxPackageNames).toContain('@tokentreehq/database');
 
       // Check externalRefs PURLs in SPDX
       const rusqliteSpdx = spdxDoc.packages.find((p) => p.name === 'rusqlite');
       expect(rusqliteSpdx?.externalRefs[0].referenceLocator).toMatch(/^pkg:cargo\/rusqlite@/);
-
-      const coreSpdx = spdxDoc.packages.find((p) => p.name === '@tokentreehq/core');
-      expect(coreSpdx?.externalRefs[0].referenceLocator).toMatch(/^pkg:npm\/%40tokentreehq\/core@/);
 
       // 2. Inspect CycloneDX 1.5 output
       const cdxDoc = JSON.parse(readFileSync(join(tmp, 'tokentree-cyclonedx-sbom.json'), 'utf8')) as {
@@ -97,14 +93,10 @@ describe('Software Bill of Materials (SBOM) generation & schema validation', () 
 
       // Assert representative npm dependencies exist
       expect(cdxComponentNames).toContain('@tokentreehq/cli');
-      expect(cdxComponentNames).toContain('@tokentreehq/core');
       expect(cdxComponentNames).toContain('@tokentreehq/database');
 
       const rusqliteCdx = cdxDoc.components.find((c) => c.name === 'rusqlite');
       expect(rusqliteCdx?.purl).toMatch(/^pkg:cargo\/rusqlite@/);
-
-      const coreCdx = cdxDoc.components.find((c) => c.name === '@tokentreehq/core');
-      expect(coreCdx?.purl).toMatch(/^pkg:npm\/%40tokentreehq\/core@/);
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }

@@ -1,7 +1,7 @@
 {
   "name":"tokentree",
   "displayName":"TokenTree",
-  "version":"0.1.0",
+  "version":"0.2.0",
   "description":"Local-first AI coding-agent usage measurement with enqueue-only lifecycle hooks.",
   "author":{"name":"TokenTree contributors","url":"https://github.com/tokentreehq/tokentree"},
   "homepage":"https://github.com/tokentreehq/tokentree",

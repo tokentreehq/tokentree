@@ -68,6 +68,13 @@ const pkg = JSON.parse(fs.readFileSync(process.env.CLI_ROOT + '/package.json', '
 delete pkg.devDependencies;
 delete pkg.scripts;
 pkg.files = ['dist', 'migrations', 'data', 'vendor', 'README.md', 'LICENSE'];
+if (pkg.optionalDependencies) {
+  for (const dep of Object.keys(pkg.optionalDependencies)) {
+    if (pkg.optionalDependencies[dep].startsWith('workspace:')) {
+      pkg.optionalDependencies[dep] = pkg.version;
+    }
+  }
+}
 fs.writeFileSync(stage + '/package.json', JSON.stringify(pkg, null, 2) + '\n');
 NODE
 test -f "$WORK/npm-stage/dist/main.js"

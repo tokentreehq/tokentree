@@ -1,9 +1,7 @@
 packages:
   - apps/*
   - packages/*
-  - packages/adapters/*
   - plugins/*
 
 onlyBuiltDependencies:
   - esbuild
-
