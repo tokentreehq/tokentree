@@ -72,6 +72,19 @@ fn contains_word(haystack: &str, word: &str) -> bool {
 }
 
 #[must_use]
+/// Derive a redacted 3–8 word label from text.
+///
+/// # Privacy contract (P1)
+///
+/// This function takes raw prompt-adjacent text and emits prompt fragments
+/// (first non-stop-words). In this product it must NEVER be fed raw prompts,
+/// and its output must NEVER be persisted to the prompt-derived columns
+/// `classification_events.extracted_intent` / `rationale` — doing so would
+/// leak prompt content into the ledger. The only sanctioned persisted forms
+/// are fingerprints and redacted labels on non-prompt-derived columns, per
+/// the privacy section of CLAUDE.md. A CI guard
+/// (`classifier_privacy_guard_test.rs`) fails the build if any production
+/// INSERT/UPDATE targets those columns.
 pub fn redacted_label(text: &str) -> String {
     // 1. Redact secrets: sk-..., gh[pousr]_..., api_key/token/password = ...
     let mut cleaned = String::with_capacity(text.len());
